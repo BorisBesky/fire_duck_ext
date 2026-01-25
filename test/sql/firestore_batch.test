@@ -1,0 +1,390 @@
+# name: test/sql/firestore_batch.test
+# description: Test Firestore batch UPDATE and DELETE operations with DuckDB-side filtering
+# group: [fire_duck_ext]
+
+require fire_duck_ext
+
+# ============================================
+# Setup - Create secret for tests
+# ============================================
+
+statement ok
+CREATE SECRET batch_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-key'
+);
+
+# ============================================
+# firestore_update_batch - Argument Validation
+# ============================================
+
+# Second argument must be a LIST, not a string (DuckDB type check)
+statement error
+SELECT * FROM firestore_update_batch('users', 'not-a-list', 'field', 'value');
+----
+No function matches
+
+# Must have at least one field to update
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1', 'id2']);
+----
+firestore_update_batch requires at least one field to update
+
+# Field/value pairs must come in pairs (odd number = error)
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'field');
+----
+firestore_update_batch requires field name/value pairs
+
+# Field name must be a string
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 123, 'value');
+----
+must be a string
+
+# ============================================
+# firestore_delete_batch - Argument Validation
+# ============================================
+
+# Second argument must be a LIST, not a string (DuckDB type check)
+statement error
+SELECT * FROM firestore_delete_batch('users', 'not-a-list');
+----
+No function matches
+
+# ============================================
+# Filtering Pattern Tests (DuckDB-side filtering)
+# These test the SQL patterns users would use with batch functions
+# ============================================
+
+# Create temp table to simulate Firestore scan results
+statement ok
+CREATE TABLE mock_users AS
+SELECT * FROM (VALUES
+    ('user1', 'Alice', 30, 'active'),
+    ('user2', 'Bob', 25, 'pending'),
+    ('user3', 'Charlie', 35, 'inactive'),
+    ('user4', 'Diana', 28, 'pending'),
+    ('user5', 'Eve', 40, 'active')
+) AS t(__document_id, name, age, status);
+
+# Test: Extract document IDs matching a filter condition
+query I
+SELECT list(__document_id) FROM mock_users WHERE status = 'pending';
+----
+[user2, user4]
+
+# Test: Filter by multiple conditions
+query I
+SELECT list(__document_id) FROM mock_users WHERE status = 'active' AND age > 30;
+----
+[user5]
+
+# Test: Filter with LIKE pattern
+query I
+SELECT list(__document_id) FROM mock_users WHERE name LIKE 'A%';
+----
+[user1]
+
+# Test: Filter returning empty list
+query I
+SELECT list(__document_id) FROM mock_users WHERE status = 'deleted';
+----
+[]
+
+# Test: Complex filter with subquery pattern
+query I
+SELECT list(__document_id) FROM mock_users
+WHERE age > (SELECT AVG(age) FROM mock_users);
+----
+[user3, user5]
+
+# ============================================
+# Batch function with literal lists - These fail at runtime (no real credentials)
+# but should pass the binding phase
+# ============================================
+
+# Empty list should return count of 0 (no documents to process)
+query I
+SELECT * FROM firestore_update_batch('users', []::VARCHAR[], 'status', 'active');
+----
+0
+
+# Empty list for delete should return count of 0
+query I
+SELECT * FROM firestore_delete_batch('users', []::VARCHAR[]);
+----
+0
+
+# Single element list - fails at runtime due to invalid credentials
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'status', 'active');
+----
+
+# Multiple document IDs - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1', 'id2', 'id3'], 'status', 'active');
+----
+
+# Multiple fields to update - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'status', 'active', 'lastUpdated', '2024-01-15');
+----
+
+# Delete batch with list - fails at runtime
+statement error
+SELECT * FROM firestore_delete_batch('users', ['id1', 'id2']);
+----
+
+# ============================================
+# Value Type Coercion in Batch Updates
+# ============================================
+
+# String values - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'name', 'NewName');
+----
+
+# Integer values - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'age', 42);
+----
+
+# Boolean values - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'active', true);
+----
+
+# Double values - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'score', 3.14);
+----
+
+# NULL values - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'deletedField', NULL);
+----
+
+# ============================================
+# Batch UPDATE with Variable Pattern
+# DuckDB doesn't allow subqueries directly in table function arguments
+# Use SET VARIABLE to store the list first, then use getvariable()
+#
+# Pattern:
+#   SET VARIABLE ids = (SELECT list(__document_id) FROM firestore_scan('col') WHERE condition);
+#   SELECT * FROM firestore_update_batch('col', getvariable('ids'), 'field', value);
+# ============================================
+
+# Store pending user IDs in a variable
+statement ok
+SET VARIABLE pending_ids = (SELECT list(__document_id) FROM mock_users WHERE status = 'pending');
+
+# Verify the variable contains expected IDs
+query I
+SELECT getvariable('pending_ids');
+----
+[user2, user4]
+
+# Batch update using variable - fails at runtime (no real credentials)
+statement error
+SELECT * FROM firestore_update_batch('users', getvariable('pending_ids'), 'status', 'reviewed');
+----
+
+# Store IDs with multiple filter conditions
+statement ok
+SET VARIABLE active_over_30 = (SELECT list(__document_id) FROM mock_users WHERE status = 'active' AND age > 30);
+
+query I
+SELECT getvariable('active_over_30');
+----
+[user5]
+
+# Batch update with multiple fields - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users', getvariable('active_over_30'), 'verified', true, 'verifiedAt', '2024-01-15');
+----
+
+# Store IDs with LIKE filter
+statement ok
+SET VARIABLE names_with_a = (SELECT list(__document_id) FROM mock_users WHERE name LIKE 'A%');
+
+query I
+SELECT getvariable('names_with_a');
+----
+[user1]
+
+# Store IDs with complex subquery (above average age)
+statement ok
+SET VARIABLE above_avg_age = (SELECT list(__document_id) FROM mock_users WHERE age > (SELECT AVG(age) FROM mock_users));
+
+query I
+SELECT getvariable('above_avg_age');
+----
+[user3, user5]
+
+# Empty result stored in variable - list() returns NULL when no rows match
+statement ok
+SET VARIABLE nonexistent = (SELECT list(__document_id) FROM mock_users WHERE status = 'nonexistent');
+
+query I
+SELECT getvariable('nonexistent');
+----
+NULL
+
+# Batch update with NULL variable returns 0 (handles NULL gracefully)
+query I
+SELECT * FROM firestore_update_batch('users', getvariable('nonexistent'), 'status', 'updated');
+----
+0
+
+# ============================================
+# Batch DELETE with Variable Pattern
+# ============================================
+
+# Store inactive user IDs
+statement ok
+SET VARIABLE inactive_ids = (SELECT list(__document_id) FROM mock_users WHERE status = 'inactive');
+
+query I
+SELECT getvariable('inactive_ids');
+----
+[user3]
+
+# Batch delete using variable - fails at runtime
+statement error
+SELECT * FROM firestore_delete_batch('users', getvariable('inactive_ids'));
+----
+
+# Store IDs with multiple conditions
+statement ok
+SET VARIABLE pending_under_30 = (SELECT list(__document_id) FROM mock_users WHERE status = 'pending' AND age < 30);
+
+query I
+SELECT getvariable('pending_under_30');
+----
+[user2, user4]
+
+# Store IDs with LIKE pattern (names ending in 'e')
+statement ok
+SET VARIABLE names_end_e = (SELECT list(__document_id) FROM mock_users WHERE name LIKE '%e');
+
+query I
+SELECT getvariable('names_end_e');
+----
+[user1, user3, user5]
+
+# Store IDs below average age
+statement ok
+SET VARIABLE below_avg_age = (SELECT list(__document_id) FROM mock_users WHERE age < (SELECT AVG(age) FROM mock_users));
+
+query I
+SELECT getvariable('below_avg_age');
+----
+[user2, user4]
+
+# Batch delete with NULL variable returns 0 (handles NULL gracefully)
+query I
+SELECT * FROM firestore_delete_batch('users', getvariable('nonexistent'));
+----
+0
+
+# ============================================
+# Nested Collection Batch Operations
+# ============================================
+
+# Create mock nested collection data
+statement ok
+CREATE TABLE mock_orders AS
+SELECT * FROM (VALUES
+    ('order1', 'user1', 'shipped', 100.00),
+    ('order2', 'user1', 'pending', 50.00),
+    ('order3', 'user2', 'pending', 75.00),
+    ('order4', 'user2', 'cancelled', 25.00)
+) AS t(__document_id, user_id, status, amount);
+
+# Store order IDs for nested collection
+statement ok
+SET VARIABLE user1_pending_orders = (SELECT list(__document_id) FROM mock_orders WHERE user_id = 'user1' AND status = 'pending');
+
+query I
+SELECT getvariable('user1_pending_orders');
+----
+[order2]
+
+# Batch update orders in nested collection - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('users/user1/orders', getvariable('user1_pending_orders'), 'status', 'processing');
+----
+
+# Store cancelled orders for user2
+statement ok
+SET VARIABLE user2_cancelled = (SELECT list(__document_id) FROM mock_orders WHERE user_id = 'user2' AND status = 'cancelled');
+
+query I
+SELECT getvariable('user2_cancelled');
+----
+[order4]
+
+# Batch delete from nested collection - fails at runtime
+statement error
+SELECT * FROM firestore_delete_batch('users/user2/orders', getvariable('user2_cancelled'));
+----
+
+# ============================================
+# Collection Group Batch Operations
+# Full document paths from collection group queries
+# ============================================
+
+# Create mock collection group data with full paths
+statement ok
+CREATE TABLE mock_profiles AS
+SELECT * FROM (VALUES
+    ('users/user1/profile/main', 'active'),
+    ('users/user2/profile/main', 'inactive'),
+    ('users/user3/profile/main', 'pending')
+) AS t(__document_id, status);
+
+# Store full paths for inactive profiles
+statement ok
+SET VARIABLE inactive_profiles = (SELECT list(__document_id) FROM mock_profiles WHERE status = 'inactive');
+
+query I
+SELECT getvariable('inactive_profiles');
+----
+[users/user2/profile/main]
+
+# Batch update using full paths - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('profile', getvariable('inactive_profiles'), 'status', 'reactivated');
+----
+
+# Store pending profile paths
+statement ok
+SET VARIABLE pending_profiles = (SELECT list(__document_id) FROM mock_profiles WHERE status = 'pending');
+
+query I
+SELECT getvariable('pending_profiles');
+----
+[users/user3/profile/main]
+
+# Batch delete using full paths - fails at runtime
+statement error
+SELECT * FROM firestore_delete_batch('profile', getvariable('pending_profiles'));
+----
+
+# ============================================
+# Cleanup
+# ============================================
+
+statement ok
+DROP TABLE mock_profiles;
+
+statement ok
+DROP TABLE mock_orders;
+
+statement ok
+DROP TABLE mock_users;
+
+statement ok
+DROP SECRET batch_test;

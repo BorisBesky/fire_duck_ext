@@ -1,0 +1,23 @@
+# name: test/sql/fire_duck_ext.test
+# description: test fire_duck_ext extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT fire_duck_ext('Sam');
+----
+Catalog Error: Scalar Function with name fire_duck_ext does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require fire_duck_ext
+
+# Confirm the extension works
+query I
+SELECT fire_duck_ext('Sam');
+----
+FireDuckExt Sam 🐥
+
+query I
+SELECT fire_duck_ext_openssl_version('Michael') ILIKE 'FireDuckExt Michael, my linked OpenSSL version is OpenSSL%';
+----
+true

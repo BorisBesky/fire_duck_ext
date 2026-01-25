@@ -1,0 +1,221 @@
+# name: test/sql/firestore_write.test
+# description: Test Firestore write operations (UPDATE, DELETE, batch)
+# group: [fire_duck_ext]
+
+require fire_duck_ext
+
+# ============================================
+# firestore_update Error Handling
+# ============================================
+
+# Missing credentials
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name', 'New Name');
+----
+No Firestore credentials found
+
+# Create secret for further tests
+statement ok
+CREATE SECRET write_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-key'
+);
+
+# Missing field/value pairs (only collection and doc_id)
+statement error
+SELECT * FROM firestore_update('users', 'doc1');
+----
+firestore_update requires at least one field to update
+
+# Odd number of field/value args (missing value)
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name');
+----
+firestore_update requires field name/value pairs
+
+# Field name must be a string
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 123, 'value');
+----
+must be a string
+
+# ============================================
+# firestore_delete Error Handling
+# ============================================
+
+statement ok
+DROP SECRET write_test;
+
+# Missing credentials
+statement error
+SELECT * FROM firestore_delete('users', 'doc1');
+----
+No Firestore credentials found
+
+# ============================================
+# firestore_update_batch Error Handling
+# ============================================
+
+# Non-list document IDs (string instead of list)
+statement error
+SELECT * FROM firestore_update_batch('users', 'not-a-list', 'field', 'value');
+----
+firestore_update_batch requires a LIST
+
+# Empty field list after document IDs
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1', 'id2']);
+----
+firestore_update_batch requires at least one field to update
+
+# Odd number of field/value args
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1'], 'field');
+----
+firestore_update_batch requires field name/value pairs
+
+# ============================================
+# firestore_delete_batch Error Handling
+# ============================================
+
+# Non-list document IDs
+statement error
+SELECT * FROM firestore_delete_batch('users', 'not-a-list');
+----
+firestore_delete_batch requires a LIST
+
+# ============================================
+# Function Signature Validation
+# ============================================
+
+# firestore_update requires at least 4 arguments (collection, doc_id, field, value)
+statement error
+SELECT * FROM firestore_update('users');
+----
+
+# firestore_delete requires exactly 2 arguments
+statement error
+SELECT * FROM firestore_delete('users');
+----
+
+# ============================================
+# Type Coercion Tests
+# ============================================
+
+statement ok
+CREATE SECRET type_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-key'
+);
+
+# Different value types should be accepted
+# (These will fail at runtime due to invalid credentials, but bind should succeed)
+
+# String value
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name', 'string_value');
+----
+
+# Integer value
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'age', 42);
+----
+
+# Boolean value
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'active', true);
+----
+
+# Double value
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'score', 3.14);
+----
+
+# NULL value
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'deleted_field', NULL);
+----
+
+# ============================================
+# Multi-field Update Tests
+# ============================================
+
+# Update multiple fields at once
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name', 'Alice', 'age', 30, 'active', true);
+----
+
+# Update with mixed types
+statement error
+SELECT * FROM firestore_update('products', 'prod1', 'name', 'Widget', 'price', 9.99, 'inStock', true, 'quantity', 100);
+----
+
+# ============================================
+# Nested Collection Path Tests
+# ============================================
+
+# Update document in nested collection
+statement error
+SELECT * FROM firestore_update('users/user1/orders', 'order1', 'status', 'shipped');
+----
+
+# Delete from nested collection
+statement error
+SELECT * FROM firestore_delete('users/user1/orders', 'order1');
+----
+
+# Batch update in nested collection
+statement error
+SELECT * FROM firestore_update_batch('users/user1/orders', ['order1', 'order2'], 'status', 'cancelled');
+----
+
+# Batch delete from nested collection
+statement error
+SELECT * FROM firestore_delete_batch('users/user1/orders', ['order1', 'order2']);
+----
+
+# ============================================
+# Named Parameter Tests
+# ============================================
+
+# Update with explicit project_id
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name', 'Test', project_id='other-project');
+----
+
+# Update with custom database
+statement error
+SELECT * FROM firestore_update('users', 'doc1', 'name', 'Test', database='custom-db');
+----
+
+# Delete with explicit credentials path
+statement error
+SELECT * FROM firestore_delete('users', 'doc1', credentials='/nonexistent/path.json');
+----
+
+# ============================================
+# Collection Group Paths (for batch operations)
+# ============================================
+
+# Batch update with full document paths (for collection group results)
+statement error
+SELECT * FROM firestore_update_batch(
+    'users',
+    ['users/user1/profile/main', 'users/user2/profile/main'],
+    'updated', true
+);
+----
+
+# Batch delete with full document paths
+statement error
+SELECT * FROM firestore_delete_batch(
+    'users',
+    ['users/user1/profile/main', 'users/user2/profile/main']
+);
+----
+
+# Clean up
+statement ok
+DROP SECRET type_test;

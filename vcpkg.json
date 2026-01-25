@@ -1,13 +1,18 @@
 {
-        "dependencies": [
-                "openssl"
+    "name": "fire-duck-ext",
+    "version-string": "0.1.0",
+    "description": "DuckDB extension for Google Cloud Firestore",
+    "dependencies": [
+        "openssl",
+        "curl",
+        "nlohmann-json"
+    ],
+    "vcpkg-configuration": {
+        "overlay-ports": [
+            "./extension-ci-tools/vcpkg_ports"
         ],
-        "vcpkg-configuration": {
-                "overlay-ports": [
-                        "./extension-ci-tools/vcpkg_ports"
-                ],
-                "overlay-triplets": [
-                        "./extension-ci-tools/toolchains"
-                ]
-        }
+        "overlay-triplets": [
+            "./extension-ci-tools/toolchains"
+        ]
+    }
 }

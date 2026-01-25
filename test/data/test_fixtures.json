@@ -1,0 +1,64 @@
+{
+  "description": "Test data fixtures for FireDuckExt integration tests",
+  "collections": {
+    "users": [
+      {
+        "__id": "user1",
+        "name": "Alice",
+        "age": 30,
+        "status": "active",
+        "email": "alice@example.com"
+      },
+      {
+        "__id": "user2",
+        "name": "Bob",
+        "age": 25,
+        "status": "pending",
+        "email": "bob@example.com"
+      },
+      {
+        "__id": "user3",
+        "name": "Charlie",
+        "age": 35,
+        "status": "inactive",
+        "email": "charlie@example.com"
+      }
+    ],
+    "products": [
+      {
+        "__id": "prod1",
+        "name": "Widget",
+        "price": 9.99,
+        "inStock": true,
+        "category": "tools"
+      },
+      {
+        "__id": "prod2",
+        "name": "Gadget",
+        "price": 19.99,
+        "inStock": false,
+        "category": "electronics"
+      }
+    ],
+    "types_test": [
+      {
+        "__id": "all_types",
+        "stringField": "hello",
+        "intField": 42,
+        "doubleField": 3.14,
+        "boolField": true,
+        "timestampField": "2024-01-15T10:30:00Z",
+        "arrayField": [1, 2, 3],
+        "mapField": {"nested": "value"},
+        "nullField": null
+      }
+    ],
+    "empty_collection": []
+  },
+  "expected_results": {
+    "users_count": 3,
+    "products_count": 2,
+    "users_active_count": 1,
+    "users_by_name_order": ["Alice", "Bob", "Charlie"]
+  }
+}

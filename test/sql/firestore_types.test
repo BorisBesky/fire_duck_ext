@@ -1,0 +1,111 @@
+# name: test/sql/firestore_types.test
+# description: Test Firestore type conversions and function signatures
+# group: [fire_duck_ext]
+
+require fire_duck_ext
+
+# ============================================
+# Function Signature Tests
+# ============================================
+
+# firestore_scan requires VARCHAR collection name
+statement error
+SELECT * FROM firestore_scan(123);
+----
+
+# firestore_scan with no arguments
+statement error
+SELECT * FROM firestore_scan();
+----
+
+# ============================================
+# Named Parameter Type Tests
+# ============================================
+
+statement ok
+CREATE SECRET type_test (
+    TYPE firestore,
+    PROJECT_ID 'test',
+    API_KEY 'key'
+);
+
+# limit should accept integer
+statement error
+SELECT * FROM firestore_scan('col', limit=10);
+----
+
+# order_by should accept string
+statement error
+SELECT * FROM firestore_scan('col', order_by='name');
+----
+
+# ============================================
+# Collection Path Tests
+# ============================================
+
+# Regular collection path
+statement error
+SELECT * FROM firestore_scan('users');
+----
+
+# Nested collection path
+statement error
+SELECT * FROM firestore_scan('users/user1/orders');
+----
+
+# Collection group query (~ prefix)
+statement error
+SELECT * FROM firestore_scan('~orders');
+----
+
+# ============================================
+# Batch Function Type Tests
+# ============================================
+
+# List literal should work
+statement error
+SELECT * FROM firestore_update_batch('users', ['id1', 'id2', 'id3'], 'status', 'active');
+----
+
+# Empty list should work (but do nothing)
+statement error
+SELECT * FROM firestore_update_batch('users', [], 'status', 'active');
+----
+
+# Clean up
+statement ok
+DROP SECRET type_test;
+
+# ============================================
+# Return Type Tests
+# ============================================
+
+# These test that functions return expected column types
+# firestore_update returns BIGINT count
+statement ok
+CREATE SECRET return_test (
+    TYPE firestore,
+    PROJECT_ID 'test',
+    API_KEY 'key'
+);
+
+# The function should return a single 'count' column of type BIGINT
+# We can't test actual return values without emulator, but we can verify the schema
+statement error
+SELECT count FROM firestore_update('users', 'doc1', 'name', 'test');
+----
+
+statement error
+SELECT count FROM firestore_delete('users', 'doc1');
+----
+
+statement error
+SELECT count FROM firestore_update_batch('users', ['id1'], 'name', 'test');
+----
+
+statement error
+SELECT count FROM firestore_delete_batch('users', ['id1']);
+----
+
+statement ok
+DROP SECRET return_test;

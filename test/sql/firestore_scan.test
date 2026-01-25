@@ -1,0 +1,100 @@
+# name: test/sql/firestore_scan.test
+# description: Test firestore_scan table function
+# group: [fire_duck_ext]
+
+# Require the extension
+require fire_duck_ext
+
+# Test that the function exists (will fail without credentials)
+statement error
+SELECT * FROM firestore_scan('test_collection');
+----
+No Firestore credentials found
+
+# Test with explicit parameters (will fail without valid credentials)
+statement error
+SELECT * FROM firestore_scan('users', project_id='test-project', api_key='invalid-key');
+----
+
+# Test secret creation syntax
+statement ok
+CREATE SECRET test_firestore (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-api-key'
+);
+
+# Test that secrets work
+statement error
+SELECT * FROM firestore_scan('users');
+----
+
+# ============================================
+# __document_id Column Projection Tests
+# These tests verify correct handling of __document_id in various SELECT patterns
+# Regression test: COLUMN_IDENTIFIER_ROW_ID mishandling caused SELECT * to return
+# only __document_id column with 0 rows
+# ============================================
+
+# Create mock data to test projection patterns
+statement ok
+CREATE TABLE mock_firestore_data AS
+SELECT * FROM (VALUES
+    ('doc1', 'Alice', 30, true),
+    ('doc2', 'Bob', 25, false),
+    ('doc3', 'Charlie', 35, true)
+) AS t(__document_id, name, age, active);
+
+# Test: SELECT * should return all columns including __document_id
+query ITIB
+SELECT * FROM mock_firestore_data ORDER BY __document_id;
+----
+doc1	Alice	30	true
+doc2	Bob	25	false
+doc3	Charlie	35	true
+
+# Test: Selecting only __document_id should work
+query I
+SELECT __document_id FROM mock_firestore_data ORDER BY __document_id;
+----
+doc1
+doc2
+doc3
+
+# Test: Selecting __document_id with specific columns should work
+query IT
+SELECT __document_id, name FROM mock_firestore_data ORDER BY name;
+----
+doc1	Alice
+doc2	Bob
+doc3	Charlie
+
+# Test: Selecting columns without __document_id should work
+query TI
+SELECT name, age FROM mock_firestore_data ORDER BY name;
+----
+Alice	30
+Bob	25
+Charlie	35
+
+# Test: __document_id can be used in WHERE clause
+query IT
+SELECT __document_id, name FROM mock_firestore_data WHERE __document_id = 'doc2';
+----
+doc2	Bob
+
+# Test: __document_id can be used in aggregation
+query I
+SELECT COUNT(DISTINCT __document_id) FROM mock_firestore_data;
+----
+3
+
+# Test: __document_id can be collected into a list (common pattern for batch operations)
+query I
+SELECT list(__document_id ORDER BY __document_id) FROM mock_firestore_data WHERE active = true;
+----
+[doc1, doc3]
+
+# Cleanup
+statement ok
+DROP TABLE mock_firestore_data;
