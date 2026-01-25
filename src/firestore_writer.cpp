@@ -714,6 +714,177 @@ static void FirestoreDeleteBatchFunction(
 }
 
 // ============================================================================
+// ARRAY TRANSFORM functions implementation
+// Usage: SELECT * FROM firestore_array_union('collection', 'doc_id', 'field', ['val1', 'val2'])
+//        SELECT * FROM firestore_array_remove('collection', 'doc_id', 'field', ['val1', 'val2'])
+//        SELECT * FROM firestore_array_append('collection', 'doc_id', 'field', ['val1', 'val2'])
+// ============================================================================
+
+struct FirestoreArrayTransformBindData : public TableFunctionData {
+    std::string collection;
+    std::shared_ptr<FirestoreCredentials> credentials;
+    std::string document_id;
+    std::string field_name;
+    std::vector<Value> elements;
+    FirestoreClient::ArrayTransformType transform_type;
+};
+
+struct FirestoreArrayTransformGlobalState : public GlobalTableFunctionState {
+    bool done;
+    FirestoreArrayTransformGlobalState() : done(false) {}
+    idx_t MaxThreads() const override { return 1; }
+};
+
+static unique_ptr<FunctionData> FirestoreArrayTransformBind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names,
+    FirestoreClient::ArrayTransformType transform_type
+) {
+    auto result = make_uniq<FirestoreArrayTransformBindData>();
+    result->transform_type = transform_type;
+
+    // Get collection name (first arg)
+    result->collection = input.inputs[0].GetValue<string>();
+
+    // Get document ID (second arg)
+    result->document_id = input.inputs[1].GetValue<string>();
+
+    // Get field name (third arg)
+    result->field_name = input.inputs[2].GetValue<string>();
+
+    // Get elements to add/remove (fourth arg) - must be a LIST
+    auto &elements_value = input.inputs[3];
+    if (elements_value.type().id() != LogicalTypeId::LIST) {
+        throw BinderException("Array transform requires a LIST of elements as fourth argument.");
+    }
+
+    if (!elements_value.IsNull()) {
+        auto &element_list = ListValue::GetChildren(elements_value);
+        for (auto &elem : element_list) {
+            result->elements.push_back(elem);
+        }
+    }
+
+    // Process named parameters for credentials
+    std::optional<std::string> project_id;
+    std::optional<std::string> credentials_path;
+    std::optional<std::string> api_key;
+    std::optional<std::string> database_id;
+
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "project_id") {
+            project_id = kv.second.GetValue<string>();
+        } else if (kv.first == "credentials") {
+            credentials_path = kv.second.GetValue<string>();
+        } else if (kv.first == "api_key") {
+            api_key = kv.second.GetValue<string>();
+        } else if (kv.first == "database") {
+            database_id = kv.second.GetValue<string>();
+        }
+    }
+
+    result->credentials = ResolveFirestoreCredentials(context, project_id, credentials_path, api_key, database_id);
+
+    if (!result->credentials) {
+        throw BinderException("No Firestore credentials found for array transform operation.");
+    }
+
+    // Return type: count of affected documents (1 or 0)
+    names.push_back("count");
+    return_types.push_back(LogicalType::BIGINT);
+
+    return std::move(result);
+}
+
+static unique_ptr<FunctionData> FirestoreArrayUnionBind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names
+) {
+    return FirestoreArrayTransformBind(context, input, return_types, names,
+                                        FirestoreClient::ArrayTransformType::ARRAY_UNION);
+}
+
+static unique_ptr<FunctionData> FirestoreArrayRemoveBind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names
+) {
+    return FirestoreArrayTransformBind(context, input, return_types, names,
+                                        FirestoreClient::ArrayTransformType::ARRAY_REMOVE);
+}
+
+static unique_ptr<FunctionData> FirestoreArrayAppendBind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names
+) {
+    return FirestoreArrayTransformBind(context, input, return_types, names,
+                                        FirestoreClient::ArrayTransformType::ARRAY_APPEND);
+}
+
+static unique_ptr<GlobalTableFunctionState> FirestoreArrayTransformInitGlobal(
+    ClientContext &context,
+    TableFunctionInitInput &input
+) {
+    return make_uniq<FirestoreArrayTransformGlobalState>();
+}
+
+static void FirestoreArrayTransformFunction(
+    ClientContext &context,
+    TableFunctionInput &data,
+    DataChunk &output
+) {
+    auto &bind_data = data.bind_data->CastNoConst<FirestoreArrayTransformBindData>();
+    auto &global_state = data.global_state->Cast<FirestoreArrayTransformGlobalState>();
+
+    if (global_state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+
+    int64_t count = 0;
+
+    try {
+        FirestoreClient client(bind_data.credentials);
+
+        // Convert DuckDB values to Firestore format
+        json elements = json::array();
+        LogicalType element_type = LogicalType::VARCHAR;
+        if (!bind_data.elements.empty()) {
+            element_type = bind_data.elements[0].type();
+        }
+
+        for (const auto &elem : bind_data.elements) {
+            elements.push_back(DuckDBValueToFirestore(elem, elem.type()));
+        }
+
+        // Perform the array transform
+        client.ArrayTransform(
+            bind_data.collection,
+            bind_data.document_id,
+            bind_data.field_name,
+            elements,
+            bind_data.transform_type
+        );
+        count = 1;
+    } catch (const FirestoreNotFoundException &e) {
+        count = 0;
+    } catch (const std::exception &e) {
+        throw InvalidInputException("Firestore array transform failed: " + std::string(e.what()));
+    }
+
+    FlatVector::GetData<int64_t>(output.data[0])[0] = count;
+    output.SetCardinality(1);
+    global_state.done = true;
+}
+
+// ============================================================================
 // Table-valued function for bulk insert (via COPY or INSERT...SELECT)
 // ============================================================================
 
@@ -819,6 +990,57 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
     delete_batch_func.named_parameters["database"] = LogicalType::VARCHAR;
 
     loader.RegisterFunction(delete_batch_func);
+
+    // Register firestore_array_union table function
+    // Usage: SELECT * FROM firestore_array_union('collection', 'doc_id', 'field', ['val1', 'val2'])
+    // Adds elements to array without duplicates
+    TableFunction array_union_func("firestore_array_union",
+                                   {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                    LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+                                   FirestoreArrayTransformFunction,
+                                   FirestoreArrayUnionBind,
+                                   FirestoreArrayTransformInitGlobal);
+
+    array_union_func.named_parameters["project_id"] = LogicalType::VARCHAR;
+    array_union_func.named_parameters["credentials"] = LogicalType::VARCHAR;
+    array_union_func.named_parameters["api_key"] = LogicalType::VARCHAR;
+    array_union_func.named_parameters["database"] = LogicalType::VARCHAR;
+
+    loader.RegisterFunction(array_union_func);
+
+    // Register firestore_array_remove table function
+    // Usage: SELECT * FROM firestore_array_remove('collection', 'doc_id', 'field', ['val1', 'val2'])
+    // Removes specified elements from array
+    TableFunction array_remove_func("firestore_array_remove",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                     LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+                                    FirestoreArrayTransformFunction,
+                                    FirestoreArrayRemoveBind,
+                                    FirestoreArrayTransformInitGlobal);
+
+    array_remove_func.named_parameters["project_id"] = LogicalType::VARCHAR;
+    array_remove_func.named_parameters["credentials"] = LogicalType::VARCHAR;
+    array_remove_func.named_parameters["api_key"] = LogicalType::VARCHAR;
+    array_remove_func.named_parameters["database"] = LogicalType::VARCHAR;
+
+    loader.RegisterFunction(array_remove_func);
+
+    // Register firestore_array_append table function
+    // Usage: SELECT * FROM firestore_array_append('collection', 'doc_id', 'field', ['val1', 'val2'])
+    // Appends elements to array (may create duplicates)
+    TableFunction array_append_func("firestore_array_append",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                     LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+                                    FirestoreArrayTransformFunction,
+                                    FirestoreArrayAppendBind,
+                                    FirestoreArrayTransformInitGlobal);
+
+    array_append_func.named_parameters["project_id"] = LogicalType::VARCHAR;
+    array_append_func.named_parameters["credentials"] = LogicalType::VARCHAR;
+    array_append_func.named_parameters["api_key"] = LogicalType::VARCHAR;
+    array_append_func.named_parameters["database"] = LogicalType::VARCHAR;
+
+    loader.RegisterFunction(array_append_func);
 }
 
 void RegisterFirestoreCopyFunction(ExtensionLoader &loader) {

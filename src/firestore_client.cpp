@@ -375,6 +375,88 @@ void FirestoreClient::BatchWrite(const std::vector<json> &writes) {
     FS_LOG_DEBUG("Batch write completed successfully");
 }
 
+void FirestoreClient::ArrayTransform(
+    const std::string &collection,
+    const std::string &document_id,
+    const std::string &field_name,
+    const json &elements,
+    ArrayTransformType transform_type
+) {
+    std::string transform_name;
+    switch (transform_type) {
+        case ArrayTransformType::ARRAY_UNION:
+            transform_name = "appendMissingElements";
+            FS_LOG_DEBUG("Array union on " + collection + "/" + document_id + "." + field_name);
+            break;
+        case ArrayTransformType::ARRAY_REMOVE:
+            transform_name = "removeAllFromArray";
+            FS_LOG_DEBUG("Array remove on " + collection + "/" + document_id + "." + field_name);
+            break;
+        case ArrayTransformType::ARRAY_APPEND:
+            // For append, we use appendMissingElements but the caller should handle dedup
+            // Actually, Firestore doesn't have a direct "append with duplicates" operation
+            // We'll need to do read-modify-write for true append
+            transform_name = "appendMissingElements";
+            FS_LOG_DEBUG("Array append on " + collection + "/" + document_id + "." + field_name);
+            break;
+    }
+
+    // Build the document path
+    std::string clean_collection = collection;
+    if (!clean_collection.empty() && clean_collection[0] == '/') {
+        clean_collection = clean_collection.substr(1);
+    }
+    std::string doc_path = "projects/" + credentials_->project_id +
+                           "/databases/" + credentials_->database_id +
+                           "/documents/" + clean_collection + "/" + document_id;
+
+    // For ARRAY_APPEND with duplicates, we need to do read-modify-write
+    if (transform_type == ArrayTransformType::ARRAY_APPEND) {
+        // Read current document
+        FirestoreDocument current_doc = GetDocument(collection, document_id);
+
+        // Get current array value
+        json current_array = json::array();
+        if (current_doc.fields.contains(field_name) &&
+            current_doc.fields[field_name].contains("arrayValue") &&
+            current_doc.fields[field_name]["arrayValue"].contains("values")) {
+            current_array = current_doc.fields[field_name]["arrayValue"]["values"];
+        }
+
+        // Append new elements (allowing duplicates)
+        for (const auto &elem : elements) {
+            current_array.push_back(elem);
+        }
+
+        // Update with the new array
+        json fields = {{field_name, {{"arrayValue", {{"values", current_array}}}}}};
+        UpdateDocument(collection, document_id, fields);
+        return;
+    }
+
+    // For ARRAY_UNION and ARRAY_REMOVE, use field transforms via commit
+    std::string url = BuildBaseUrl() + ":commit" + credentials_->GetUrlSuffix();
+
+    FirestoreErrorContext ctx;
+    ctx.withOperation("array_transform").withCollection(collection).withDocument(document_id);
+
+    // Build the write with field transform
+    json write_op = {
+        {"transform", {
+            {"document", doc_path},
+            {"fieldTransforms", {{
+                {"fieldPath", field_name},
+                {transform_name, {{"values", elements}}}
+            }}}
+        }}
+    };
+
+    json body = {{"writes", {write_op}}};
+    MakeRequest("POST", url, body, ctx);
+
+    FS_LOG_DEBUG("Array transform completed successfully");
+}
+
 FirestoreListResponse FirestoreClient::CollectionGroupQuery(
     const std::string &collection_id,
     const FirestoreQuery &query

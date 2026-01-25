@@ -72,6 +72,21 @@ public:
     // Batch write for bulk operations
     void BatchWrite(const std::vector<json> &writes);
 
+    // Array field transforms
+    enum class ArrayTransformType {
+        ARRAY_UNION,      // Add elements without duplicates
+        ARRAY_REMOVE,     // Remove specific elements
+        ARRAY_APPEND      // Append elements (may create duplicates)
+    };
+
+    void ArrayTransform(
+        const std::string &collection,
+        const std::string &document_id,
+        const std::string &field_name,
+        const json &elements,
+        ArrayTransformType transform_type
+    );
+
     // Collection group query - queries all subcollections with a given name
     // Use this to query across all documents in subcollections
     FirestoreListResponse CollectionGroupQuery(

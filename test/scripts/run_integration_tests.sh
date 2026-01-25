@@ -374,5 +374,160 @@ SELECT * FROM firestore_delete_batch('users', getvariable('inactive_ids'));
 SELECT __document_id, name, status FROM firestore_scan('users') ORDER BY name;
 "
 
+# Test 13: Array operations - setup
+echo "Test 13: Array operations setup..."
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/array_test?documentId=arr1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"name":{"stringValue":"Array Test Doc"},"tags":{"arrayValue":{"values":[{"stringValue":"initial"},{"stringValue":"tag"}]}},"scores":{"arrayValue":{"values":[{"integerValue":"10"},{"integerValue":"20"}]}}}}' > /dev/null
+
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET array_ops_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Verify initial state
+SELECT 'Initial array state:' as label;
+SELECT __document_id, name, tags, scores FROM firestore_scan('array_test');
+"
+
+# Test 14: Array append (allows duplicates)
+echo "Test 14: Array append (allows duplicates)..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET array_append_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Append elements (including duplicate 'initial')
+SELECT * FROM firestore_array_append('array_test', 'arr1', 'tags', ['new', 'initial']);
+
+-- Verify duplicates were added
+SELECT 'After append:' as label;
+SELECT tags FROM firestore_scan('array_test');
+"
+
+# Verify append created duplicates
+echo "Verifying array_append allows duplicates..."
+TAG_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET append_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT list_count(tags) FROM firestore_scan('array_test');
+" 2>&1 | tail -1)
+
+if [ "$TAG_COUNT" -lt 4 ]; then
+    echo "FAIL: array_append should have created duplicates. Expected 4+ tags, got $TAG_COUNT"
+    exit 1
+else
+    echo "PASS: array_append created duplicates ($TAG_COUNT tags)"
+fi
+
+# Test 15: Array union (no duplicates)
+echo "Test 15: Array union (no duplicates)..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET array_union_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Union with existing and new elements
+SELECT * FROM firestore_array_union('array_test', 'arr1', 'tags', ['premium', 'initial']);
+
+-- Verify - 'initial' should not be added again, but 'premium' should
+SELECT 'After union:' as label;
+SELECT tags FROM firestore_scan('array_test');
+"
+
+# Test 16: Array remove
+echo "Test 16: Array remove..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET array_remove_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Remove all instances of 'initial'
+SELECT * FROM firestore_array_remove('array_test', 'arr1', 'tags', ['initial']);
+
+-- Verify all 'initial' entries were removed
+SELECT 'After remove:' as label;
+SELECT tags FROM firestore_scan('array_test');
+"
+
+# Verify remove worked - 'initial' should be gone
+echo "Verifying array_remove removed all instances..."
+INITIAL_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET remove_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');
+" 2>&1 | tail -1)
+
+if [ "$INITIAL_COUNT" -ne 0 ]; then
+    echo "FAIL: array_remove should have removed all 'initial' entries. Found $INITIAL_COUNT"
+    exit 1
+else
+    echo "PASS: array_remove removed all 'initial' entries"
+fi
+
+# Test 17: Numeric array operations
+echo "Test 17: Numeric array operations..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET numeric_array_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Append numeric values
+SELECT * FROM firestore_array_append('array_test', 'arr1', 'scores', [30, 40]);
+
+-- Verify and use list aggregations
+SELECT 'Numeric array after append:' as label;
+SELECT scores,
+       list_aggregate(scores, 'sum') as total,
+       list_aggregate(scores, 'avg') as average
+FROM firestore_scan('array_test');
+"
+
+# Test 18: Array contains check with list_contains
+echo "Test 18: Array contains filtering..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET contains_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Check array membership
+SELECT __document_id,
+       list_contains(tags, 'premium') as has_premium,
+       list_contains(tags, 'initial') as has_initial
+FROM firestore_scan('array_test');
+"
+
+# Cleanup array test data
+echo "Cleaning up array test data..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET cleanup (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT * FROM firestore_delete('array_test', 'arr1');
+"
+
 echo ""
 echo "=== All integration tests passed! ==="
