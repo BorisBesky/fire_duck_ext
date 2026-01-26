@@ -2,10 +2,56 @@
 #include "firestore_logger.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
 #include <map>
 #include <set>
 
 namespace duckdb {
+
+// Base64 encoding for bytesValue
+static std::string Base64Encode(const std::string &data) {
+    BIO *bio, *b64;
+    BUF_MEM *bufferPtr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(bio, data.data(), data.size());
+    BIO_flush(bio);
+    BIO_get_mem_ptr(bio, &bufferPtr);
+
+    std::string result(bufferPtr->data, bufferPtr->length);
+    BIO_free_all(bio);
+
+    return result;
+}
+
+// Base64 decoding for bytesValue
+static std::string Base64Decode(const std::string &encoded) {
+    BIO *bio, *b64;
+
+    // Calculate max decoded length
+    size_t decoded_length = encoded.size() * 3 / 4 + 1;
+    std::vector<char> buffer(decoded_length);
+
+    bio = BIO_new_mem_buf(encoded.data(), encoded.size());
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    int actual_length = BIO_read(bio, buffer.data(), encoded.size());
+    BIO_free_all(bio);
+
+    if (actual_length < 0) {
+        return encoded;  // Return as-is if decoding fails
+    }
+
+    return std::string(buffer.data(), actual_length);
+}
 
 bool IsFirestoreNull(const json &value) {
     return value.contains("nullValue");
@@ -37,8 +83,11 @@ LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type) {
     if (firestore_type == "nullValue") return LogicalType::VARCHAR;  // Will be null
 
     if (firestore_type == "geoPointValue") {
-        // GeoPoints become JSON strings for simplicity
-        return LogicalType::VARCHAR;
+        // GeoPoints become STRUCT(latitude DOUBLE, longitude DOUBLE)
+        child_list_t<LogicalType> struct_children;
+        struct_children.push_back(make_pair("latitude", LogicalType::DOUBLE));
+        struct_children.push_back(make_pair("longitude", LogicalType::DOUBLE));
+        return LogicalType::STRUCT(struct_children);
     }
 
     if (firestore_type == "arrayValue") {
@@ -116,12 +165,15 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
     }
 
     if (fv.contains("geoPointValue")) {
-        // Convert geopoint to JSON string
+        // Convert geopoint to STRUCT(latitude DOUBLE, longitude DOUBLE)
         auto &geo = fv["geoPointValue"];
-        json geo_json;
-        geo_json["latitude"] = geo["latitude"].get<double>();
-        geo_json["longitude"] = geo["longitude"].get<double>();
-        return Value(geo_json.dump());
+        double lat = geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0;
+        double lng = geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0;
+
+        child_list_t<Value> struct_values;
+        struct_values.push_back(make_pair("latitude", Value::DOUBLE(lat)));
+        struct_values.push_back(make_pair("longitude", Value::DOUBLE(lng)));
+        return Value::STRUCT(struct_values);
     }
 
     if (fv.contains("arrayValue")) {
@@ -235,8 +287,9 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
 
     if (fv.contains("bytesValue")) {
         std::string b64 = fv["bytesValue"].get<std::string>();
-        // Decode base64 (simplified - full implementation would use proper decoder)
-        return Value::BLOB(b64);  // Store as-is for now, proper decoding needed
+        // Decode base64 to binary data
+        std::string decoded = Base64Decode(b64);
+        return Value::BLOB(decoded);
     }
 
     // Unknown type - return as string
@@ -287,9 +340,11 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
             return {{"timestampValue", ts_str}};
         }
 
-        case LogicalTypeId::BLOB:
-            // For now, store as-is (should be base64 encoded)
-            return {{"bytesValue", value.GetValue<std::string>()}};
+        case LogicalTypeId::BLOB: {
+            // Base64 encode the binary data for Firestore
+            std::string blob_data = value.GetValue<std::string>();
+            return {{"bytesValue", Base64Encode(blob_data)}};
+        }
 
         case LogicalTypeId::LIST: {
             json arr_values = json::array();
@@ -302,9 +357,35 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
         }
 
         case LogicalTypeId::STRUCT: {
-            json fields;
-            auto &children = StructValue::GetChildren(value);
+            // Check if this is a geopoint struct (has latitude and longitude)
             auto &child_types = StructType::GetChildTypes(source_type);
+            bool is_geopoint = false;
+            if (child_types.size() == 2) {
+                bool has_lat = false, has_lng = false;
+                for (const auto &child : child_types) {
+                    if (child.first == "latitude" && child.second.id() == LogicalTypeId::DOUBLE) has_lat = true;
+                    if (child.first == "longitude" && child.second.id() == LogicalTypeId::DOUBLE) has_lng = true;
+                }
+                is_geopoint = has_lat && has_lng;
+            }
+
+            auto &children = StructValue::GetChildren(value);
+
+            if (is_geopoint) {
+                // Convert to geoPointValue
+                double lat = 0.0, lng = 0.0;
+                for (idx_t i = 0; i < children.size(); i++) {
+                    if (child_types[i].first == "latitude") {
+                        lat = children[i].IsNull() ? 0.0 : children[i].GetValue<double>();
+                    } else if (child_types[i].first == "longitude") {
+                        lng = children[i].IsNull() ? 0.0 : children[i].GetValue<double>();
+                    }
+                }
+                return {{"geoPointValue", {{"latitude", lat}, {"longitude", lng}}}};
+            }
+
+            // Regular struct -> mapValue
+            json fields;
             for (idx_t i = 0; i < children.size(); i++) {
                 fields[child_types[i].first] =
                     DuckDBValueToFirestore(children[i], child_types[i].second);
@@ -482,6 +563,50 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
                     }
                 }
             }
+            break;
+        }
+        case LogicalTypeId::STRUCT: {
+            // Handle STRUCT type (e.g., geoPointValue)
+            auto &struct_children = StructValue::GetChildren(converted);
+            auto &struct_vector = StructVector::GetEntries(vector);
+            auto &child_types = StructType::GetChildTypes(actual_type);
+
+            for (idx_t i = 0; i < struct_children.size() && i < struct_vector.size(); i++) {
+                auto &child_vec = *struct_vector[i];
+                auto &child_val = struct_children[i];
+
+                if (child_val.IsNull()) {
+                    FlatVector::SetNull(child_vec, index, true);
+                } else {
+                    switch (child_types[i].second.id()) {
+                        case LogicalTypeId::DOUBLE:
+                            FlatVector::GetData<double>(child_vec)[index] = child_val.GetValue<double>();
+                            break;
+                        case LogicalTypeId::VARCHAR: {
+                            auto str = child_val.GetValue<std::string>();
+                            FlatVector::GetData<string_t>(child_vec)[index] =
+                                StringVector::AddString(child_vec, str);
+                            break;
+                        }
+                        case LogicalTypeId::BIGINT:
+                            FlatVector::GetData<int64_t>(child_vec)[index] = child_val.GetValue<int64_t>();
+                            break;
+                        case LogicalTypeId::BOOLEAN:
+                            FlatVector::GetData<bool>(child_vec)[index] = child_val.GetValue<bool>();
+                            break;
+                        default:
+                            FlatVector::SetNull(child_vec, index, true);
+                            break;
+                    }
+                }
+            }
+            break;
+        }
+        case LogicalTypeId::BLOB: {
+            // Handle BLOB type (bytesValue)
+            auto blob_data = converted.GetValue<std::string>();
+            FlatVector::GetData<string_t>(vector)[index] =
+                StringVector::AddString(vector, blob_data);
             break;
         }
         default:

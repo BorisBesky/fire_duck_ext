@@ -529,5 +529,313 @@ CREATE SECRET cleanup (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-
 SELECT * FROM firestore_delete('array_test', 'arr1');
 "
 
+# Test 19: GeoPoint type (reading)
+echo "Test 19: GeoPoint type support..."
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"name":{"stringValue":"San Francisco"},"coordinates":{"geoPointValue":{"latitude":37.7749,"longitude":-122.4194}}}}' > /dev/null
+
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET geopoint_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Verify geopoint is read as STRUCT
+SELECT 'GeoPoint column type:' as label;
+DESCRIBE SELECT coordinates FROM firestore_scan('locations');
+
+-- Access struct fields
+SELECT __document_id, name,
+       coordinates.latitude as lat,
+       coordinates.longitude as lng
+FROM firestore_scan('locations');
+"
+
+# Test 20: GeoPoint type (writing)
+echo "Test 20: GeoPoint update..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET geopoint_update_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Update with new coordinates (New York)
+SELECT * FROM firestore_update('locations', 'loc1',
+    'coordinates', {'latitude': 40.7128, 'longitude': -74.0060}::STRUCT(latitude DOUBLE, longitude DOUBLE),
+    'name', 'New York'
+);
+
+-- Verify the update
+SELECT __document_id, name,
+       coordinates.latitude as lat,
+       coordinates.longitude as lng
+FROM firestore_scan('locations');
+"
+
+# Verify geopoint was written correctly
+echo "Verifying geopoint was written correctly..."
+LAT_VALUE=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET geopoint_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT round(coordinates.latitude, 4) FROM firestore_scan('locations');
+" 2>&1 | tail -1)
+
+if [ "$LAT_VALUE" != "40.7128" ]; then
+    echo "FAIL: GeoPoint latitude should be 40.7128, got $LAT_VALUE"
+    exit 1
+else
+    echo "PASS: GeoPoint written correctly (latitude=$LAT_VALUE)"
+fi
+
+# Test 21: Reference type
+echo "Test 21: Reference type support..."
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/posts?documentId=post1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"title":{"stringValue":"My Post"},"author":{"referenceValue":"projects/test-project/databases/(default)/documents/users/user1"}}}' > /dev/null
+
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET reference_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Verify reference is read as VARCHAR
+SELECT 'Reference column type:' as label;
+DESCRIBE SELECT author FROM firestore_scan('posts');
+
+-- Read the reference value
+SELECT __document_id, title, author FROM firestore_scan('posts');
+
+-- Extract document ID from reference path
+SELECT __document_id, title,
+       split_part(author, '/', -1) as author_id
+FROM firestore_scan('posts');
+"
+
+# Test 22: Bytes type
+echo "Test 22: Bytes type support..."
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/files?documentId=file1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"filename":{"stringValue":"test.txt"},"content":{"bytesValue":"SGVsbG8gRmlyZXN0b3JlIQ=="}}}' > /dev/null
+
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET bytes_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Verify bytes is read as BLOB
+SELECT 'Bytes column type:' as label;
+DESCRIBE SELECT content FROM firestore_scan('files');
+
+-- Read the bytes value (base64 decoded)
+SELECT __document_id, filename, content FROM firestore_scan('files');
+
+-- Verify content is correctly decoded
+SELECT __document_id, filename,
+       content::VARCHAR as decoded_content
+FROM firestore_scan('files');
+"
+
+# Verify bytes was decoded correctly
+echo "Verifying bytes decoding..."
+DECODED=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET bytes_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT content::VARCHAR FROM firestore_scan('files');
+" 2>&1 | tail -1)
+
+if [ "$DECODED" != "Hello Firestore!" ]; then
+    echo "FAIL: Bytes should decode to 'Hello Firestore!', got '$DECODED'"
+    exit 1
+else
+    echo "PASS: Bytes decoded correctly ($DECODED)"
+fi
+
+# Test 23: Reference type update
+echo "Test 23: Reference type update..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET reference_update_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Update the author reference to a different user
+SELECT * FROM firestore_update('posts', 'post1',
+    'author', 'projects/test-project/databases/(default)/documents/users/user2',
+    'title', 'Updated Post'
+);
+
+-- Verify the update
+SELECT __document_id, title,
+       split_part(author, '/', -1) as author_id
+FROM firestore_scan('posts');
+"
+
+# Verify reference was updated correctly
+echo "Verifying reference update..."
+AUTHOR_ID=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET ref_update_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT split_part(author, '/', -1) FROM firestore_scan('posts');
+" 2>&1 | tail -1)
+
+if [ "$AUTHOR_ID" != "user2" ]; then
+    echo "FAIL: Reference should be updated to user2, got $AUTHOR_ID"
+    exit 1
+else
+    echo "PASS: Reference updated correctly (author_id=$AUTHOR_ID)"
+fi
+
+# Test 24: Bytes type update
+echo "Test 24: Bytes type update..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET bytes_update_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Update with new binary content (will be base64 encoded automatically)
+SELECT * FROM firestore_update('files', 'file1',
+    'content', 'New binary data!'::BLOB,
+    'filename', 'updated.txt'
+);
+
+-- Verify the update
+SELECT __document_id, filename, content::VARCHAR as text_content
+FROM firestore_scan('files');
+"
+
+# Verify bytes was updated correctly
+echo "Verifying bytes update..."
+UPDATED_CONTENT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET bytes_update_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT content::VARCHAR FROM firestore_scan('files');
+" 2>&1 | tail -1)
+
+if [ "$UPDATED_CONTENT" != "New binary data!" ]; then
+    echo "FAIL: Bytes should be 'New binary data!', got '$UPDATED_CONTENT'"
+    exit 1
+else
+    echo "PASS: Bytes updated correctly ($UPDATED_CONTENT)"
+fi
+
+# Test 25: Multiple GeoPoint updates (batch scenario simulation)
+echo "Test 25: Multiple location updates..."
+# Create additional location documents
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"name":{"stringValue":"Los Angeles"},"coordinates":{"geoPointValue":{"latitude":34.0522,"longitude":-118.2437}}}}' > /dev/null
+
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"name":{"stringValue":"Chicago"},"coordinates":{"geoPointValue":{"latitude":41.8781,"longitude":-87.6298}}}}' > /dev/null
+
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET multi_geopoint_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- View all locations
+SELECT 'All locations before batch update:' as label;
+SELECT __document_id, name,
+       coordinates.latitude as lat,
+       coordinates.longitude as lng
+FROM firestore_scan('locations')
+ORDER BY name;
+
+-- Get IDs of locations to update (all of them)
+SET VARIABLE loc_ids = (SELECT list(__document_id) FROM firestore_scan('locations'));
+
+-- Batch update - mark all as verified with a new field
+SELECT * FROM firestore_update_batch('locations', getvariable('loc_ids'), 'verified', true);
+
+-- Verify the batch update
+SELECT 'After batch update (verified field added):' as label;
+SELECT __document_id, name, verified
+FROM firestore_scan('locations')
+ORDER BY name;
+"
+
+# Verify batch update worked
+echo "Verifying batch geopoint update..."
+VERIFIED_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET batch_geo_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT count(*) FROM firestore_scan('locations') WHERE verified = true;
+" 2>&1 | tail -1)
+
+if [ "$VERIFIED_COUNT" -ne 3 ]; then
+    echo "FAIL: All 3 locations should be verified, got $VERIFIED_COUNT"
+    exit 1
+else
+    echo "PASS: Batch update worked ($VERIFIED_COUNT locations verified)"
+fi
+
+# Test 26: GeoPoint distance calculation (using struct fields)
+echo "Test 26: GeoPoint calculations..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+
+CREATE SECRET geopoint_calc_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'fake-key'
+);
+
+-- Calculate approximate distance from a reference point (simplified)
+-- Reference: Seattle (47.6062, -122.3321)
+SELECT __document_id, name,
+       coordinates.latitude as lat,
+       coordinates.longitude as lng,
+       -- Simple Euclidean approximation (not accurate for real distances)
+       sqrt(power(coordinates.latitude - 47.6062, 2) + power(coordinates.longitude - (-122.3321), 2)) as approx_distance
+FROM firestore_scan('locations')
+ORDER BY approx_distance;
+
+-- Filter locations within a bounding box (latitude 35-45, longitude -125 to -70)
+SELECT 'Locations in bounding box:' as label;
+SELECT __document_id, name, coordinates.latitude, coordinates.longitude
+FROM firestore_scan('locations')
+WHERE coordinates.latitude BETWEEN 35 AND 45
+  AND coordinates.longitude BETWEEN -125 AND -70;
+"
+
+# Cleanup special types test data
+echo "Cleaning up special types test data..."
+$DUCKDB -unsigned -c "
+LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+CREATE SECRET special_cleanup (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT * FROM firestore_delete('locations', 'loc1');
+SELECT * FROM firestore_delete('locations', 'loc2');
+SELECT * FROM firestore_delete('locations', 'loc3');
+SELECT * FROM firestore_delete('posts', 'post1');
+SELECT * FROM firestore_delete('files', 'file1');
+"
+
 echo ""
 echo "=== All integration tests passed! ==="

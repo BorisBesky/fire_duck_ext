@@ -265,12 +265,12 @@ SELECT getvariable('pending_under_30');
 ----
 [user2, user4]
 
-# Store IDs with LIKE pattern (names ending in 'e')
+# Store IDs with LIKE pattern (names includes 'e')
 statement ok
-SET VARIABLE names_end_e = (SELECT list(__document_id) FROM mock_users WHERE name LIKE '%e');
+SET VARIABLE names_include_e = (SELECT list(__document_id) FROM mock_users WHERE name LIKE '%e%');
 
 query I
-SELECT getvariable('names_end_e');
+SELECT getvariable('names_include_e');
 ----
 [user1, user3, user5]
 
