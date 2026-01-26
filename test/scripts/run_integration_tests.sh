@@ -14,6 +14,43 @@ else
     exit 1
 fi
 
+EXT_PATH="build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension"
+
+# Helper: run a DuckDB query and return the trimmed last line of output
+run_query() {
+    $DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+$1
+" 2>&1 | tail -1 | tr -d '[:space:]"'
+}
+
+# Helper: assert equality
+assert_eq() {
+    local actual="$1"
+    local expected="$2"
+    local msg="$3"
+    if [ "$actual" != "$expected" ]; then
+        echo "FAIL: $msg (expected '$expected', got '$actual')"
+        exit 1
+    else
+        echo "PASS: $msg"
+    fi
+}
+
+# Helper: assert numeric comparison
+assert_ge() {
+    local actual="$1"
+    local threshold="$2"
+    local msg="$3"
+    if [ "$actual" -lt "$threshold" ]; then
+        echo "FAIL: $msg (expected >= $threshold, got $actual)"
+        exit 1
+    else
+        echo "PASS: $msg"
+    fi
+}
+
 echo "=== FireDuckExt Integration Tests ==="
 echo "FIRESTORE_EMULATOR_HOST: $FIRESTORE_EMULATOR_HOST"
 
@@ -72,307 +109,120 @@ echo "Test data seeded."
 echo ""
 echo "Running integration tests..."
 
-# Test 1: Basic scan
+# Test 1: Basic scan - extension loads
 echo "Test 1: Basic firestore_scan..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET test_secret (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key-for-emulator'
-);
-
--- Note: The emulator doesn't require real authentication
--- but our extension still needs credentials configured
-
-SELECT 'Extension loaded successfully' as status;
-"
+LOAD_RESULT=$(run_query "SELECT 'ok';")
+assert_eq "$LOAD_RESULT" "ok" "Extension loads successfully"
 
 # Test 2: Verify functions exist
 echo "Test 2: Verify all functions registered..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-SELECT function_name FROM duckdb_functions()
-WHERE function_name LIKE 'firestore%'
-ORDER BY function_name;
-"
+FUNC_COUNT=$(run_query "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'firestore%';")
+assert_ge "$FUNC_COUNT" 9 "At least 9 firestore functions registered (got $FUNC_COUNT)"
 
 # Test 3: Secret management
 echo "Test 3: Secret management..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
+SECRET_RESULT=$(run_query "
+DROP SECRET __q;
 CREATE SECRET s1 (TYPE firestore, PROJECT_ID 'p1', API_KEY 'k1');
 CREATE SECRET s2 (TYPE firestore, PROJECT_ID 'p2', API_KEY 'k2', DATABASE 'custom-db');
 DROP SECRET s1;
 DROP SECRET s2;
-
-SELECT 'Secret management works' as status;
-"
+SELECT 'ok';
+")
+assert_eq "$SECRET_RESULT" "ok" "Secret create/drop works"
 
 # Test 4: Read data from emulator
 echo "Test 4: Reading data from emulator..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+USER_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('users');")
+assert_eq "$USER_COUNT" "5" "Read 5 users from emulator"
 
-CREATE SECRET emulator_secret (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Scan users collection
-SELECT __document_id, name, status FROM firestore_scan('users') ORDER BY name;
-"
+ALICE_AGE=$(run_query "SELECT age FROM firestore_scan('users') WHERE name = 'Alice';")
+assert_eq "$ALICE_AGE" "30" "Alice has age 30"
 
 # Test 4b: __document_id projection regression test
-# This test ensures SELECT * returns all columns (not just __document_id) and correct row count
-# Regression: COLUMN_IDENTIFIER_ROW_ID handling caused SELECT * to return only __document_id with 0 rows
 echo "Test 4b: __document_id projection regression test..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET projection_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Test 1: SELECT * must return correct row count (5 users seeded)
--- This was broken: returned 0 rows when COLUMN_IDENTIFIER_ROW_ID was mishandled
-SELECT 'Row count test:' as label;
-SELECT CASE
-    WHEN (SELECT COUNT(*) FROM firestore_scan('users')) = 5
-    THEN 'PASS: SELECT * returned 5 rows'
-    ELSE 'FAIL: SELECT * returned ' || (SELECT COUNT(*) FROM firestore_scan('users')) || ' rows, expected 5'
-END as result;
-
--- Test 2: Selecting only __document_id should work and return data
-SELECT 'Selecting only __document_id:' as label;
-SELECT __document_id FROM firestore_scan('users') ORDER BY __document_id;
-
--- Test 3: Selecting __document_id with other specific columns should work
-SELECT 'Selecting __document_id with name:' as label;
-SELECT __document_id, name FROM firestore_scan('users') ORDER BY name;
-
--- Test 4: SELECT * should include __document_id as first column plus all data columns
--- This was broken: only showed __document_id column, missing name/age/status
-SELECT 'Full SELECT * output (should show __document_id, name, age, status):' as label;
-SELECT * FROM firestore_scan('users') ORDER BY name LIMIT 2;
-
--- Test 5: Verify we can access data columns (proves schema inference worked)
-SELECT 'Data column access test:' as label;
-SELECT name, age, status FROM firestore_scan('users') WHERE name = 'Alice';
-"
-
-# Verify the regression didn't occur - check that SELECT * returns more than just __document_id
-echo "Verifying SELECT * returns multiple columns..."
-COL_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET col_count_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+COL_COUNT=$(run_query "
 CREATE TEMP TABLE scan_result AS SELECT * FROM firestore_scan('users') LIMIT 1;
 SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'scan_result';
-" 2>&1 | tail -1)
+")
+assert_ge "$COL_COUNT" 2 "SELECT * returns multiple columns ($COL_COUNT)"
 
-if [ "$COL_COUNT" -le 1 ]; then
-    echo "FAIL: SELECT * returned only $COL_COUNT column(s). Expected multiple columns (__document_id + data columns)."
-    exit 1
-else
-    echo "PASS: SELECT * returned $COL_COUNT columns"
-fi
+ROW_COUNT=$(run_query "SELECT COUNT(*) FROM firestore_scan('users');")
+assert_eq "$ROW_COUNT" "5" "SELECT * returns 5 rows"
 
-# Verify row count is not 0
-echo "Verifying row count is correct..."
-ROW_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET row_count_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT COUNT(*) FROM firestore_scan('users');
-" 2>&1 | tail -1)
-
-if [ "$ROW_COUNT" -eq 0 ]; then
-    echo "FAIL: SELECT * returned 0 rows. Expected 5 rows."
-    exit 1
-else
-    echo "PASS: SELECT * returned $ROW_COUNT rows"
-fi
-
-# Test 5: DuckDB-side filtering pattern (the key use case!)
-echo "Test 5: DuckDB-side filtering for batch operations..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET filter_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- This is the pattern: filter in DuckDB, extract IDs, use in batch operation
-
--- Step 1: Find all pending users (filter in DuckDB)
-SELECT 'Pending users:' as label;
-SELECT __document_id, name, status
-FROM firestore_scan('users')
-WHERE status = 'pending';
-
--- Step 2: Extract document IDs into a list
-SELECT 'Document IDs to update:' as label;
-SELECT list(__document_id) as ids_to_update
-FROM firestore_scan('users')
-WHERE status = 'pending';
-
--- Step 3: Use with batch update (this would work with real credentials)
--- SELECT * FROM firestore_update_batch('users',
---     (SELECT list(__document_id) FROM firestore_scan('users') WHERE status = 'pending'),
---     'status', 'reviewed'
--- );
-"
+# Test 5: DuckDB-side filtering
+echo "Test 5: DuckDB-side filtering..."
+PENDING_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'pending';")
+assert_eq "$PENDING_COUNT" "2" "Found 2 pending users"
 
 # Test 6: Nested collection scan
 echo "Test 6: Nested collection scan..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+ORDER_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('users/user1/orders');")
+assert_eq "$ORDER_COUNT" "2" "User1 has 2 orders"
 
-CREATE SECRET nested_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Scan nested orders for user1
-SELECT __document_id, product, status
-FROM firestore_scan('users/user1/orders')
-ORDER BY product;
-"
+ORDER_PRODUCT=$(run_query "SELECT product FROM firestore_scan('users/user1/orders') WHERE __document_id = 'order1';")
+assert_eq "$ORDER_PRODUCT" "Widget" "Order1 product is Widget"
 
 # Test 7: Collection group query
 echo "Test 7: Collection group query (all orders across all users)..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET group_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Collection group query returns full path as __document_id
-SELECT __document_id, product, status
-FROM firestore_scan('~orders')
-ORDER BY product;
-"
+ALL_ORDERS=$(run_query "SELECT count(*) FROM firestore_scan('~orders');")
+assert_eq "$ALL_ORDERS" "3" "Collection group returns 3 total orders"
 
 # Test 8: Complex filtering with aggregation
 echo "Test 8: Complex filtering with aggregation..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET agg_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Find users above average age
-SELECT __document_id, name, age
-FROM firestore_scan('users')
+ABOVE_AVG=$(run_query "
+SELECT count(*) FROM firestore_scan('users')
 WHERE age > (SELECT AVG(age) FROM firestore_scan('users'));
+")
+assert_eq "$ABOVE_AVG" "2" "2 users above average age"
 
--- Count by status
-SELECT status, COUNT(*) as count
-FROM firestore_scan('users')
-GROUP BY status
-ORDER BY status;
-"
+ACTIVE_COUNT=$(run_query "
+SELECT count FROM (SELECT status, COUNT(*) as count FROM firestore_scan('users') GROUP BY status) WHERE status = 'active';
+")
+assert_eq "$ACTIVE_COUNT" "2" "2 active users"
 
 # Test 9: Single document update
 echo "Test 9: Single document update..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+run_query "SELECT * FROM firestore_update('users', 'user1', 'status', 'verified');" > /dev/null
 
-CREATE SECRET update_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Update a single document
-SELECT * FROM firestore_update('users', 'user1', 'status', 'verified');
-
--- Verify update
-SELECT __document_id, name, status
-FROM firestore_scan('users')
-WHERE __document_id = 'user1';
-"
+UPDATED_STATUS=$(run_query "SELECT status FROM firestore_scan('users') WHERE __document_id = 'user1';")
+assert_eq "$UPDATED_STATUS" "verified" "User1 status updated to verified"
 
 # Test 10: Batch update with DuckDB filtering
 echo "Test 10: Batch update with DuckDB filtering..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET batch_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Step 1: Get IDs of pending users and store in variable
--- (DuckDB doesn't allow subqueries directly in table function arguments)
+run_query "
 SET VARIABLE pending_ids = (SELECT list(__document_id) FROM firestore_scan('users') WHERE status = 'pending');
-SELECT 'Pending user IDs:' as label, getvariable('pending_ids') as ids;
-
--- Step 2: Batch update all pending users to 'reviewed' status
 SELECT * FROM firestore_update_batch('users', getvariable('pending_ids'), 'status', 'reviewed');
+" > /dev/null
 
--- Step 3: Verify - should be no more pending users
-SELECT COUNT(*) as pending_count
-FROM firestore_scan('users')
-WHERE status = 'pending';
-"
+REMAINING_PENDING=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'pending';")
+assert_eq "$REMAINING_PENDING" "0" "No pending users remain after batch update"
+
+REVIEWED_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'reviewed';")
+assert_eq "$REVIEWED_COUNT" "2" "2 users now reviewed"
 
 # Test 11: Single document delete
 echo "Test 11: Single document delete..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+BEFORE_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('products');")
+assert_eq "$BEFORE_DELETE" "2" "2 products before delete"
 
-CREATE SECRET delete_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+run_query "SELECT * FROM firestore_delete('products', 'prod2');" > /dev/null
 
--- Count before delete
-SELECT 'Before delete:' as label, COUNT(*) as count FROM firestore_scan('products');
-
--- Delete a product
-SELECT * FROM firestore_delete('products', 'prod2');
-
--- Count after delete
-SELECT 'After delete:' as label, COUNT(*) as count FROM firestore_scan('products');
-"
+AFTER_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('products');")
+assert_eq "$AFTER_DELETE" "1" "1 product after delete"
 
 # Test 12: Batch delete with filtering
 echo "Test 12: Batch delete with filtering..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET batch_delete_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Step 1: Get IDs of inactive users and store in variable
+run_query "
 SET VARIABLE inactive_ids = (SELECT list(__document_id) FROM firestore_scan('users') WHERE status = 'inactive');
-SELECT 'Inactive user IDs to delete:' as label, getvariable('inactive_ids') as ids;
-
--- Step 2: Delete all inactive users
 SELECT * FROM firestore_delete_batch('users', getvariable('inactive_ids'));
+" > /dev/null
 
--- Step 3: Verify
-SELECT __document_id, name, status FROM firestore_scan('users') ORDER BY name;
-"
+INACTIVE_REMAINING=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'inactive';")
+assert_eq "$INACTIVE_REMAINING" "0" "No inactive users remain after batch delete"
+
+TOTAL_USERS=$(run_query "SELECT count(*) FROM firestore_scan('users');")
+assert_eq "$TOTAL_USERS" "4" "4 users remain after deleting 1 inactive"
 
 # Test 13: Array operations - setup
 echo "Test 13: Array operations setup..."
@@ -380,154 +230,66 @@ curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/data
   -H "Content-Type: application/json" \
   -d '{"fields":{"name":{"stringValue":"Array Test Doc"},"tags":{"arrayValue":{"values":[{"stringValue":"initial"},{"stringValue":"tag"}]}},"scores":{"arrayValue":{"values":[{"integerValue":"10"},{"integerValue":"20"}]}}}}' > /dev/null
 
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET array_ops_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Verify initial state
-SELECT 'Initial array state:' as label;
-SELECT __document_id, name, tags, scores FROM firestore_scan('array_test');
-"
+INIT_TAG_COUNT=$(run_query "SELECT list_count(tags) FROM firestore_scan('array_test');")
+assert_eq "$INIT_TAG_COUNT" "2" "Initial array has 2 tags"
 
 # Test 14: Array append (allows duplicates)
 echo "Test 14: Array append (allows duplicates)..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+run_query "SELECT * FROM firestore_array_append('array_test', 'arr1', 'tags', ['new', 'initial']);" > /dev/null
 
-CREATE SECRET array_append_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+TAG_COUNT=$(run_query "SELECT list_count(tags) FROM firestore_scan('array_test');")
+assert_eq "$TAG_COUNT" "4" "Array has 4 tags after append (duplicates allowed)"
 
--- Append elements (including duplicate 'initial')
-SELECT * FROM firestore_array_append('array_test', 'arr1', 'tags', ['new', 'initial']);
-
--- Verify duplicates were added
-SELECT 'After append:' as label;
-SELECT tags FROM firestore_scan('array_test');
-"
-
-# Verify append created duplicates
-echo "Verifying array_append allows duplicates..."
-TAG_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET append_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT list_count(tags) FROM firestore_scan('array_test');
-" 2>&1 | tail -1)
-
-if [ "$TAG_COUNT" -lt 4 ]; then
-    echo "FAIL: array_append should have created duplicates. Expected 4+ tags, got $TAG_COUNT"
-    exit 1
-else
-    echo "PASS: array_append created duplicates ($TAG_COUNT tags)"
-fi
+INITIAL_OCCURRENCES=$(run_query "SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');")
+assert_eq "$INITIAL_OCCURRENCES" "2" "'initial' appears twice (duplicate created)"
 
 # Test 15: Array union (no duplicates)
 echo "Test 15: Array union (no duplicates)..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+TAG_COUNT_BEFORE=$(run_query "SELECT list_count(tags) FROM firestore_scan('array_test');")
+run_query "SELECT * FROM firestore_array_union('array_test', 'arr1', 'tags', ['premium', 'initial']);" > /dev/null
 
-CREATE SECRET array_union_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+TAG_COUNT_AFTER=$(run_query "SELECT list_count(tags) FROM firestore_scan('array_test');")
+HAS_PREMIUM=$(run_query "SELECT list_contains(tags, 'premium') FROM firestore_scan('array_test');")
+assert_eq "$HAS_PREMIUM" "true" "Union added 'premium'"
 
--- Union with existing and new elements
-SELECT * FROM firestore_array_union('array_test', 'arr1', 'tags', ['premium', 'initial']);
-
--- Verify - 'initial' should not be added again, but 'premium' should
-SELECT 'After union:' as label;
-SELECT tags FROM firestore_scan('array_test');
-"
+# Union should add only 'premium' (1 new element), not 'initial' (already exists)
+EXPECTED_AFTER=$((TAG_COUNT_BEFORE + 1))
+assert_eq "$TAG_COUNT_AFTER" "$EXPECTED_AFTER" "Union added exactly 1 new element (premium)"
 
 # Test 16: Array remove
 echo "Test 16: Array remove..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+run_query "SELECT * FROM firestore_array_remove('array_test', 'arr1', 'tags', ['initial']);" > /dev/null
 
-CREATE SECRET array_remove_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+INITIAL_COUNT=$(run_query "SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');")
+assert_eq "$INITIAL_COUNT" "0" "All 'initial' entries removed"
 
--- Remove all instances of 'initial'
-SELECT * FROM firestore_array_remove('array_test', 'arr1', 'tags', ['initial']);
+HAS_PREMIUM=$(run_query "SELECT list_contains(tags, 'premium') FROM firestore_scan('array_test');")
+assert_eq "$HAS_PREMIUM" "true" "'premium' still present after removing 'initial'"
 
--- Verify all 'initial' entries were removed
-SELECT 'After remove:' as label;
-SELECT tags FROM firestore_scan('array_test');
-"
-
-# Verify remove worked - 'initial' should be gone
-echo "Verifying array_remove removed all instances..."
-INITIAL_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET remove_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');
-" 2>&1 | tail -1)
-
-if [ "$INITIAL_COUNT" -ne 0 ]; then
-    echo "FAIL: array_remove should have removed all 'initial' entries. Found $INITIAL_COUNT"
-    exit 1
-else
-    echo "PASS: array_remove removed all 'initial' entries"
-fi
+HAS_TAG=$(run_query "SELECT list_contains(tags, 'tag') FROM firestore_scan('array_test');")
+assert_eq "$HAS_TAG" "true" "'tag' still present after removing 'initial'"
 
 # Test 17: Numeric array operations
 echo "Test 17: Numeric array operations..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+run_query "SELECT * FROM firestore_array_append('array_test', 'arr1', 'scores', [30, 40]);" > /dev/null
 
-CREATE SECRET numeric_array_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+SCORE_COUNT=$(run_query "SELECT list_count(scores) FROM firestore_scan('array_test');")
+assert_eq "$SCORE_COUNT" "4" "Scores array has 4 elements after append"
 
--- Append numeric values
-SELECT * FROM firestore_array_append('array_test', 'arr1', 'scores', [30, 40]);
-
--- Verify and use list aggregations
-SELECT 'Numeric array after append:' as label;
-SELECT scores,
-       list_aggregate(scores, 'sum') as total,
-       list_aggregate(scores, 'avg') as average
-FROM firestore_scan('array_test');
-"
+SCORE_SUM=$(run_query "SELECT list_aggregate(scores, 'sum') FROM firestore_scan('array_test');")
+assert_eq "$SCORE_SUM" "100" "Sum of scores is 100"
 
 # Test 18: Array contains check with list_contains
 echo "Test 18: Array contains filtering..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+HAS_PREMIUM=$(run_query "SELECT list_contains(tags, 'premium') FROM firestore_scan('array_test');")
+assert_eq "$HAS_PREMIUM" "true" "list_contains finds 'premium'"
 
-CREATE SECRET contains_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Check array membership
-SELECT __document_id,
-       list_contains(tags, 'premium') as has_premium,
-       list_contains(tags, 'initial') as has_initial
-FROM firestore_scan('array_test');
-"
+HAS_INITIAL=$(run_query "SELECT list_contains(tags, 'initial') FROM firestore_scan('array_test');")
+assert_eq "$HAS_INITIAL" "false" "list_contains correctly reports 'initial' missing"
 
 # Cleanup array test data
 echo "Cleaning up array test data..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET cleanup (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT * FROM firestore_delete('array_test', 'arr1');
-"
+run_query "SELECT * FROM firestore_delete('array_test', 'arr1');" > /dev/null
 
 # Test 19: GeoPoint type (reading)
 echo "Test 19: GeoPoint type support..."
@@ -535,214 +297,92 @@ curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/data
   -H "Content-Type: application/json" \
   -d '{"fields":{"name":{"stringValue":"San Francisco"},"coordinates":{"geoPointValue":{"latitude":37.7749,"longitude":-122.4194}}}}' > /dev/null
 
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+GEO_TYPE=$(run_query "SELECT column_type FROM (DESCRIBE SELECT coordinates FROM firestore_scan('locations'));")
+assert_eq "$GEO_TYPE" "STRUCT(latitudeDOUBLE,longitudeDOUBLE)" "GeoPoint is STRUCT type"
 
-CREATE SECRET geopoint_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+GEO_LAT=$(run_query "SELECT round(coordinates.latitude, 4) FROM firestore_scan('locations');")
+assert_eq "$GEO_LAT" "37.7749" "GeoPoint latitude read correctly"
 
--- Verify geopoint is read as STRUCT
-SELECT 'GeoPoint column type:' as label;
-DESCRIBE SELECT coordinates FROM firestore_scan('locations');
-
--- Access struct fields
-SELECT __document_id, name,
-       coordinates.latitude as lat,
-       coordinates.longitude as lng
-FROM firestore_scan('locations');
-"
+GEO_LNG=$(run_query "SELECT round(coordinates.longitude, 4) FROM firestore_scan('locations');")
+assert_eq "$GEO_LNG" "-122.4194" "GeoPoint longitude read correctly"
 
 # Test 20: GeoPoint type (writing)
 echo "Test 20: GeoPoint update..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET geopoint_update_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Update with new coordinates (New York)
+run_query "
 SELECT * FROM firestore_update('locations', 'loc1',
     'coordinates', {'latitude': 40.7128, 'longitude': -74.0060}::STRUCT(latitude DOUBLE, longitude DOUBLE),
     'name', 'New York'
 );
+" > /dev/null
 
--- Verify the update
-SELECT __document_id, name,
-       coordinates.latitude as lat,
-       coordinates.longitude as lng
-FROM firestore_scan('locations');
-"
+LAT_VALUE=$(run_query "SELECT round(coordinates.latitude, 4) FROM firestore_scan('locations');")
+assert_eq "$LAT_VALUE" "40.7128" "GeoPoint latitude updated to 40.7128"
 
-# Verify geopoint was written correctly
-echo "Verifying geopoint was written correctly..."
-LAT_VALUE=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET geopoint_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT round(coordinates.latitude, 4) FROM firestore_scan('locations');
-" 2>&1 | tail -1)
+LNG_VALUE=$(run_query "SELECT round(coordinates.longitude, 3) FROM firestore_scan('locations');")
+assert_eq "$LNG_VALUE" "-74.006" "GeoPoint longitude updated to -74.006"
 
-if [ "$LAT_VALUE" != "40.7128" ]; then
-    echo "FAIL: GeoPoint latitude should be 40.7128, got $LAT_VALUE"
-    exit 1
-else
-    echo "PASS: GeoPoint written correctly (latitude=$LAT_VALUE)"
-fi
+NAME_VALUE=$(run_query "SELECT name FROM firestore_scan('locations');")
+assert_eq "$NAME_VALUE" "NewYork" "Name updated to New York"
 
-# Test 21: Reference type
+# Test 21: Reference type (reading)
 echo "Test 21: Reference type support..."
 curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/posts?documentId=post1" \
   -H "Content-Type: application/json" \
   -d '{"fields":{"title":{"stringValue":"My Post"},"author":{"referenceValue":"projects/test-project/databases/(default)/documents/users/user1"}}}' > /dev/null
 
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+REF_TYPE=$(run_query "SELECT column_type FROM (DESCRIBE SELECT author FROM firestore_scan('posts'));")
+assert_eq "$REF_TYPE" "VARCHAR" "Reference stored as VARCHAR"
 
-CREATE SECRET reference_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
+AUTHOR_ID=$(run_query "SELECT split_part(author, '/', -1) FROM firestore_scan('posts');")
+assert_eq "$AUTHOR_ID" "user1" "Reference points to user1"
 
--- Verify reference is read as VARCHAR
-SELECT 'Reference column type:' as label;
-DESCRIBE SELECT author FROM firestore_scan('posts');
+TITLE=$(run_query "SELECT title FROM firestore_scan('posts');")
+assert_eq "$TITLE" "MyPost" "Title is My Post"
 
--- Read the reference value
-SELECT __document_id, title, author FROM firestore_scan('posts');
-
--- Extract document ID from reference path
-SELECT __document_id, title,
-       split_part(author, '/', -1) as author_id
-FROM firestore_scan('posts');
-"
-
-# Test 22: Bytes type
+# Test 22: Bytes type (reading)
 echo "Test 22: Bytes type support..."
 curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/files?documentId=file1" \
   -H "Content-Type: application/json" \
   -d '{"fields":{"filename":{"stringValue":"test.txt"},"content":{"bytesValue":"SGVsbG8gRmlyZXN0b3JlIQ=="}}}' > /dev/null
 
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+BYTES_TYPE=$(run_query "SELECT column_type FROM (DESCRIBE SELECT content FROM firestore_scan('files'));")
+assert_eq "$BYTES_TYPE" "BLOB" "Bytes stored as BLOB"
 
-CREATE SECRET bytes_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Verify bytes is read as BLOB
-SELECT 'Bytes column type:' as label;
-DESCRIBE SELECT content FROM firestore_scan('files');
-
--- Read the bytes value (base64 decoded)
-SELECT __document_id, filename, content FROM firestore_scan('files');
-
--- Verify content is correctly decoded
-SELECT __document_id, filename,
-       content::VARCHAR as decoded_content
-FROM firestore_scan('files');
-"
-
-# Verify bytes was decoded correctly
-echo "Verifying bytes decoding..."
-DECODED=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET bytes_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT content::VARCHAR FROM firestore_scan('files');
-" 2>&1 | tail -1)
-
-if [ "$DECODED" != "Hello Firestore!" ]; then
-    echo "FAIL: Bytes should decode to 'Hello Firestore!', got '$DECODED'"
-    exit 1
-else
-    echo "PASS: Bytes decoded correctly ($DECODED)"
-fi
+DECODED=$(run_query "SELECT content::VARCHAR FROM firestore_scan('files');")
+assert_eq "$DECODED" "HelloFirestore!" "Bytes decoded from base64 correctly"
 
 # Test 23: Reference type update
 echo "Test 23: Reference type update..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET reference_update_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Update the author reference to a different user
+run_query "
 SELECT * FROM firestore_update('posts', 'post1',
     'author', 'projects/test-project/databases/(default)/documents/users/user2',
     'title', 'Updated Post'
 );
+" > /dev/null
 
--- Verify the update
-SELECT __document_id, title,
-       split_part(author, '/', -1) as author_id
-FROM firestore_scan('posts');
-"
+AUTHOR_ID=$(run_query "SELECT split_part(author, '/', -1) FROM firestore_scan('posts');")
+assert_eq "$AUTHOR_ID" "user2" "Reference updated to user2"
 
-# Verify reference was updated correctly
-echo "Verifying reference update..."
-AUTHOR_ID=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET ref_update_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT split_part(author, '/', -1) FROM firestore_scan('posts');
-" 2>&1 | tail -1)
-
-if [ "$AUTHOR_ID" != "user2" ]; then
-    echo "FAIL: Reference should be updated to user2, got $AUTHOR_ID"
-    exit 1
-else
-    echo "PASS: Reference updated correctly (author_id=$AUTHOR_ID)"
-fi
+TITLE=$(run_query "SELECT title FROM firestore_scan('posts');")
+assert_eq "$TITLE" "UpdatedPost" "Title updated"
 
 # Test 24: Bytes type update
 echo "Test 24: Bytes type update..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-
-CREATE SECRET bytes_update_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Update with new binary content (will be base64 encoded automatically)
+run_query "
 SELECT * FROM firestore_update('files', 'file1',
     'content', 'New binary data!'::BLOB,
     'filename', 'updated.txt'
 );
+" > /dev/null
 
--- Verify the update
-SELECT __document_id, filename, content::VARCHAR as text_content
-FROM firestore_scan('files');
-"
+UPDATED_CONTENT=$(run_query "SELECT content::VARCHAR FROM firestore_scan('files');")
+assert_eq "$UPDATED_CONTENT" "Newbinarydata!" "Bytes updated correctly (round-trip)"
 
-# Verify bytes was updated correctly
-echo "Verifying bytes update..."
-UPDATED_CONTENT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET bytes_update_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT content::VARCHAR FROM firestore_scan('files');
-" 2>&1 | tail -1)
+UPDATED_NAME=$(run_query "SELECT filename FROM firestore_scan('files');")
+assert_eq "$UPDATED_NAME" "updated.txt" "Filename updated"
 
-if [ "$UPDATED_CONTENT" != "New binary data!" ]; then
-    echo "FAIL: Bytes should be 'New binary data!', got '$UPDATED_CONTENT'"
-    exit 1
-else
-    echo "PASS: Bytes updated correctly ($UPDATED_CONTENT)"
-fi
-
-# Test 25: Multiple GeoPoint updates (batch scenario simulation)
+# Test 25: Multiple GeoPoint updates (batch scenario)
 echo "Test 25: Multiple location updates..."
-# Create additional location documents
 curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc2" \
   -H "Content-Type: application/json" \
   -d '{"fields":{"name":{"stringValue":"Los Angeles"},"coordinates":{"geoPointValue":{"latitude":34.0522,"longitude":-118.2437}}}}' > /dev/null
@@ -751,91 +391,45 @@ curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/data
   -H "Content-Type: application/json" \
   -d '{"fields":{"name":{"stringValue":"Chicago"},"coordinates":{"geoPointValue":{"latitude":41.8781,"longitude":-87.6298}}}}' > /dev/null
 
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
+LOC_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('locations');")
+assert_eq "$LOC_COUNT" "3" "3 locations seeded"
 
-CREATE SECRET multi_geopoint_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- View all locations
-SELECT 'All locations before batch update:' as label;
-SELECT __document_id, name,
-       coordinates.latitude as lat,
-       coordinates.longitude as lng
-FROM firestore_scan('locations')
-ORDER BY name;
-
--- Get IDs of locations to update (all of them)
+run_query "
 SET VARIABLE loc_ids = (SELECT list(__document_id) FROM firestore_scan('locations'));
-
--- Batch update - mark all as verified with a new field
 SELECT * FROM firestore_update_batch('locations', getvariable('loc_ids'), 'verified', true);
+" > /dev/null
 
--- Verify the batch update
-SELECT 'After batch update (verified field added):' as label;
-SELECT __document_id, name, verified
-FROM firestore_scan('locations')
-ORDER BY name;
-"
+VERIFIED_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('locations') WHERE verified = true;")
+assert_eq "$VERIFIED_COUNT" "3" "All 3 locations verified after batch update"
 
-# Verify batch update worked
-echo "Verifying batch geopoint update..."
-VERIFIED_COUNT=$($DUCKDB -unsigned -csv -noheader -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET batch_geo_verify (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT count(*) FROM firestore_scan('locations') WHERE verified = true;
-" 2>&1 | tail -1)
-
-if [ "$VERIFIED_COUNT" -ne 3 ]; then
-    echo "FAIL: All 3 locations should be verified, got $VERIFIED_COUNT"
-    exit 1
-else
-    echo "PASS: Batch update worked ($VERIFIED_COUNT locations verified)"
-fi
-
-# Test 26: GeoPoint distance calculation (using struct fields)
+# Test 26: GeoPoint calculations (bounding box and distance)
 echo "Test 26: GeoPoint calculations..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
 
-CREATE SECRET geopoint_calc_test (
-    TYPE firestore,
-    PROJECT_ID 'test-project',
-    API_KEY 'fake-key'
-);
-
--- Calculate approximate distance from a reference point (simplified)
--- Reference: Seattle (47.6062, -122.3321)
-SELECT __document_id, name,
-       coordinates.latitude as lat,
-       coordinates.longitude as lng,
-       -- Simple Euclidean approximation (not accurate for real distances)
-       sqrt(power(coordinates.latitude - 47.6062, 2) + power(coordinates.longitude - (-122.3321), 2)) as approx_distance
-FROM firestore_scan('locations')
-ORDER BY approx_distance;
-
--- Filter locations within a bounding box (latitude 35-45, longitude -125 to -70)
-SELECT 'Locations in bounding box:' as label;
-SELECT __document_id, name, coordinates.latitude, coordinates.longitude
-FROM firestore_scan('locations')
+# Los Angeles (34.0522) is NOT in the 35-45 bounding box; New York (40.7128) and Chicago (41.8781) ARE
+BBOX_COUNT=$(run_query "
+SELECT count(*) FROM firestore_scan('locations')
 WHERE coordinates.latitude BETWEEN 35 AND 45
   AND coordinates.longitude BETWEEN -125 AND -70;
-"
+")
+assert_eq "$BBOX_COUNT" "2" "Bounding box (35-45 lat) contains 2 locations"
+
+# Los Angeles should be closest to Seattle (47.6062, -122.3321) by simple distance
+CLOSEST=$(run_query "
+SELECT __document_id FROM firestore_scan('locations')
+ORDER BY sqrt(power(coordinates.latitude - 47.6062, 2) + power(coordinates.longitude - (-122.3321), 2))
+LIMIT 1;
+")
+assert_eq "$CLOSEST" "loc2" "Los Angeles is closest to Seattle by Euclidean distance"
 
 # Cleanup special types test data
 echo "Cleaning up special types test data..."
-$DUCKDB -unsigned -c "
-LOAD 'build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension';
-CREATE SECRET special_cleanup (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+run_query "
 SELECT * FROM firestore_delete('locations', 'loc1');
 SELECT * FROM firestore_delete('locations', 'loc2');
 SELECT * FROM firestore_delete('locations', 'loc3');
 SELECT * FROM firestore_delete('posts', 'post1');
 SELECT * FROM firestore_delete('files', 'file1');
-"
+" > /dev/null
 
 echo ""
 echo "=== All integration tests passed! ==="
