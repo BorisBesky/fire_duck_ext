@@ -10,23 +10,26 @@ class ExtensionLoader;
 
 // Bind data for write operations
 struct FirestoreWriteBindData : public TableFunctionData {
-    std::string collection;
-    std::shared_ptr<FirestoreCredentials> credentials;
-    std::vector<std::string> column_names;
-    std::vector<LogicalType> column_types;
+	std::string collection;
+	std::shared_ptr<FirestoreCredentials> credentials;
+	std::vector<std::string> column_names;
+	std::vector<LogicalType> column_types;
 
-    // For specifying document ID on insert
-    std::optional<std::string> document_id_column;
+	// For specifying document ID on insert
+	std::optional<std::string> document_id_column;
 };
 
 // Global state for write operations
 struct FirestoreWriteGlobalState : public GlobalTableFunctionState {
-    std::unique_ptr<FirestoreClient> client;
-    idx_t rows_written;
+	std::unique_ptr<FirestoreClient> client;
+	idx_t rows_written;
 
-    FirestoreWriteGlobalState() : rows_written(0) {}
+	FirestoreWriteGlobalState() : rows_written(0) {
+	}
 
-    idx_t MaxThreads() const override { return 1; }
+	idx_t MaxThreads() const override {
+		return 1;
+	}
 };
 
 // Register write-related functions

@@ -36,23 +36,18 @@ Value FirestoreValueToDuckDB(const json &firestore_value, const LogicalType &tar
 json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type);
 
 // Set a value in a DuckDB vector from Firestore JSON
-void SetDuckDBValue(Vector &vector, idx_t index,
-                    const json &firestore_value,
-                    const LogicalType &type);
+void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type);
 
 // Column information inferred from documents
 struct InferredColumn {
-    std::string name;
-    LogicalType type;
-    bool nullable;
-    int64_t occurrence_count;
+	std::string name;
+	LogicalType type;
+	bool nullable;
+	int64_t occurrence_count;
 };
 
 // Infer schema from a collection of documents
-std::vector<InferredColumn> InferSchemaFromDocuments(
-    const std::vector<json> &document_fields,
-    idx_t sample_size = 100
-);
+std::vector<InferredColumn> InferSchemaFromDocuments(const std::vector<json> &document_fields, idx_t sample_size = 100);
 
 // Helper: Check if a Firestore value is null
 bool IsFirestoreNull(const json &value);

@@ -1,6 +1,6 @@
 # name: test/sql/firestore_scan.test
 # description: Test firestore_scan table function
-# group: [fire_duck_ext]
+# group: [sql]
 
 # Require the extension
 require fire_duck_ext

@@ -1,6 +1,6 @@
 # name: test/sql/firestore_write.test
 # description: Test Firestore write operations (UPDATE, DELETE, batch)
-# group: [fire_duck_ext]
+# group: [sql]
 
 require fire_duck_ext
 

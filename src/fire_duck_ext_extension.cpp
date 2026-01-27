@@ -10,29 +10,29 @@
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-    // Register the firestore secret type for credential management
-    RegisterFirestoreSecretType(loader);
+	// Register the firestore secret type for credential management
+	RegisterFirestoreSecretType(loader);
 
-    // Register table scan function: firestore_scan('collection')
-    RegisterFirestoreScanFunction(loader);
+	// Register table scan function: firestore_scan('collection')
+	RegisterFirestoreScanFunction(loader);
 
-    // Register write functions
-    RegisterFirestoreWriteFunctions(loader);
+	// Register write functions
+	RegisterFirestoreWriteFunctions(loader);
 }
 
 void FireDuckExtExtension::Load(ExtensionLoader &loader) {
-    LoadInternal(loader);
+	LoadInternal(loader);
 }
 
 std::string FireDuckExtExtension::Name() {
-    return "fire_duck_ext";
+	return "fire_duck_ext";
 }
 
 std::string FireDuckExtExtension::Version() const {
 #ifdef EXT_VERSION_FIRE_DUCK_EXT
-    return EXT_VERSION_FIRE_DUCK_EXT;
+	return EXT_VERSION_FIRE_DUCK_EXT;
 #else
-    return "v0.1.0";
+	return "v0.1.0";
 #endif
 }
 
@@ -41,7 +41,6 @@ std::string FireDuckExtExtension::Version() const {
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(fire_duck_ext, loader) {
-    duckdb::LoadInternal(loader);
+	duckdb::LoadInternal(loader);
 }
-
 }

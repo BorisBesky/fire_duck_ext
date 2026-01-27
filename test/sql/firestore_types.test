@@ -1,6 +1,6 @@
 # name: test/sql/firestore_types.test
 # description: Test Firestore type conversions and function signatures
-# group: [fire_duck_ext]
+# group: [sql]
 
 require fire_duck_ext
 

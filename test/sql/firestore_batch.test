@@ -1,6 +1,6 @@
 # name: test/sql/firestore_batch.test
 # description: Test Firestore batch UPDATE and DELETE operations with DuckDB-side filtering
-# group: [fire_duck_ext]
+# group: [sql]
 
 require fire_duck_ext
 

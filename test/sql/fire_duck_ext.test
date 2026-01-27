@@ -1,6 +1,6 @@
 # name: test/sql/fire_duck_ext.test
 # description: test fire_duck_ext extension loading
-# group: [fire_duck_ext]
+# group: [sql]
 
 # Require statement will ensure this test is run with this extension loaded
 require fire_duck_ext
