@@ -377,6 +377,75 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
         return result;
     }
 
+    // Handle OR conjunction - detect OR-of-equalities-on-same-field pattern for Firestore IN
+    // DuckDB rewrites `x IN ('a', 'b')` to `(x = 'a') OR (x = 'b')`
+    if (expr.type == ExpressionType::CONJUNCTION_OR) {
+        auto &conj = expr.Cast<BoundConjunctionExpression>();
+        if (conj.children.empty()) {
+            return {};
+        }
+
+        // Check if all children are equality comparisons on the same column
+        std::string common_field;
+        LogicalType common_type;
+        std::vector<json> values;
+
+        for (auto &child : conj.children) {
+            // Each child must be a comparison expression with EQUAL
+            if (child->expression_class != ExpressionClass::BOUND_COMPARISON ||
+                child->type != ExpressionType::COMPARE_EQUAL) {
+                return {};  // Not all children are equalities - can't convert to IN
+            }
+            auto &cmp = child->Cast<BoundComparisonExpression>();
+
+            const BoundColumnRefExpression *col_ref = nullptr;
+            const BoundConstantExpression *const_val = nullptr;
+
+            if (cmp.left->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+                cmp.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
+                col_ref = &cmp.left->Cast<BoundColumnRefExpression>();
+                const_val = &cmp.right->Cast<BoundConstantExpression>();
+            } else if (cmp.right->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+                       cmp.left->expression_class == ExpressionClass::BOUND_CONSTANT) {
+                col_ref = &cmp.right->Cast<BoundColumnRefExpression>();
+                const_val = &cmp.left->Cast<BoundConstantExpression>();
+            } else {
+                return {};
+            }
+
+            std::string field_name;
+            LogicalType field_type;
+            if (!resolve_column(*col_ref, field_name, field_type)) {
+                return {};
+            }
+
+            if (common_field.empty()) {
+                common_field = field_name;
+                common_type = field_type;
+            } else if (common_field != field_name) {
+                return {};  // Different columns - can't convert to single IN filter
+            }
+
+            values.push_back(DuckDBValueToFirestore(const_val->value, common_type));
+        }
+
+        // Firestore IN filter has a limit of 30 values
+        if (values.size() > 30) {
+            FS_LOG_DEBUG("IN filter on " + common_field + " has " +
+                         std::to_string(values.size()) + " values (max 30), skipping pushdown");
+            return {};
+        }
+
+        FirestorePushdownFilter pf;
+        pf.field_path = common_field;
+        pf.firestore_op = "IN";
+        pf.is_in_filter = true;
+        pf.is_equality = true;
+        pf.in_values = std::move(values);
+        result.push_back(std::move(pf));
+        return result;
+    }
+
     // Handle IS NULL / IS NOT NULL (BoundOperatorExpression)
     if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
         auto &op_expr = expr.Cast<BoundOperatorExpression>();
