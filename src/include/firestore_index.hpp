@@ -5,6 +5,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/expression.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <string>
@@ -86,6 +87,17 @@ FirestoreFilterResult MatchFiltersToIndexes(
     const std::vector<FirestorePushdownFilter> &candidate_filters,
     const FirestoreIndexCache &index_cache,
     bool is_collection_group
+);
+
+// Convert a DuckDB Expression tree into Firestore pushdown filters
+// Used by pushdown_complex_filter callback (operates on Expression trees, not TableFilter)
+// column_names/column_types are the bind-time schema (excluding __document_id)
+// table_index is the LogicalGet's table_index for matching column references
+std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
+    const Expression &expr,
+    idx_t table_index,
+    const std::vector<std::string> &column_names,
+    const std::vector<LogicalType> &column_types
 );
 
 } // namespace duckdb

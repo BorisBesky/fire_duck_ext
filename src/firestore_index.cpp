@@ -2,6 +2,11 @@
 #include "firestore_types.hpp"
 #include "firestore_logger.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 
 namespace duckdb {
 
@@ -322,6 +327,146 @@ FirestoreFilterResult MatchFiltersToIndexes(
     }
 
     return result;
+}
+
+std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
+    const Expression &expr,
+    idx_t table_index,
+    const std::vector<std::string> &column_names,
+    const std::vector<LogicalType> &column_types
+) {
+    std::vector<FirestorePushdownFilter> result;
+
+    // Handle AND conjunction - recurse into children
+    if (expr.type == ExpressionType::CONJUNCTION_AND) {
+        auto &conj = expr.Cast<BoundConjunctionExpression>();
+        for (auto &child : conj.children) {
+            auto child_filters = ConvertExpressionToFilters(*child, table_index, column_names, column_types);
+            result.insert(result.end(),
+                std::make_move_iterator(child_filters.begin()),
+                std::make_move_iterator(child_filters.end()));
+        }
+        return result;
+    }
+
+    // Handle IS NULL / IS NOT NULL (BoundOperatorExpression)
+    if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+        auto &op_expr = expr.Cast<BoundOperatorExpression>();
+        if (op_expr.children.size() == 1 &&
+            op_expr.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+            auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+            if (col_ref.binding.table_index != table_index) {
+                return {};
+            }
+            idx_t col_idx = col_ref.binding.column_index;
+            // col_idx 0 is __document_id, actual fields start at 1
+            if (col_idx == 0 || col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+                return {};
+            }
+            idx_t field_idx = col_idx - 1;
+            if (field_idx >= column_names.size()) {
+                return {};
+            }
+
+            FirestorePushdownFilter pf;
+            pf.field_path = column_names[field_idx];
+            pf.is_unary = true;
+            pf.unary_op = (expr.type == ExpressionType::OPERATOR_IS_NULL) ? "IS_NULL" : "IS_NOT_NULL";
+            pf.is_equality = true;
+            result.push_back(std::move(pf));
+        }
+        return result;
+    }
+
+    // Handle comparison expressions (=, <>, <, <=, >, >=)
+    if (expr.expression_class == ExpressionClass::BOUND_COMPARISON) {
+        auto &cmp = expr.Cast<BoundComparisonExpression>();
+
+        // Determine which side is the column and which is the constant
+        const BoundColumnRefExpression *col_ref = nullptr;
+        const BoundConstantExpression *const_val = nullptr;
+        bool reversed = false;
+
+        if (cmp.left->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+            cmp.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
+            col_ref = &cmp.left->Cast<BoundColumnRefExpression>();
+            const_val = &cmp.right->Cast<BoundConstantExpression>();
+        } else if (cmp.right->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+                   cmp.left->expression_class == ExpressionClass::BOUND_CONSTANT) {
+            col_ref = &cmp.right->Cast<BoundColumnRefExpression>();
+            const_val = &cmp.left->Cast<BoundConstantExpression>();
+            reversed = true;
+        } else {
+            // Neither side is a simple column ref + constant
+            return {};
+        }
+
+        if (col_ref->binding.table_index != table_index) {
+            return {};
+        }
+        idx_t col_idx = col_ref->binding.column_index;
+        if (col_idx == 0 || col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+            return {};
+        }
+        idx_t field_idx = col_idx - 1;
+        if (field_idx >= column_names.size()) {
+            return {};
+        }
+
+        FirestorePushdownFilter pf;
+        pf.field_path = column_names[field_idx];
+
+        ExpressionType cmp_type = expr.type;
+        // If the constant is on the left (e.g., 5 < x), flip the comparison
+        if (reversed) {
+            switch (cmp_type) {
+                case ExpressionType::COMPARE_LESSTHAN:
+                    cmp_type = ExpressionType::COMPARE_GREATERTHAN; break;
+                case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+                    cmp_type = ExpressionType::COMPARE_GREATERTHANOREQUALTO; break;
+                case ExpressionType::COMPARE_GREATERTHAN:
+                    cmp_type = ExpressionType::COMPARE_LESSTHAN; break;
+                case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+                    cmp_type = ExpressionType::COMPARE_LESSTHANOREQUALTO; break;
+                default:
+                    break; // EQUAL and NOT_EQUAL are symmetric
+            }
+        }
+
+        switch (cmp_type) {
+            case ExpressionType::COMPARE_EQUAL:
+                pf.firestore_op = "EQUAL";
+                pf.is_equality = true;
+                break;
+            case ExpressionType::COMPARE_NOTEQUAL:
+                pf.firestore_op = "NOT_EQUAL";
+                pf.is_equality = true;
+                break;
+            case ExpressionType::COMPARE_LESSTHAN:
+                pf.firestore_op = "LESS_THAN";
+                break;
+            case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+                pf.firestore_op = "LESS_THAN_OR_EQUAL";
+                break;
+            case ExpressionType::COMPARE_GREATERTHAN:
+                pf.firestore_op = "GREATER_THAN";
+                break;
+            case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+                pf.firestore_op = "GREATER_THAN_OR_EQUAL";
+                break;
+            default:
+                FS_LOG_DEBUG("Unsupported comparison type for expression pushdown on field: " + pf.field_path);
+                return {};
+        }
+
+        pf.firestore_value = DuckDBValueToFirestore(const_val->value, column_types[field_idx]);
+        result.push_back(std::move(pf));
+        return result;
+    }
+
+    // Unsupported expression type - skip silently
+    FS_LOG_DEBUG("Expression type not supported for pushdown: " + std::to_string(static_cast<int>(expr.type)));
+    return {};
 }
 
 } // namespace duckdb

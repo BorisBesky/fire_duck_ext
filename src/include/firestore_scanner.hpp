@@ -28,6 +28,11 @@ struct FirestoreScanBindData : public TableFunctionData {
 
     // Index cache - populated at bind time for filter pushdown
     std::shared_ptr<FirestoreIndexCache> index_cache;
+
+    // Candidate filters extracted by pushdown_complex_filter callback
+    // These are stored here so InitGlobal can use them to build the Firestore query.
+    // All original DuckDB expressions are left intact so DuckDB re-verifies results.
+    std::vector<FirestorePushdownFilter> candidate_pushdown_filters;
 };
 
 // Global state - shared across threads

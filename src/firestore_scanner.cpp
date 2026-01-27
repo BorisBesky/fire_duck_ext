@@ -4,8 +4,38 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
+
+// pushdown_complex_filter callback: extracts filter expressions for Firestore pushdown
+// but leaves all expressions in the vector so DuckDB re-applies them as post-scan filters.
+// This ensures correctness - Firestore filtering is used for performance (reduce network transfer)
+// while DuckDB re-verifies every row (handles semantic differences like nulls, empty strings, etc.)
+static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &get,
+                                           FunctionData *bind_data_p,
+                                           vector<unique_ptr<Expression>> &filters) {
+    auto &bind_data = bind_data_p->Cast<FirestoreScanBindData>();
+
+    if (!bind_data.index_cache || !bind_data.index_cache->fetch_succeeded) {
+        return;
+    }
+
+    bind_data.candidate_pushdown_filters.clear();
+
+    for (auto &filter : filters) {
+        auto converted = ConvertExpressionToFilters(
+            *filter, get.table_index, bind_data.column_names, bind_data.column_types);
+        bind_data.candidate_pushdown_filters.insert(
+            bind_data.candidate_pushdown_filters.end(),
+            std::make_move_iterator(converted.begin()),
+            std::make_move_iterator(converted.end()));
+    }
+
+    // IMPORTANT: Do NOT remove any expressions from the filters vector.
+    // By leaving them all in place, DuckDB will apply them as post-scan filters,
+    // ensuring correctness regardless of Firestore's filtering semantics.
+}
 
 void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
     TableFunction scan_func("firestore_scan",
@@ -26,8 +56,9 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
     // Enable projection pushdown for efficiency
     scan_func.projection_pushdown = true;
 
-    // Enable filter pushdown for WHERE clause predicates
-    scan_func.filter_pushdown = true;
+    // Use complex filter pushdown: this lets us extract filter info for Firestore queries
+    // while leaving all expressions for DuckDB to re-verify (ensuring correct results)
+    scan_func.pushdown_complex_filter = FirestoreComplexFilterPushdown;
 
     loader.RegisterFunction(scan_func);
 }
@@ -150,44 +181,11 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(
         bind_data.is_collection_group = true;
     }
 
-    // Process filter pushdown
-    std::vector<FirestorePushdownFilter> candidate_filters;
-    if (input.filters && bind_data.index_cache && bind_data.index_cache->fetch_succeeded) {
-        for (auto &entry : input.filters->filters) {
-            idx_t col_idx = entry.first;
-            auto &filter = *entry.second;
-
-            // Map filter column index to actual column via column_ids
-            if (col_idx >= input.column_ids.size()) {
-                continue;
-            }
-            auto actual_col_id = input.column_ids[col_idx];
-
-            // Skip __document_id (column 0) and COLUMN_IDENTIFIER_ROW_ID
-            if (actual_col_id == 0 || actual_col_id == COLUMN_IDENTIFIER_ROW_ID) {
-                continue;
-            }
-
-            // actual_col_id - 1 gives index into bind_data.column_names
-            idx_t field_idx = actual_col_id - 1;
-            if (field_idx >= bind_data.column_names.size()) {
-                continue;
-            }
-
-            const std::string &field_name = bind_data.column_names[field_idx];
-            const LogicalType &field_type = bind_data.column_types[field_idx];
-
-            auto converted = ConvertDuckDBFilter(field_name, field_type, filter);
-            candidate_filters.insert(candidate_filters.end(),
-                std::make_move_iterator(converted.begin()),
-                std::make_move_iterator(converted.end()));
-        }
-
-        // Match filters against available indexes
-        if (!candidate_filters.empty()) {
-            global_state->pushdown_result = MatchFiltersToIndexes(
-                candidate_filters, *bind_data.index_cache, bind_data.is_collection_group);
-        }
+    // Process filter pushdown using candidate filters from pushdown_complex_filter callback
+    if (!bind_data.candidate_pushdown_filters.empty() &&
+        bind_data.index_cache && bind_data.index_cache->fetch_succeeded) {
+        global_state->pushdown_result = MatchFiltersToIndexes(
+            bind_data.candidate_pushdown_filters, *bind_data.index_cache, bind_data.is_collection_group);
     }
 
     // Build query and fetch initial documents
