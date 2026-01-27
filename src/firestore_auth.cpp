@@ -4,7 +4,8 @@
 #include <fstream>
 #include <sstream>
 #include <ctime>
-#include <curl/curl.h>
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
@@ -51,12 +52,6 @@ std::string FirestoreCredentials::GetUrlSuffix() const {
     return "";
 }
 
-// CURL write callback
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
-    size_t newLength = size * nmemb;
-    s->append((char*)contents, newLength);
-    return newLength;
-}
 
 std::unique_ptr<FirestoreCredentials> FirestoreAuthManager::LoadServiceAccount(const std::string &json_path) {
     FS_LOG_DEBUG("Loading service account from: " + json_path);
@@ -252,45 +247,27 @@ std::string FirestoreAuthManager::CreateJWT(const FirestoreCredentials &creds) {
 std::string FirestoreAuthManager::ExchangeJWTForToken(const std::string &jwt) {
     FS_LOG_DEBUG("Exchanging JWT for access token");
 
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
-                                 "Failed to initialize CURL for token exchange");
-    }
-
-    std::string response_data;
     std::string post_data = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=" + jwt;
 
-    curl_easy_setopt(curl, CURLOPT_URL, GOOGLE_TOKEN_URL);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+    httplib::Client cli("https://oauth2.googleapis.com");
+    cli.set_connection_timeout(30);
+    cli.set_read_timeout(30);
 
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    auto res = cli.Post("/token", post_data, "application/x-www-form-urlencoded");
 
-    CURLcode res = curl_easy_perform(curl);
-
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
+    if (!res) {
         throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
-                                 "CURL request failed: " + std::string(curl_easy_strerror(res)));
+                                 "HTTP request failed: " + httplib::to_string(res.error()));
     }
 
-    if (http_code != 200) {
-        FS_LOG_ERROR("Token exchange failed with HTTP " + std::to_string(http_code));
+    if (res->status != 200) {
+        FS_LOG_ERROR("Token exchange failed with HTTP " + std::to_string(res->status));
         throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
-                                 "Token exchange failed with HTTP " + std::to_string(http_code) + ": " + response_data);
+                                 "Token exchange failed with HTTP " + std::to_string(res->status) + ": " + res->body);
     }
 
     try {
-        auto j = json::parse(response_data);
+        auto j = json::parse(res->body);
         if (!j.contains("access_token")) {
             throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_MISSING,
                                      "Token response missing access_token");

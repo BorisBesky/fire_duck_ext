@@ -1,7 +1,8 @@
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
 #include "firestore_types.hpp"
-#include <curl/curl.h>
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
 #include <sstream>
 #include <cstdlib>
 #include <chrono>
@@ -18,11 +19,24 @@ static std::string GetEmulatorHost() {
     return emulator_host ? std::string(emulator_host) : "";
 }
 
-// CURL write callback
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
-    size_t newLength = size * nmemb;
-    s->append((char*)contents, newLength);
-    return newLength;
+// Parse a URL into scheme+host and path components
+static bool ParseUrl(const std::string &url, std::string &scheme_host, std::string &path) {
+    // Find scheme
+    auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) {
+        return false;
+    }
+    auto host_start = scheme_end + 3;
+    // Find path start (first '/' after host)
+    auto path_start = url.find('/', host_start);
+    if (path_start == std::string::npos) {
+        scheme_host = url;
+        path = "/";
+    } else {
+        scheme_host = url.substr(0, path_start);
+        path = url.substr(path_start);
+    }
+    return true;
 }
 
 FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials)
@@ -79,67 +93,62 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
     // Ensure token is valid for service account auth
     FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_);
 
-    CURL *curl = curl_easy_init();
-    if (!curl) {
+    // Parse the URL into scheme+host and path
+    std::string scheme_host, path;
+    if (!ParseUrl(url, scheme_host, path)) {
         throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_INIT,
-                                    "Failed to initialize CURL", error_ctx);
+                                    "Failed to parse URL: " + url, error_ctx);
     }
 
-    std::string response_data;
+    httplib::Client cli(scheme_host);
+    cli.set_connection_timeout(30);
+    cli.set_read_timeout(30);
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-
-    // Set method
-    if (method == "POST") {
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    } else if (method == "PATCH") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-    } else if (method == "DELETE") {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-    }
-    // GET is default
-
-    // Set headers
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+    // Build headers
+    httplib::Headers headers = {
+        {"Content-Type", "application/json"}
+    };
 
     std::string auth_header = credentials_->GetAuthHeader();
     if (!auth_header.empty()) {
-        std::string auth_line = "Authorization: " + auth_header;
-        headers = curl_slist_append(headers, auth_line.c_str());
+        headers.emplace("Authorization", auth_header);
     }
 
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    // Set body for POST/PATCH
+    // Execute request based on method
+    httplib::Result res;
     std::string body_str;
     if (!body.empty() && (method == "POST" || method == "PATCH")) {
         body_str = body.dump();
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
     }
 
-    CURLcode res = curl_easy_perform(curl);
-
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    if (method == "GET") {
+        res = cli.Get(path, headers);
+    } else if (method == "POST") {
+        res = cli.Post(path, headers, body_str, "application/json");
+    } else if (method == "PATCH") {
+        res = cli.Patch(path, headers, body_str, "application/json");
+    } else if (method == "DELETE") {
+        res = cli.Delete(path, headers);
+    } else {
+        res = cli.Get(path, headers);
+    }
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    FS_LOG_DEBUG("Request completed in " + std::to_string(duration_ms) + "ms, status: " + std::to_string(http_code));
 
-    error_ctx.withStatus(static_cast<int>(http_code));
-
-    if (res != CURLE_OK) {
-        error_ctx.withResponseBody(response_data);
-        std::string error_msg = "HTTP request failed: " + std::string(curl_easy_strerror(res));
+    if (!res) {
+        auto err = res.error();
+        std::string error_msg = "HTTP request failed: " + httplib::to_string(err);
         FS_LOG_ERROR(error_msg + " " + error_ctx.ToString());
         throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
     }
+
+    int http_code = res->status;
+    const std::string &response_data = res->body;
+
+    FS_LOG_DEBUG("Request completed in " + std::to_string(duration_ms) + "ms, status: " + std::to_string(http_code));
+
+    error_ctx.withStatus(http_code);
 
     // Parse response
     json response;

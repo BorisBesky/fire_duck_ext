@@ -3,9 +3,7 @@
     "version-string": "0.1.0",
     "description": "DuckDB extension for Google Cloud Firestore",
     "dependencies": [
-        "openssl",
-        "curl",
-        "nlohmann-json"
+        "openssl"
     ],
     "vcpkg-configuration": {
         "overlay-ports": [

@@ -3,11 +3,11 @@ cmake_minimum_required(VERSION 3.5)
 # Set extension name here
 set(TARGET_NAME fire_duck_ext)
 
-# DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
-# used in cmake with find_package.
-find_package(OpenSSL REQUIRED)
-find_package(CURL REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
+# OpenSSL is required for HTTPS support (via cpp-httplib) and JWT signing.
+# Skip dependency resolution for clang-tidy builds which only need to parse source.
+if (NOT CLANG_TIDY)
+  find_package(OpenSSL REQUIRED)
+endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -41,19 +41,28 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
+# nlohmann/json is vendored as a submodule in third_party/nlohmann_json
+target_include_directories(${EXTENSION_NAME}
+    PRIVATE
+    third_party/nlohmann_json/include
+)
+target_include_directories(${LOADABLE_EXTENSION_NAME}
+    PRIVATE
+    third_party/nlohmann_json/include
+)
+
 # Link dependencies to both the static library and the loadable extension
-target_link_libraries(${EXTENSION_NAME}
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    CURL::libcurl
-    nlohmann_json::nlohmann_json
-)
-target_link_libraries(${LOADABLE_EXTENSION_NAME}
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    CURL::libcurl
-    nlohmann_json::nlohmann_json
-)
+# Skip linking for clang-tidy builds which only perform static analysis
+if (NOT CLANG_TIDY)
+  target_link_libraries(${EXTENSION_NAME}
+      OpenSSL::SSL
+      OpenSSL::Crypto
+  )
+  target_link_libraries(${LOADABLE_EXTENSION_NAME}
+      OpenSSL::SSL
+      OpenSSL::Crypto
+  )
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}
