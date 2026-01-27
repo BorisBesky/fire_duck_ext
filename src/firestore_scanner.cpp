@@ -1,6 +1,7 @@
 #include "firestore_scanner.hpp"
 #include "firestore_types.hpp"
 #include "firestore_secrets.hpp"
+#include "firestore_logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -196,8 +197,14 @@ unique_ptr<FunctionData> FirestoreScanBind(
                      " composite indexes, default_single_field=" +
                      (result->index_cache->default_single_field_enabled ? "true" : "false"));
     } catch (const std::exception &e) {
-        FS_LOG_WARN("Failed to fetch indexes, filter pushdown disabled: " + std::string(e.what()));
-        result->index_cache->fetch_succeeded = false;
+        // Admin API unavailable (e.g. emulator, insufficient permissions).
+        // Assume Firestore's default single-field indexes exist for every field.
+        // Composite index queries may fail at RunQuery time, but the existing
+        // fallback (catch in InitGlobal) handles that gracefully.
+        FS_LOG_WARN("Failed to fetch indexes (Admin API unavailable): " + std::string(e.what()) +
+                    ". Assuming default single-field indexes.");
+        result->index_cache->fetch_succeeded = true;
+        result->index_cache->default_single_field_enabled = true;
     }
 
     return std::move(result);

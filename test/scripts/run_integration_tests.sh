@@ -51,6 +51,45 @@ assert_ge() {
     fi
 }
 
+# Helper: run EXPLAIN and return the full output (whitespace preserved)
+run_explain() {
+    $DUCKDB -unsigned -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+$1
+" 2>&1
+}
+
+# Helper: assert that a string contains a substring
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local msg="$3"
+    if echo "$haystack" | grep -qF "$needle"; then
+        echo "PASS: $msg"
+    else
+        echo "FAIL: $msg (expected output to contain '$needle')"
+        echo "  Actual output:"
+        echo "$haystack" | head -80
+        exit 1
+    fi
+}
+
+# Helper: assert that a string does NOT contain a substring
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local msg="$3"
+    if echo "$haystack" | grep -qF "$needle"; then
+        echo "FAIL: $msg (expected output to NOT contain '$needle')"
+        echo "  Actual output:"
+        echo "$haystack" | head -40
+        exit 1
+    else
+        echo "PASS: $msg"
+    fi
+}
+
 echo "=== FireDuckExt Integration Tests ==="
 echo "FIRESTORE_EMULATOR_HOST: $FIRESTORE_EMULATOR_HOST"
 
@@ -505,7 +544,98 @@ echo "Test 34: Filter with aggregation..."
 AVG_SCORE=$(run_query "SELECT round(avg(score), 1) FROM firestore_scan('pushdown_test') WHERE status = 'active' AND score IS NOT NULL;")
 assert_eq "$AVG_SCORE" "90.3" "Average score of active users with scores is 90.3"
 
+# =====================================================
+# EXPLAIN Plan Pushdown Validation Tests
+# =====================================================
+# These tests verify that EXPLAIN output shows the correct
+# Firestore Pushed Filters in the plan. DuckDB re-applies
+# filters as post-scan FILTER node for correctness.
+
+echo ""
+echo "=== EXPLAIN Plan Pushdown Validation Tests ==="
+
+# Test 35: EXPLAIN shows equality filter pushdown
+echo "Test 35: EXPLAIN shows equality filter pushdown..."
+EXPLAIN_EQ=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE status = 'active';")
+assert_contains "$EXPLAIN_EQ" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters"
+assert_contains "$EXPLAIN_EQ" "status EQUAL 'active'" "EXPLAIN shows status EQUAL 'active'"
+assert_contains "$EXPLAIN_EQ" "FILTER" "EXPLAIN has post-scan FILTER node for correctness"
+
+# Test 36: EXPLAIN shows range filter pushdown
+echo "Test 36: EXPLAIN shows range filter pushdown..."
+EXPLAIN_GT=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE age > 28;")
+assert_contains "$EXPLAIN_GT" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for range"
+assert_contains "$EXPLAIN_GT" "age GREATER_THAN" "EXPLAIN shows age GREATER_THAN"
+
+# Test 37: IS NULL is NOT pushed down (Firestore excludes missing fields from IS_NULL matches)
+echo "Test 37: EXPLAIN does NOT push down IS NULL..."
+EXPLAIN_NULL=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE score IS NULL;")
+assert_not_contains "$EXPLAIN_NULL" "Firestore Pushed Filters" "IS NULL is NOT pushed to Firestore (missing field semantics differ)"
+
+# Test 38: EXPLAIN shows IS NOT NULL pushdown
+echo "Test 38: EXPLAIN shows IS NOT NULL pushdown..."
+EXPLAIN_NOTNULL=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE score IS NOT NULL;")
+assert_contains "$EXPLAIN_NOTNULL" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for IS NOT NULL"
+assert_contains "$EXPLAIN_NOTNULL" "score IS_NOT_NULL" "EXPLAIN shows score IS_NOT_NULL"
+
+# Test 39: EXPLAIN shows NOT EQUAL pushdown
+echo "Test 39: EXPLAIN shows NOT EQUAL pushdown..."
+EXPLAIN_NEQ=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE status != 'pending';")
+assert_contains "$EXPLAIN_NEQ" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for NOT EQUAL"
+assert_contains "$EXPLAIN_NEQ" "status NOT_EQUAL 'pending'" "EXPLAIN shows status NOT_EQUAL 'pending'"
+
+# Test 40: EXPLAIN shows multiple filters pushed down
+echo "Test 40: EXPLAIN shows multiple filters pushed down..."
+EXPLAIN_MULTI=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE status = 'active' AND age > 30;")
+assert_contains "$EXPLAIN_MULTI" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for multi-filter"
+assert_contains "$EXPLAIN_MULTI" "status EQUAL 'active'" "EXPLAIN shows status EQUAL in multi-filter"
+
+# Test 41: EXPLAIN shows IN filter pushdown
+echo "Test 41: EXPLAIN shows IN filter pushdown..."
+EXPLAIN_IN=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE status IN ('active', 'pending');")
+assert_contains "$EXPLAIN_IN" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for IN"
+assert_contains "$EXPLAIN_IN" "status IN [2 values]" "EXPLAIN shows status IN [2 values]"
+
+# Test 42: EXPLAIN does NOT show pushdown for unsupported filters (LIKE)
+echo "Test 42: EXPLAIN does NOT push down LIKE filter..."
+EXPLAIN_LIKE=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE name LIKE '%li%';")
+assert_not_contains "$EXPLAIN_LIKE" "Firestore Pushed Filters" "LIKE filter is NOT pushed to Firestore"
+
+# Test 43: EXPLAIN shows LESS_THAN_OR_EQUAL pushdown
+echo "Test 43: EXPLAIN shows LESS_THAN_OR_EQUAL pushdown..."
+EXPLAIN_LTE=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE age <= 30;")
+assert_contains "$EXPLAIN_LTE" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters for <="
+assert_contains "$EXPLAIN_LTE" "age LESS_THAN_OR_EQUAL" "EXPLAIN shows age LESS_THAN_OR_EQUAL"
+
+# Test 44: EXPLAIN shows correct column for IS NULL with multiple columns in schema
+echo "Test 44: EXPLAIN pushes correct column name (not shifted by projection)..."
+EXPLAIN_COL=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE score IS NOT NULL AND status = 'active';")
+assert_contains "$EXPLAIN_COL" "score IS_NOT_NULL" "EXPLAIN shows score IS_NOT_NULL (correct column)"
+# DuckDB box rendering wraps long File Filters lines, so check both filters are present.
+# The status EQUAL 'active' may be split across lines, so check EQUAL is on a separate line.
+assert_contains "$EXPLAIN_COL" "EQUAL" "EXPLAIN shows EQUAL filter for status"
+# Verify incorrect column names are NOT present (regression test for column mapping bug)
+assert_not_contains "$EXPLAIN_COL" "activeBackground" "EXPLAIN does NOT show wrong column name"
+
+# Test 45: IN filter result correctness
+echo "Test 45: IN filter result correctness..."
+IN_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE status IN ('active', 'pending');")
+assert_eq "$IN_COUNT" "4" "Found 4 users with status IN (active, pending)"
+
+IN_NAMES=$(run_query "SELECT string_agg(name, ',' ORDER BY name) FROM firestore_scan('pushdown_test') WHERE status IN ('active', 'pending');")
+assert_eq "$IN_NAMES" "Alice,Bob,Diana,Eve" "IN filter returns correct users"
+
+# Test 46: Boolean filter pushdown
+echo "Test 46: Boolean-like filter pushdown correctness..."
+# Eve has no score field (NULL), others have numeric scores
+NULL_SCORE_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE score IS NULL;")
+assert_eq "$NULL_SCORE_COUNT" "1" "Found 1 user with NULL score (Eve)"
+
+NOTNULL_SCORE=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE score IS NOT NULL;")
+assert_eq "$NOTNULL_SCORE" "4" "Found 4 users with non-NULL score"
+
 # Cleanup pushdown test data
+echo ""
 echo "Cleaning up pushdown test data..."
 run_query "
 SELECT * FROM firestore_delete('pushdown_test', 'pt1');

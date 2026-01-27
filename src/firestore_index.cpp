@@ -58,13 +58,11 @@ std::vector<FirestorePushdownFilter> ConvertDuckDBFilter(
         }
 
         case TableFilterType::IS_NULL: {
-            FirestorePushdownFilter pf;
-            pf.field_path = field_name;
-            pf.is_unary = true;
-            pf.unary_op = "IS_NULL";
-            pf.is_equality = true;
-            result.push_back(std::move(pf));
-            break;
+            // IS_NULL is NOT pushed down: Firestore's IS_NULL only matches documents where
+            // the field exists and is explicitly null, not documents where the field is missing.
+            // DuckDB treats missing fields as NULL, so this would produce incorrect results.
+            FS_LOG_DEBUG("IS_NULL filter not pushed down (Firestore excludes missing fields): " + field_name);
+            return {};
         }
 
         case TableFilterType::IS_NOT_NULL: {
@@ -446,8 +444,13 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
         return result;
     }
 
-    // Handle IS NULL / IS NOT NULL (BoundOperatorExpression)
-    if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+    // Handle IS NOT NULL (BoundOperatorExpression)
+    // Note: IS_NULL is NOT pushed down because Firestore's IS_NULL only matches documents
+    // where the field exists and is explicitly null, not documents where the field is missing.
+    // DuckDB treats missing fields as NULL, so pushing IS_NULL would incorrectly exclude
+    // documents that lack the field entirely. IS_NOT_NULL is safe to push because Firestore
+    // correctly excludes both missing-field and explicitly-null documents.
+    if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
         auto &op_expr = expr.Cast<BoundOperatorExpression>();
         if (op_expr.children.size() == 1 &&
             op_expr.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
@@ -461,10 +464,55 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
             FirestorePushdownFilter pf;
             pf.field_path = field_name;
             pf.is_unary = true;
-            pf.unary_op = (expr.type == ExpressionType::OPERATOR_IS_NULL) ? "IS_NULL" : "IS_NOT_NULL";
+            pf.unary_op = "IS_NOT_NULL";
             pf.is_equality = true;
             result.push_back(std::move(pf));
         }
+        return result;
+    }
+
+    // Handle COMPARE_IN / COMPARE_NOT_IN (BoundOperatorExpression)
+    // DuckDB represents `x IN ('a', 'b')` as BoundOperatorExpression with type COMPARE_IN
+    // children[0] = column ref, children[1..n] = constant values
+    if (expr.type == ExpressionType::COMPARE_IN || expr.type == ExpressionType::COMPARE_NOT_IN) {
+        auto &op_expr = expr.Cast<BoundOperatorExpression>();
+        if (op_expr.children.size() < 2) {
+            return {};
+        }
+
+        // First child must be a column reference
+        if (op_expr.children[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+            return {};
+        }
+        auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+        std::string field_name;
+        LogicalType field_type;
+        if (!resolve_column(col_ref, field_name, field_type)) {
+            return {};
+        }
+
+        // Remaining children must be constants
+        std::vector<json> values;
+        for (size_t i = 1; i < op_expr.children.size(); i++) {
+            if (op_expr.children[i]->expression_class != ExpressionClass::BOUND_CONSTANT) {
+                return {};
+            }
+            auto &const_val = op_expr.children[i]->Cast<BoundConstantExpression>();
+            values.push_back(DuckDBValueToFirestore(const_val.value, field_type));
+        }
+
+        // Firestore IN filter has a limit of 30 values
+        if (values.size() > 30) {
+            return {};
+        }
+
+        FirestorePushdownFilter pf;
+        pf.field_path = field_name;
+        pf.firestore_op = (expr.type == ExpressionType::COMPARE_IN) ? "IN" : "NOT_IN";
+        pf.is_in_filter = true;
+        pf.is_equality = true;
+        pf.in_values = std::move(values);
+        result.push_back(std::move(pf));
         return result;
     }
 
