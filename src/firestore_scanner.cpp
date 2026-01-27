@@ -274,7 +274,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(
         }
         sq["limit"] = page_size;
 
-        // Add orderBy
+        // Add orderBy - Firestore requires inequality/range filter fields to appear
+        // before __name__ in the orderBy clause
         if (bind_data.order_by.has_value()) {
             std::string order_str = bind_data.order_by.value();
             std::string field_name = order_str;
@@ -292,11 +293,48 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(
                 {"direction", direction}
             }};
         } else {
-            // Default orderBy __name__ for cursor-based pagination
-            sq["orderBy"] = {{
+            // Build orderBy: inequality/range fields first, then __name__ last.
+            // Firestore requires inequality filter fields (range, NOT_EQUAL, NOT_IN,
+            // IS_NOT_NULL) to appear in orderBy before __name__.
+            json order_by_arr = json::array();
+            std::set<std::string> added_fields;
+
+            for (auto &f : global_state->pushdown_result.pushed_filters) {
+                // Firestore inequality-like operators that require orderBy on the field:
+                // - Range: LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL
+                // - NOT_EQUAL, NOT_IN
+                // - IS_NOT_NULL (unary)
+                // Equality operators (EQUAL, IN) do NOT require orderBy.
+                bool needs_order = false;
+                if (f.is_unary && f.unary_op == "IS_NOT_NULL") {
+                    needs_order = true;
+                } else if (!f.is_unary && !f.is_in_filter) {
+                    // Check if it's a range or NOT_EQUAL op
+                    if (f.firestore_op == "LESS_THAN" || f.firestore_op == "LESS_THAN_OR_EQUAL" ||
+                        f.firestore_op == "GREATER_THAN" || f.firestore_op == "GREATER_THAN_OR_EQUAL" ||
+                        f.firestore_op == "NOT_EQUAL") {
+                        needs_order = true;
+                    }
+                } else if (f.is_in_filter && f.firestore_op == "NOT_IN") {
+                    needs_order = true;
+                }
+
+                if (needs_order && added_fields.find(f.field_path) == added_fields.end()) {
+                    order_by_arr.push_back({
+                        {"field", {{"fieldPath", f.field_path}}},
+                        {"direction", "ASCENDING"}
+                    });
+                    added_fields.insert(f.field_path);
+                }
+            }
+
+            // __name__ always last for cursor-based pagination
+            order_by_arr.push_back({
                 {"field", {{"fieldPath", "__name__"}}},
                 {"direction", "ASCENDING"}
-            }};
+            });
+
+            sq["orderBy"] = order_by_arr;
         }
 
         global_state->structured_query = sq;
