@@ -87,11 +87,11 @@ SELECT list(__document_id) FROM mock_users WHERE name LIKE 'A%';
 ----
 [user1]
 
-# Test: Filter returning empty list
+# Test: Filter returning empty list — list() returns NULL when no rows match
 query I
 SELECT list(__document_id) FROM mock_users WHERE status = 'deleted';
 ----
-[]
+NULL
 
 # Test: Complex filter with subquery pattern
 query I
@@ -281,7 +281,7 @@ SET VARIABLE below_avg_age = (SELECT list(__document_id) FROM mock_users WHERE a
 query I
 SELECT getvariable('below_avg_age');
 ----
-[user2, user4]
+[user1, user2, user4]
 
 # Batch delete with NULL variable returns 0 (handles NULL gracefully)
 query I

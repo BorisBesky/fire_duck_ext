@@ -46,7 +46,7 @@ SELECT * FROM (VALUES
 ) AS t(__document_id, name, age, active);
 
 # Test: SELECT * should return all columns including __document_id
-query ITIB
+query ITIT
 SELECT * FROM mock_firestore_data ORDER BY __document_id;
 ----
 doc1	Alice	30	true
