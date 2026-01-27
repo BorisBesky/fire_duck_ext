@@ -20,7 +20,7 @@ const char *LogLevelToString(FirestoreLogLevel level) {
 		return "INFO";
 	case FirestoreLogLevel::WARN:
 		return "WARN";
-	case FirestoreLogLevel::ERROR:
+	case FirestoreLogLevel::ERR:
 		return "ERROR";
 	case FirestoreLogLevel::NONE:
 		return "NONE";
@@ -40,7 +40,7 @@ FirestoreLogLevel ParseLogLevel(const std::string &str) {
 	if (upper == "WARN" || upper == "WARNING")
 		return FirestoreLogLevel::WARN;
 	if (upper == "ERROR")
-		return FirestoreLogLevel::ERROR;
+		return FirestoreLogLevel::ERR;
 	if (upper == "NONE" || upper == "OFF")
 		return FirestoreLogLevel::NONE;
 

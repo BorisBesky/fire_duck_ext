@@ -17,7 +17,7 @@ enum class FirestoreLogLevel {
 	DEBUG = 0, // Detailed diagnostic information
 	INFO = 1,  // General operational information
 	WARN = 2,  // Warning conditions
-	ERROR = 3, // Error conditions
+	ERR = 3,   // Error conditions
 	NONE = 4   // Disable all logging
 };
 
@@ -136,7 +136,7 @@ public:
 	}
 
 	void Error(const std::string &msg, const char *file = nullptr, int line = 0, const char *func = nullptr) {
-		Log(FirestoreLogLevel::ERROR, msg, file, line, func);
+		Log(FirestoreLogLevel::ERR, msg, file, line, func);
 	}
 
 	// Delete copy/move constructors
@@ -180,7 +180,7 @@ private:
 
 #define FS_LOG_ERROR(msg)                                                                                              \
 	do {                                                                                                               \
-		if (::duckdb::FirestoreLogger::Instance().ShouldLog(::duckdb::FirestoreLogLevel::ERROR)) {                     \
+		if (::duckdb::FirestoreLogger::Instance().ShouldLog(::duckdb::FirestoreLogLevel::ERR)) {                       \
 			::duckdb::FirestoreLogger::Instance().Error(msg, __FILE__, __LINE__, __func__);                            \
 		}                                                                                                              \
 	} while (0)
