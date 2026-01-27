@@ -91,13 +91,15 @@ FirestoreFilterResult MatchFiltersToIndexes(
 
 // Convert a DuckDB Expression tree into Firestore pushdown filters
 // Used by pushdown_complex_filter callback (operates on Expression trees, not TableFilter)
-// column_names/column_types are the bind-time schema (excluding __document_id)
+// all_column_names/all_column_types are the full bind-time schema (including __document_id at index 0)
 // table_index is the LogicalGet's table_index for matching column references
+// column_ids maps binding column_index -> original column index in all_column_names
 std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
     const Expression &expr,
     idx_t table_index,
-    const std::vector<std::string> &column_names,
-    const std::vector<LogicalType> &column_types
+    const std::vector<std::string> &all_column_names,
+    const std::vector<LogicalType> &all_column_types,
+    const std::vector<idx_t> &column_id_map
 );
 
 } // namespace duckdb

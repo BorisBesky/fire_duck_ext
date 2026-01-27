@@ -49,9 +49,18 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 
     bind_data.candidate_pushdown_filters.clear();
 
+    // Build column_id_map: maps binding.column_index -> original column index in get.names
+    // binding.column_index is the position in LogicalGet's column_ids array
+    std::vector<idx_t> column_id_map;
+    auto &col_ids = get.GetColumnIds();
+    column_id_map.reserve(col_ids.size());
+    for (auto &cid : col_ids) {
+        column_id_map.push_back(cid.GetPrimaryIndex());
+    }
+
     for (auto &filter : filters) {
         auto converted = ConvertExpressionToFilters(
-            *filter, get.table_index, bind_data.column_names, bind_data.column_types);
+            *filter, get.table_index, get.names, get.returned_types, column_id_map);
         bind_data.candidate_pushdown_filters.insert(
             bind_data.candidate_pushdown_filters.end(),
             std::make_move_iterator(converted.begin()),

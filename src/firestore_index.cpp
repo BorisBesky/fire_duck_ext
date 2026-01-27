@@ -332,16 +332,44 @@ FirestoreFilterResult MatchFiltersToIndexes(
 std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
     const Expression &expr,
     idx_t table_index,
-    const std::vector<std::string> &column_names,
-    const std::vector<LogicalType> &column_types
+    const std::vector<std::string> &all_column_names,
+    const std::vector<LogicalType> &all_column_types,
+    const std::vector<idx_t> &column_id_map
 ) {
     std::vector<FirestorePushdownFilter> result;
+
+    // Helper: resolve a BoundColumnRefExpression to a field name and type.
+    // binding.column_index is the position in LogicalGet's column_ids array,
+    // column_id_map[binding.column_index] gives the original bind-time column index
+    // into all_column_names / all_column_types.
+    // Returns false if the column can't be resolved to a pushable field.
+    auto resolve_column = [&](const BoundColumnRefExpression &col_ref,
+                              std::string &out_name, LogicalType &out_type) -> bool {
+        if (col_ref.binding.table_index != table_index) {
+            return false;
+        }
+        idx_t binding_idx = col_ref.binding.column_index;
+        if (binding_idx >= column_id_map.size()) {
+            return false;
+        }
+        idx_t original_col_idx = column_id_map[binding_idx];
+        // Skip __document_id (column 0) and virtual row id
+        if (original_col_idx == 0 || original_col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+            return false;
+        }
+        if (original_col_idx >= all_column_names.size()) {
+            return false;
+        }
+        out_name = all_column_names[original_col_idx];
+        out_type = all_column_types[original_col_idx];
+        return true;
+    };
 
     // Handle AND conjunction - recurse into children
     if (expr.type == ExpressionType::CONJUNCTION_AND) {
         auto &conj = expr.Cast<BoundConjunctionExpression>();
         for (auto &child : conj.children) {
-            auto child_filters = ConvertExpressionToFilters(*child, table_index, column_names, column_types);
+            auto child_filters = ConvertExpressionToFilters(*child, table_index, all_column_names, all_column_types, column_id_map);
             result.insert(result.end(),
                 std::make_move_iterator(child_filters.begin()),
                 std::make_move_iterator(child_filters.end()));
@@ -355,21 +383,14 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
         if (op_expr.children.size() == 1 &&
             op_expr.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
             auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
-            if (col_ref.binding.table_index != table_index) {
-                return {};
-            }
-            idx_t col_idx = col_ref.binding.column_index;
-            // col_idx 0 is __document_id, actual fields start at 1
-            if (col_idx == 0 || col_idx == COLUMN_IDENTIFIER_ROW_ID) {
-                return {};
-            }
-            idx_t field_idx = col_idx - 1;
-            if (field_idx >= column_names.size()) {
+            std::string field_name;
+            LogicalType field_type;
+            if (!resolve_column(col_ref, field_name, field_type)) {
                 return {};
             }
 
             FirestorePushdownFilter pf;
-            pf.field_path = column_names[field_idx];
+            pf.field_path = field_name;
             pf.is_unary = true;
             pf.unary_op = (expr.type == ExpressionType::OPERATOR_IS_NULL) ? "IS_NULL" : "IS_NOT_NULL";
             pf.is_equality = true;
@@ -401,20 +422,14 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
             return {};
         }
 
-        if (col_ref->binding.table_index != table_index) {
-            return {};
-        }
-        idx_t col_idx = col_ref->binding.column_index;
-        if (col_idx == 0 || col_idx == COLUMN_IDENTIFIER_ROW_ID) {
-            return {};
-        }
-        idx_t field_idx = col_idx - 1;
-        if (field_idx >= column_names.size()) {
+        std::string field_name;
+        LogicalType field_type;
+        if (!resolve_column(*col_ref, field_name, field_type)) {
             return {};
         }
 
         FirestorePushdownFilter pf;
-        pf.field_path = column_names[field_idx];
+        pf.field_path = field_name;
 
         ExpressionType cmp_type = expr.type;
         // If the constant is on the left (e.g., 5 < x), flip the comparison
@@ -459,7 +474,7 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(
                 return {};
         }
 
-        pf.firestore_value = DuckDBValueToFirestore(const_val->value, column_types[field_idx]);
+        pf.firestore_value = DuckDBValueToFirestore(const_val->value, field_type);
         result.push_back(std::move(pf));
         return result;
     }
