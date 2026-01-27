@@ -25,6 +25,7 @@ set(EXTENSION_SOURCES
     src/firestore_secrets.cpp
     src/firestore_error.cpp
     src/firestore_logger.cpp
+    src/firestore_index.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

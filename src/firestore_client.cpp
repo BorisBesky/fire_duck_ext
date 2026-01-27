@@ -1,4 +1,5 @@
 #include "firestore_client.hpp"
+#include "firestore_index.hpp"
 #include "firestore_types.hpp"
 #include <curl/curl.h>
 #include <sstream>
@@ -517,6 +518,168 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(
 
     FS_LOG_DEBUG("Collection group query returned " + std::to_string(result.documents.size()) + " documents");
     return result;
+}
+
+std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
+    std::string emulator_host = GetEmulatorHost();
+    std::string base;
+
+    if (!emulator_host.empty()) {
+        base = "http://" + emulator_host + "/v1/projects/" +
+               credentials_->project_id + "/databases/" + credentials_->database_id;
+    } else {
+        base = "https://firestore.googleapis.com/v1/projects/" +
+               credentials_->project_id + "/databases/" + credentials_->database_id;
+    }
+
+    if (!path.empty()) {
+        if (path[0] != '/') {
+            base += "/";
+        }
+        base += path;
+    }
+
+    base += credentials_->GetUrlSuffix();
+    return base;
+}
+
+FirestoreListResponse FirestoreClient::RunQuery(
+    const std::string &collection,
+    const json &structured_query,
+    bool is_collection_group
+) {
+    FS_LOG_DEBUG("Executing runQuery for collection: " + collection +
+                 " (collection_group=" + (is_collection_group ? "true" : "false") + ")");
+
+    std::string url = BuildBaseUrl() + ":runQuery" + credentials_->GetUrlSuffix();
+
+    FirestoreErrorContext ctx;
+    ctx.withOperation("run_query").withCollection(collection);
+
+    json body = {{"structuredQuery", structured_query}};
+
+    FS_LOG_DEBUG("StructuredQuery: " + structured_query.dump());
+
+    json response = MakeRequest("POST", url, body, ctx);
+
+    FirestoreListResponse result;
+
+    if (response.is_array()) {
+        for (auto &item : response) {
+            if (item.contains("document")) {
+                result.documents.push_back(ParseDocument(item["document"]));
+            }
+        }
+    }
+
+    FS_LOG_DEBUG("RunQuery returned " + std::to_string(result.documents.size()) + " documents");
+    return result;
+}
+
+std::vector<FirestoreIndex> FirestoreClient::FetchCompositeIndexes(const std::string &collection_id) {
+    FS_LOG_DEBUG("Fetching composite indexes for collection: " + collection_id);
+
+    std::string url = BuildAdminUrl("collectionGroups/" + collection_id + "/indexes");
+
+    FirestoreErrorContext ctx;
+    ctx.withOperation("fetch_indexes").withCollection(collection_id);
+
+    json response = MakeRequest("GET", url, {}, ctx);
+
+    std::vector<FirestoreIndex> indexes;
+
+    if (!response.contains("indexes")) {
+        FS_LOG_DEBUG("No composite indexes found for collection: " + collection_id);
+        return indexes;
+    }
+
+    for (auto &idx_json : response["indexes"]) {
+        FirestoreIndex idx;
+
+        if (idx_json.contains("name")) {
+            idx.name = idx_json["name"].get<std::string>();
+        }
+
+        // Parse query scope
+        std::string scope_str = idx_json.value("queryScope", "COLLECTION");
+        if (scope_str == "COLLECTION_GROUP") {
+            idx.query_scope = FirestoreIndex::QueryScope::COLLECTION_GROUP;
+        } else {
+            idx.query_scope = FirestoreIndex::QueryScope::COLLECTION;
+        }
+
+        // Parse state
+        std::string state_str = idx_json.value("state", "READY");
+        if (state_str == "CREATING") {
+            idx.state = FirestoreIndex::State::CREATING;
+        } else if (state_str == "NEEDS_REPAIR") {
+            idx.state = FirestoreIndex::State::NEEDS_REPAIR;
+        } else {
+            idx.state = FirestoreIndex::State::READY;
+        }
+
+        // Only include READY indexes
+        if (idx.state != FirestoreIndex::State::READY) {
+            continue;
+        }
+
+        // Parse fields
+        if (idx_json.contains("fields")) {
+            for (auto &field_json : idx_json["fields"]) {
+                FirestoreIndexField field;
+                field.field_path = field_json.value("fieldPath", "");
+
+                if (field_json.contains("order")) {
+                    std::string order_str = field_json["order"].get<std::string>();
+                    field.mode = (order_str == "DESCENDING")
+                        ? FirestoreIndexField::Mode::DESCENDING
+                        : FirestoreIndexField::Mode::ASCENDING;
+                } else if (field_json.contains("arrayConfig")) {
+                    field.mode = FirestoreIndexField::Mode::ARRAY_CONTAINS;
+                } else {
+                    field.mode = FirestoreIndexField::Mode::ASCENDING;
+                }
+
+                idx.fields.push_back(std::move(field));
+            }
+        }
+
+        idx.is_single_field = (idx.fields.size() == 1);
+        indexes.push_back(std::move(idx));
+    }
+
+    FS_LOG_DEBUG("Fetched " + std::to_string(indexes.size()) + " READY composite indexes");
+    return indexes;
+}
+
+bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
+    FS_LOG_DEBUG("Checking default single-field index configuration");
+
+    try {
+        std::string url = BuildAdminUrl("collectionGroups/__default__/fields/*");
+
+        FirestoreErrorContext ctx;
+        ctx.withOperation("check_default_indexes");
+
+        json response = MakeRequest("GET", url, {}, ctx);
+
+        // If the response contains indexConfig with indexes, defaults are enabled
+        if (response.contains("indexConfig") && response["indexConfig"].contains("indexes")) {
+            auto &indexes = response["indexConfig"]["indexes"];
+            if (indexes.is_array() && !indexes.empty()) {
+                FS_LOG_DEBUG("Default single-field indexing is enabled (" +
+                             std::to_string(indexes.size()) + " default index configs)");
+                return true;
+            }
+        }
+
+        FS_LOG_DEBUG("Default single-field indexing appears disabled or empty");
+        return false;
+    } catch (const std::exception &e) {
+        // If we can't check defaults, assume they're enabled (Firestore default behavior)
+        FS_LOG_DEBUG("Failed to check default index config, assuming enabled: " + std::string(e.what()));
+        return true;
+    }
 }
 
 std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(

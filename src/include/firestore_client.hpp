@@ -13,6 +13,9 @@ namespace duckdb {
 
 using json = nlohmann::json;
 
+// Forward declaration
+struct FirestoreIndex;
+
 // Represents a Firestore document
 struct FirestoreDocument {
     std::string name;           // Full document path
@@ -102,17 +105,33 @@ public:
         int64_t sample_size = 100
     );
 
+    // Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
+    FirestoreListResponse RunQuery(
+        const std::string &collection,
+        const json &structured_query,
+        bool is_collection_group = false
+    );
+
+    // Fetch composite indexes for a collection via Admin API
+    std::vector<FirestoreIndex> FetchCompositeIndexes(const std::string &collection_id);
+
+    // Check if default single-field indexing is enabled via Admin API
+    bool CheckDefaultSingleFieldIndexes();
+
     // Get project ID
     const std::string& GetProjectId() const { return credentials_->project_id; }
 
 private:
     std::shared_ptr<FirestoreCredentials> credentials_;
 
-    // Build base URL for Firestore REST API
+    // Build base URL for Firestore REST API (documents endpoint)
     std::string BuildBaseUrl() const;
 
-    // Build full URL with path
+    // Build full URL with path (documents endpoint)
     std::string BuildUrl(const std::string &path) const;
+
+    // Build URL for Admin API (indexes, fields, etc.)
+    std::string BuildAdminUrl(const std::string &path) const;
 
     // Make HTTP request with error context
     json MakeRequest(

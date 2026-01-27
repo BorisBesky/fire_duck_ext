@@ -108,6 +108,13 @@ enum class FirestoreErrorCode : uint32_t {
     SCAN_INVALID_LIMIT          = 0x09010003,  // Invalid limit value
     SCAN_INVALID_ORDER_BY       = 0x09010004,  // Invalid order_by field
 
+    // ========== INDEX/PUSHDOWN ERRORS (Category 0x0A) ==========
+    INDEX_BASE                  = 0x0A000000,
+    INDEX_FETCH_FAILED          = 0x0A010001,  // Failed to fetch index metadata
+    INDEX_PARSE_FAILED          = 0x0A010002,  // Failed to parse index response
+    INDEX_ADMIN_API_UNAVAILABLE = 0x0A010003,  // Admin API not available (emulator)
+    INDEX_QUERY_REJECTED        = 0x0A020001,  // Firestore rejected the filtered query
+
     // ========== INTERNAL ERRORS (Category 0xFF) ==========
     INTERNAL_BASE               = 0xFF000000,
     INTERNAL_UNEXPECTED         = 0xFF000001,  // Unexpected internal error

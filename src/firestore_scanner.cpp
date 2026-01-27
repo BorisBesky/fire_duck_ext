@@ -26,6 +26,9 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
     // Enable projection pushdown for efficiency
     scan_func.projection_pushdown = true;
 
+    // Enable filter pushdown for WHERE clause predicates
+    scan_func.filter_pushdown = true;
+
     loader.RegisterFunction(scan_func);
 }
 
@@ -87,6 +90,32 @@ unique_ptr<FunctionData> FirestoreScanBind(
         result->column_types.push_back(col_type);
     }
 
+    // Fetch index metadata for filter pushdown
+    result->index_cache = std::make_shared<FirestoreIndexCache>();
+    try {
+        // Determine collection ID for index lookup
+        std::string collection_id = result->collection;
+        if (!collection_id.empty() && collection_id[0] == '~') {
+            collection_id = collection_id.substr(1);
+        }
+        // For nested paths like "users/user1/orders", use the last segment
+        size_t last_slash = collection_id.rfind('/');
+        if (last_slash != std::string::npos) {
+            collection_id = collection_id.substr(last_slash + 1);
+        }
+
+        result->index_cache->composite_indexes = client.FetchCompositeIndexes(collection_id);
+        result->index_cache->default_single_field_enabled = client.CheckDefaultSingleFieldIndexes();
+        result->index_cache->fetch_succeeded = true;
+        FS_LOG_DEBUG("Index cache populated: " +
+                     std::to_string(result->index_cache->composite_indexes.size()) +
+                     " composite indexes, default_single_field=" +
+                     (result->index_cache->default_single_field_enabled ? "true" : "false"));
+    } catch (const std::exception &e) {
+        FS_LOG_WARN("Failed to fetch indexes, filter pushdown disabled: " + std::string(e.what()));
+        result->index_cache->fetch_succeeded = false;
+    }
+
     return std::move(result);
 }
 
@@ -116,29 +145,156 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(
     auto global_state = make_uniq<FirestoreScanGlobalState>();
     global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
 
-    // Fetch initial batch of documents
-    FirestoreQuery query;
-    if (bind_data.limit.has_value()) {
-        query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
-    }
-    if (bind_data.order_by.has_value()) {
-        query.order_by = bind_data.order_by.value();
-    }
-
-    FirestoreListResponse response;
-
     // Check if this is a collection group query (starts with ~)
     if (!bind_data.collection.empty() && bind_data.collection[0] == '~') {
-        // Collection group query - set flag so __document_id returns full path
         bind_data.is_collection_group = true;
-        std::string collection_id = bind_data.collection.substr(1);
-        response = global_state->client->CollectionGroupQuery(collection_id, query);
-        // Collection group queries don't support pagination in the same way
-        global_state->next_page_token = "";
+    }
+
+    // Process filter pushdown
+    std::vector<FirestorePushdownFilter> candidate_filters;
+    if (input.filters && bind_data.index_cache && bind_data.index_cache->fetch_succeeded) {
+        for (auto &entry : input.filters->filters) {
+            idx_t col_idx = entry.first;
+            auto &filter = *entry.second;
+
+            // Map filter column index to actual column via column_ids
+            if (col_idx >= input.column_ids.size()) {
+                continue;
+            }
+            auto actual_col_id = input.column_ids[col_idx];
+
+            // Skip __document_id (column 0) and COLUMN_IDENTIFIER_ROW_ID
+            if (actual_col_id == 0 || actual_col_id == COLUMN_IDENTIFIER_ROW_ID) {
+                continue;
+            }
+
+            // actual_col_id - 1 gives index into bind_data.column_names
+            idx_t field_idx = actual_col_id - 1;
+            if (field_idx >= bind_data.column_names.size()) {
+                continue;
+            }
+
+            const std::string &field_name = bind_data.column_names[field_idx];
+            const LogicalType &field_type = bind_data.column_types[field_idx];
+
+            auto converted = ConvertDuckDBFilter(field_name, field_type, filter);
+            candidate_filters.insert(candidate_filters.end(),
+                std::make_move_iterator(converted.begin()),
+                std::make_move_iterator(converted.end()));
+        }
+
+        // Match filters against available indexes
+        if (!candidate_filters.empty()) {
+            global_state->pushdown_result = MatchFiltersToIndexes(
+                candidate_filters, *bind_data.index_cache, bind_data.is_collection_group);
+        }
+    }
+
+    // Build query and fetch initial documents
+    FirestoreListResponse response;
+
+    if (global_state->pushdown_result.has_pushdown()) {
+        // Build StructuredQuery with WHERE clause
+        std::string collection_id = bind_data.collection;
+        if (bind_data.is_collection_group && !collection_id.empty() && collection_id[0] == '~') {
+            collection_id = collection_id.substr(1);
+        }
+
+        json sq;
+        sq["from"] = {{
+            {"collectionId", collection_id},
+            {"allDescendants", bind_data.is_collection_group}
+        }};
+
+        // Add WHERE clause
+        sq["where"] = BuildWhereClause(global_state->pushdown_result.pushed_filters);
+
+        // Add limit
+        int64_t page_size = 1000;
+        if (bind_data.limit.has_value()) {
+            page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
+        }
+        sq["limit"] = page_size;
+
+        // Add orderBy
+        if (bind_data.order_by.has_value()) {
+            std::string order_str = bind_data.order_by.value();
+            std::string field_name = order_str;
+            std::string direction = "ASCENDING";
+            size_t space_pos = order_str.find(' ');
+            if (space_pos != std::string::npos) {
+                field_name = order_str.substr(0, space_pos);
+                std::string dir_str = order_str.substr(space_pos + 1);
+                if (dir_str == "DESC" || dir_str == "desc") {
+                    direction = "DESCENDING";
+                }
+            }
+            sq["orderBy"] = {{
+                {"field", {{"fieldPath", field_name}}},
+                {"direction", direction}
+            }};
+        } else {
+            // Default orderBy __name__ for cursor-based pagination
+            sq["orderBy"] = {{
+                {"field", {{"fieldPath", "__name__"}}},
+                {"direction", "ASCENDING"}
+            }};
+        }
+
+        global_state->structured_query = sq;
+        global_state->uses_run_query = true;
+
+        FS_LOG_DEBUG("Filter pushdown active: " +
+                     std::to_string(global_state->pushdown_result.pushed_filters.size()) +
+                     " filters pushed to Firestore");
+
+        try {
+            response = global_state->client->RunQuery(
+                bind_data.collection, sq, bind_data.is_collection_group);
+            global_state->next_page_token = "";  // runQuery uses cursor-based pagination
+        } catch (const std::exception &e) {
+            // Fallback: if runQuery fails, disable pushdown and use ListDocuments
+            FS_LOG_WARN("RunQuery with filters failed, falling back to full scan: " +
+                        std::string(e.what()));
+            global_state->pushdown_result = FirestoreFilterResult{};
+            global_state->uses_run_query = false;
+            global_state->structured_query = {};
+
+            FirestoreQuery query;
+            if (bind_data.limit.has_value()) {
+                query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
+            }
+            if (bind_data.order_by.has_value()) {
+                query.order_by = bind_data.order_by.value();
+            }
+
+            if (bind_data.is_collection_group) {
+                std::string coll_id = bind_data.collection.substr(1);
+                response = global_state->client->CollectionGroupQuery(coll_id, query);
+                global_state->next_page_token = "";
+            } else {
+                response = global_state->client->ListDocuments(bind_data.collection, query);
+                global_state->next_page_token = response.next_page_token;
+            }
+        }
     } else {
-        // Normal collection query
-        response = global_state->client->ListDocuments(bind_data.collection, query);
-        global_state->next_page_token = response.next_page_token;
+        // No filter pushdown - use existing query paths
+        FirestoreQuery query;
+        if (bind_data.limit.has_value()) {
+            query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
+        }
+        if (bind_data.order_by.has_value()) {
+            query.order_by = bind_data.order_by.value();
+        }
+
+        if (bind_data.is_collection_group) {
+            std::string collection_id = bind_data.collection.substr(1);
+            response = global_state->client->CollectionGroupQuery(collection_id, query);
+            global_state->next_page_token = "";
+        } else {
+            response = global_state->client->ListDocuments(bind_data.collection, query);
+            global_state->next_page_token = response.next_page_token;
+        }
     }
 
     global_state->documents = std::move(response.documents);
@@ -187,28 +343,55 @@ void FirestoreScanFunction(
     while (count < max_count) {
         // Check if we need to fetch more documents
         if (global_state.current_index >= global_state.documents.size()) {
-            if (global_state.next_page_token.empty()) {
-                // No more pages
-                break;
+            if (global_state.uses_run_query) {
+                // Cursor-based pagination for :runQuery
+                if (global_state.documents.empty()) {
+                    break;
+                }
+
+                // Use the last document's __name__ as cursor for startAfter
+                auto &last_doc = global_state.documents.back();
+                json cursor_value = {{"referenceValue", last_doc.name}};
+
+                // Update the structured query with startAt cursor
+                json paginated_query = global_state.structured_query;
+                paginated_query["startAt"] = {
+                    {"values", {cursor_value}},
+                    {"before", false}
+                };
+
+                auto response = global_state.client->RunQuery(
+                    bind_data.collection, paginated_query, bind_data.is_collection_group);
+
+                if (response.documents.empty()) {
+                    break;
+                }
+
+                global_state.documents = std::move(response.documents);
+                global_state.current_index = 0;
+            } else {
+                // Page token-based pagination for ListDocuments
+                if (global_state.next_page_token.empty()) {
+                    break;
+                }
+
+                FirestoreQuery query;
+                query.page_token = global_state.next_page_token;
+                if (bind_data.order_by.has_value()) {
+                    query.order_by = bind_data.order_by.value();
+                }
+
+                auto response = global_state.client->ListDocuments(
+                    bind_data.collection, query);
+
+                if (response.documents.empty()) {
+                    break;
+                }
+
+                global_state.documents = std::move(response.documents);
+                global_state.next_page_token = response.next_page_token;
+                global_state.current_index = 0;
             }
-
-            // Fetch next page
-            FirestoreQuery query;
-            query.page_token = global_state.next_page_token;
-            if (bind_data.order_by.has_value()) {
-                query.order_by = bind_data.order_by.value();
-            }
-
-            auto response = global_state.client->ListDocuments(
-                bind_data.collection, query);
-
-            if (response.documents.empty()) {
-                break;
-            }
-
-            global_state.documents = std::move(response.documents);
-            global_state.next_page_token = response.next_page_token;
-            global_state.current_index = 0;
         }
 
         auto &doc = global_state.documents[global_state.current_index];
@@ -257,10 +440,16 @@ void FirestoreScanFunction(
         global_state.current_index++;
     }
 
-    if (count == 0 ||
-        (global_state.current_index >= global_state.documents.size() &&
-         global_state.next_page_token.empty())) {
+    if (count == 0) {
         global_state.finished = true;
+    } else if (global_state.current_index >= global_state.documents.size()) {
+        if (global_state.uses_run_query) {
+            // For runQuery, we know we're done when a fetch returns fewer docs than the limit
+            // The next pagination attempt in the loop above will confirm with an empty response
+            // Don't mark finished yet - let the next iteration's fetch determine it
+        } else if (global_state.next_page_token.empty()) {
+            global_state.finished = true;
+        }
     }
 
     output.SetCardinality(count);

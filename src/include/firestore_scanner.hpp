@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
+#include "firestore_index.hpp"
 
 namespace duckdb {
 
@@ -24,6 +25,9 @@ struct FirestoreScanBindData : public TableFunctionData {
 
     // Collection group query flag - when true, __document_id returns full path
     bool is_collection_group = false;
+
+    // Index cache - populated at bind time for filter pushdown
+    std::shared_ptr<FirestoreIndexCache> index_cache;
 };
 
 // Global state - shared across threads
@@ -33,6 +37,11 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
     idx_t current_index;
     bool finished;
     std::string next_page_token;
+
+    // Filter pushdown state
+    FirestoreFilterResult pushdown_result;
+    json structured_query;          // Cached StructuredQuery for pagination
+    bool uses_run_query = false;    // Whether using :runQuery (true when filters pushed)
 
     FirestoreScanGlobalState() : current_index(0), finished(false) {}
 

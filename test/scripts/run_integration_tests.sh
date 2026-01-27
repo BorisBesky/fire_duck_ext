@@ -431,5 +431,89 @@ SELECT * FROM firestore_delete('posts', 'post1');
 SELECT * FROM firestore_delete('files', 'file1');
 " > /dev/null
 
+# =====================================================
+# Filter Pushdown Tests
+# =====================================================
+# Note: The emulator may not support the Admin API for indexes,
+# so filter pushdown may gracefully fall back to full scan.
+# These tests verify that results are correct regardless of pushdown.
+
+# Re-seed users for pushdown tests (some may have been modified above)
+echo ""
+echo "=== Filter Pushdown Tests ==="
+echo "Re-seeding users for pushdown tests..."
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/pushdown_test?documentId=pt1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Alice"}, "age": {"integerValue": "30"}, "status": {"stringValue": "active"}, "score": {"doubleValue": 85.5}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/pushdown_test?documentId=pt2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Bob"}, "age": {"integerValue": "25"}, "status": {"stringValue": "pending"}, "score": {"doubleValue": 92.0}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/pushdown_test?documentId=pt3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Charlie"}, "age": {"integerValue": "35"}, "status": {"stringValue": "inactive"}, "score": {"doubleValue": 78.0}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/pushdown_test?documentId=pt4" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Diana"}, "age": {"integerValue": "28"}, "status": {"stringValue": "active"}, "score": {"doubleValue": 95.0}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/pushdown_test?documentId=pt5" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Eve"}, "age": {"integerValue": "40"}, "status": {"stringValue": "active"}}}' > /dev/null
+
+echo "Pushdown test data seeded."
+
+# Test 27: Equality filter
+echo "Test 27: Equality filter on string field..."
+ACTIVE_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE status = 'active';")
+assert_eq "$ACTIVE_COUNT" "3" "Found 3 active users with equality filter"
+
+# Test 28: Range filter (greater than)
+echo "Test 28: Range filter (greater than)..."
+OLDER_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE age > 28;")
+assert_eq "$OLDER_COUNT" "3" "Found 3 users with age > 28"
+
+# Test 29: Range filter (less than or equal)
+echo "Test 29: Range filter (less than or equal)..."
+YOUNG_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE age <= 30;")
+assert_eq "$YOUNG_COUNT" "3" "Found 3 users with age <= 30"
+
+# Test 30: Combined equality + range filter
+echo "Test 30: Combined equality + range filter..."
+ACTIVE_OLDER=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE status = 'active' AND age > 30;")
+assert_eq "$ACTIVE_OLDER" "1" "Found 1 active user with age > 30"
+
+# Test 31: IS NOT NULL filter
+echo "Test 31: IS NOT NULL filter..."
+HAS_SCORE=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE score IS NOT NULL;")
+assert_eq "$HAS_SCORE" "4" "Found 4 users with non-null score"
+
+# Test 32: NOT EQUAL filter
+echo "Test 32: NOT EQUAL filter..."
+NOT_PENDING=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE status != 'pending';")
+assert_eq "$NOT_PENDING" "4" "Found 4 users with status != pending"
+
+# Test 33: Multiple range filters on same field
+echo "Test 33: Multiple range filters on same field (BETWEEN-like)..."
+AGE_RANGE=$(run_query "SELECT count(*) FROM firestore_scan('pushdown_test') WHERE age >= 28 AND age <= 35;")
+assert_eq "$AGE_RANGE" "3" "Found 3 users with age between 28 and 35"
+
+# Test 34: Filter with aggregation
+echo "Test 34: Filter with aggregation..."
+AVG_SCORE=$(run_query "SELECT round(avg(score), 1) FROM firestore_scan('pushdown_test') WHERE status = 'active' AND score IS NOT NULL;")
+assert_eq "$AVG_SCORE" "90.3" "Average score of active users with scores is 90.3"
+
+# Cleanup pushdown test data
+echo "Cleaning up pushdown test data..."
+run_query "
+SELECT * FROM firestore_delete('pushdown_test', 'pt1');
+SELECT * FROM firestore_delete('pushdown_test', 'pt2');
+SELECT * FROM firestore_delete('pushdown_test', 'pt3');
+SELECT * FROM firestore_delete('pushdown_test', 'pt4');
+SELECT * FROM firestore_delete('pushdown_test', 'pt5');
+" > /dev/null
+
 echo ""
 echo "=== All integration tests passed! ==="
