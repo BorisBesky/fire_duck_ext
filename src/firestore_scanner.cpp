@@ -8,6 +8,32 @@
 
 namespace duckdb {
 
+// Format a pushdown filter for EXPLAIN output
+static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
+    if (f.is_unary) {
+        return f.field_path + " " + f.unary_op;
+    }
+    if (f.is_in_filter) {
+        return f.field_path + " " + f.firestore_op + " [" + std::to_string(f.in_values.size()) + " values]";
+    }
+    // Format the value compactly
+    string val_str;
+    if (f.firestore_value.contains("stringValue")) {
+        val_str = "'" + f.firestore_value["stringValue"].get<string>() + "'";
+    } else if (f.firestore_value.contains("integerValue")) {
+        val_str = f.firestore_value["integerValue"].get<string>();
+    } else if (f.firestore_value.contains("doubleValue")) {
+        val_str = std::to_string(f.firestore_value["doubleValue"].get<double>());
+    } else if (f.firestore_value.contains("booleanValue")) {
+        val_str = f.firestore_value["booleanValue"].get<bool>() ? "true" : "false";
+    } else if (f.firestore_value.contains("nullValue")) {
+        val_str = "NULL";
+    } else {
+        val_str = f.firestore_value.dump();
+    }
+    return f.field_path + " " + f.firestore_op + " " + val_str;
+}
+
 // pushdown_complex_filter callback: extracts filter expressions for Firestore pushdown
 // but leaves all expressions in the vector so DuckDB re-applies them as post-scan filters.
 // This ensures correctness - Firestore filtering is used for performance (reduce network transfer)
@@ -30,6 +56,24 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
             bind_data.candidate_pushdown_filters.end(),
             std::make_move_iterator(converted.begin()),
             std::make_move_iterator(converted.end()));
+    }
+
+    // Match against indexes now to populate EXPLAIN output
+    if (!bind_data.candidate_pushdown_filters.empty()) {
+        bool is_collection_group = !bind_data.collection.empty() && bind_data.collection[0] == '~';
+        auto result = MatchFiltersToIndexes(
+            bind_data.candidate_pushdown_filters, *bind_data.index_cache, is_collection_group);
+
+        if (result.has_pushdown()) {
+            string info;
+            for (auto &f : result.pushed_filters) {
+                if (!info.empty()) {
+                    info += ", ";
+                }
+                info += FormatPushdownFilter(f);
+            }
+            get.extra_info.file_filters = "Firestore Pushed Filters: " + info;
+        }
     }
 
     // IMPORTANT: Do NOT remove any expressions from the filters vector.
