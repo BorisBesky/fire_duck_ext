@@ -193,8 +193,7 @@ static OperatorResultType FirestoreInsertInOutFunction(ExecutionContext &context
 				global_state.rows_inserted++;
 			} catch (const std::exception &e) {
 				throw InvalidInputException("Firestore insert failed at row " +
-				                            std::to_string(global_state.rows_inserted) + ": " +
-				                            std::string(e.what()));
+				                            std::to_string(global_state.rows_inserted) + ": " + std::string(e.what()));
 			}
 		} else if (global_state.use_individual_ops) {
 			// Fallback mode: individual CreateDocument calls with explicit ID

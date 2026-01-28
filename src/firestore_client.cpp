@@ -691,59 +691,34 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 	std::map<std::string, std::string> field_types;
 	// For array fields, collect element types
 	std::map<std::string, std::map<std::string, int64_t>> array_element_types;
+	// For vector fields, track dimension from first non-null vector
+	std::map<std::string, idx_t> vector_dimensions;
 
 	for (const auto &doc : response.documents) {
 		for (auto it = doc.fields.begin(); it != doc.fields.end(); ++it) {
 			const std::string &field_name = it.key();
 			const json &field_value = it.value();
 
-			// Determine type from Firestore value format
-			std::string type_name;
-			if (field_value.contains("stringValue"))
-				type_name = "stringValue";
-			else if (field_value.contains("integerValue"))
-				type_name = "integerValue";
-			else if (field_value.contains("doubleValue"))
-				type_name = "doubleValue";
-			else if (field_value.contains("booleanValue"))
-				type_name = "booleanValue";
-			else if (field_value.contains("timestampValue"))
-				type_name = "timestampValue";
-			else if (field_value.contains("geoPointValue"))
-				type_name = "geoPointValue";
-			else if (field_value.contains("arrayValue")) {
-				type_name = "arrayValue";
-				// Sample array elements to determine element type
-				if (field_value["arrayValue"].contains("values")) {
-					for (const auto &elem : field_value["arrayValue"]["values"]) {
-						std::string elem_type;
-						if (elem.contains("stringValue"))
-							elem_type = "stringValue";
-						else if (elem.contains("integerValue"))
-							elem_type = "integerValue";
-						else if (elem.contains("doubleValue"))
-							elem_type = "doubleValue";
-						else if (elem.contains("booleanValue"))
-							elem_type = "booleanValue";
-						else if (elem.contains("timestampValue"))
-							elem_type = "timestampValue";
-						else if (elem.contains("nullValue"))
-							continue; // Skip nulls for type inference
-						else
-							elem_type = "stringValue"; // Default
+			// Use the centralized type detection function
+			std::string type_name = GetFirestoreTypeName(field_value);
+
+			// For array fields, sample element types
+			if (type_name == "arrayValue" && field_value["arrayValue"].contains("values")) {
+				for (const auto &elem : field_value["arrayValue"]["values"]) {
+					std::string elem_type = GetFirestoreTypeName(elem);
+					if (elem_type != "nullValue") {
 						array_element_types[field_name][elem_type]++;
 					}
 				}
-			} else if (field_value.contains("mapValue"))
-				type_name = "mapValue";
-			else if (field_value.contains("referenceValue"))
-				type_name = "referenceValue";
-			else if (field_value.contains("bytesValue"))
-				type_name = "bytesValue";
-			else if (field_value.contains("nullValue"))
-				type_name = "nullValue";
-			else
-				type_name = "stringValue"; // Default
+			}
+
+			// For vector fields, record dimension from first occurrence
+			if (type_name == "vectorValue" && vector_dimensions.find(field_name) == vector_dimensions.end()) {
+				const auto &arr = field_value["mapValue"]["fields"]["value"]["arrayValue"];
+				if (arr.contains("values")) {
+					vector_dimensions[field_name] = arr["values"].size();
+				}
+			}
 
 			// Store first seen type (could be improved to handle type conflicts)
 			if (field_types.find(field_name) == field_types.end()) {
@@ -779,6 +754,17 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 			}
 			result.emplace_back(name, LogicalType::LIST(element_type));
 			FS_LOG_DEBUG("Array field '" + name + "' inferred element type: " + element_type.ToString());
+		} else if (type == "vectorValue") {
+			// Use the dimension from the first vector found
+			if (vector_dimensions.count(name) && vector_dimensions[name] > 0) {
+				result.emplace_back(name, LogicalType::ARRAY(LogicalType::DOUBLE, vector_dimensions[name]));
+				FS_LOG_DEBUG("Vector field '" + name +
+				             "' inferred dimension: " + std::to_string(vector_dimensions[name]));
+			} else {
+				// Fallback if no dimension could be determined
+				result.emplace_back(name, LogicalType::LIST(LogicalType::DOUBLE));
+				FS_LOG_DEBUG("Vector field '" + name + "' could not determine dimension, using LIST(DOUBLE)");
+			}
 		} else {
 			result.emplace_back(name, FirestoreTypeToDuckDB(type));
 		}

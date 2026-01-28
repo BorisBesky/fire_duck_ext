@@ -20,6 +20,7 @@ using json = nlohmann::json;
 // geoPointValue       -> STRUCT(latitude DOUBLE, longitude DOUBLE)
 // arrayValue          -> LIST(inferred type)
 // mapValue            -> JSON (VARCHAR)
+// vectorValue         -> ARRAY(DOUBLE, N) (Firestore vector embedding)
 // referenceValue      -> VARCHAR (document path)
 // bytesValue          -> BLOB
 

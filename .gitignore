@@ -8,3 +8,4 @@ testext
 test/python/__pycache__/
 .Rhistory
 firestore-debug.log
+test/scripts/firebase-debug.log

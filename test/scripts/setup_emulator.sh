@@ -27,7 +27,11 @@ if ! curl -s "http://127.0.0.1:8080" > /dev/null 2>&1; then
     exit 1
 fi
 
-echo "Emulator is running. Seeding test data..."
+echo "Emulator is running. Clearing any existing data..."
+
+# Clear all emulator data to ensure a clean state on every run
+curl -s -X DELETE "http://127.0.0.1:8080/emulator/v1/projects/test-project/databases/(default)/documents" > /dev/null
+echo "Emulator data cleared. Seeding test data..."
 
 # Seed test data via REST API
 # Users collection
@@ -67,6 +71,19 @@ curl -s -X POST "http://127.0.0.1:8080/v1/projects/test-project/databases/(defau
       "nullField": {"nullValue": null}
     }
   }'
+
+# Embeddings collection (vector type)
+curl -s -X POST "http://127.0.0.1:8080/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"cat"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":1.0},{"doubleValue":2.0},{"doubleValue":3.0}]}}}}}}}'
+
+curl -s -X POST "http://127.0.0.1:8080/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"dog"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":4.0},{"doubleValue":5.0},{"doubleValue":6.0}]}}}}}}}'
+
+curl -s -X POST "http://127.0.0.1:8080/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"bird"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":7.0},{"doubleValue":8.0},{"doubleValue":9.0}]}}}}}}}'
 
 echo ""
 echo "Test data seeded successfully!"

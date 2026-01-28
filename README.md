@@ -5,11 +5,14 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 ## Features
 
 - **Read data** from Firestore collections with `firestore_scan()`
-- **Write data** with `firestore_insert()`, `firestore_update()`, `firestore_delete()`
+- **Insert data** from subqueries, CSVs, or tables with `firestore_insert()`
+- **Update and delete** with `firestore_update()`, `firestore_delete()`
 - **Batch operations** for bulk updates and deletes
+- **Array transforms** with `firestore_array_union()`, `firestore_array_remove()`, `firestore_array_append()`
 - **Collection group queries** for querying across nested collections
+- **Filter pushdown** sends supported WHERE clauses to Firestore for faster queries
+- **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
-- **Full SQL filtering** - filter, aggregate, and join Firestore data using DuckDB's SQL engine
 
 ## Quick Start
 
@@ -31,6 +34,16 @@ SELECT * FROM firestore_scan('users');
 SELECT __document_id, name, email
 FROM firestore_scan('users')
 WHERE status = 'active';
+
+-- Insert documents from a subquery
+SELECT * FROM firestore_insert('users', (
+    SELECT 'Alice' AS name, 30 AS age
+));
+
+-- Insert with explicit document IDs
+SELECT * FROM firestore_insert('users',
+    (SELECT 'alice123' AS id, 'Alice' AS name, 30 AS age),
+    document_id := 'id');
 
 -- Update documents
 SELECT * FROM firestore_update('users', 'user123', 'status', 'verified');
@@ -82,11 +95,104 @@ CREATE SECRET emulator (
 |----------|-------------|
 | `firestore_scan('collection')` | Read all documents from a collection |
 | `firestore_scan('~collection')` | Collection group query (all subcollections) |
-| `firestore_insert('collection', 'doc_id', ...)` | Insert a new document |
-| `firestore_update('collection', 'doc_id', 'field', 'value')` | Update a single field |
+| `firestore_insert('collection', (SELECT ...), document_id := 'col')` | Insert documents from a subquery |
+| `firestore_update('collection', 'doc_id', 'field1', value1, ...)` | Update fields on a single document |
 | `firestore_delete('collection', 'doc_id')` | Delete a document |
-| `firestore_update_batch('collection', ['id1', 'id2'], 'field', 'value')` | Batch update |
-| `firestore_delete_batch('collection', ['id1', 'id2'])` | Batch delete |
+| `firestore_update_batch('collection', ['id1', ...], 'field1', value1, ...)` | Batch update |
+| `firestore_delete_batch('collection', ['id1', ...])` | Batch delete |
+| `firestore_array_union('collection', 'doc_id', 'field', ['v1', ...])` | Add to array (no duplicates) |
+| `firestore_array_remove('collection', 'doc_id', 'field', ['v1', ...])` | Remove from array |
+| `firestore_array_append('collection', 'doc_id', 'field', ['v1', ...])` | Append to array |
+
+## Insert
+
+`firestore_insert` takes a collection name and a subquery, and inserts each row as a Firestore document.
+
+```sql
+-- Auto-generated document IDs
+SELECT * FROM firestore_insert('users', (
+    SELECT name, age FROM read_csv('new_users.csv')
+));
+
+-- Explicit document IDs from a column
+SELECT * FROM firestore_insert('users',
+    (SELECT user_id, name, age FROM read_csv('new_users.csv')),
+    document_id := 'user_id');
+
+-- Insert from a DuckDB table
+SELECT * FROM firestore_insert('employees',
+    (SELECT * FROM employee_staging),
+    document_id := 'emp_id');
+
+-- Insert into nested collections
+SELECT * FROM firestore_insert('users/user1/notes', (
+    SELECT 'note1' AS id, 'Remember to buy milk' AS content
+), document_id := 'id');
+```
+
+The `document_id` parameter specifies which column to use as the Firestore document ID. That column is excluded from the document fields. If omitted, Firestore auto-generates IDs.
+
+## Type Mapping
+
+| Firestore Type | DuckDB Type |
+|----------------|-------------|
+| string | VARCHAR |
+| integer | BIGINT |
+| double | DOUBLE |
+| boolean | BOOLEAN |
+| timestamp | TIMESTAMP |
+| array | LIST |
+| map | VARCHAR (JSON string) |
+| vector | ARRAY(DOUBLE, N) |
+| null | NULL |
+| geoPoint | STRUCT(latitude DOUBLE, longitude DOUBLE) |
+| reference | VARCHAR |
+| bytes | BLOB |
+
+### Vector Embeddings
+
+Firestore vector fields (created via `FieldValue.vector()`) are mapped to DuckDB's fixed-size `ARRAY(DOUBLE, N)` type, where N is the vector dimension inferred from the data.
+
+```sql
+-- Read vectors
+SELECT label, vector FROM firestore_scan('embeddings');
+-- label: cat, vector: [1.0, 2.0, 3.0]
+
+-- Access individual elements (1-indexed)
+SELECT label, vector[1] AS first_dim FROM firestore_scan('embeddings');
+
+-- Write vectors back (preserves Firestore vector format for vector search)
+SELECT * FROM firestore_update('embeddings', 'emb1',
+    'vector', [100.0, 200.0, 300.0]::DOUBLE[3]);
+
+-- Compute distances between vectors
+SELECT a.label, b.label,
+    sqrt(list_sum(list_transform(
+        generate_series(1, 3),
+        i -> power(a.vector[i] - b.vector[i], 2)
+    ))) AS distance
+FROM firestore_scan('embeddings') a, firestore_scan('embeddings') b
+WHERE a.label < b.label;
+```
+
+## Filter Pushdown
+
+The extension pushes supported WHERE clauses to Firestore's query API to reduce data transfer. Supported filters:
+
+- Equality: `field = value`
+- Inequality: `field != value`
+- Range: `field > value`, `field >= value`, `field < value`, `field <= value`
+- IN: `field IN ('a', 'b', 'c')`
+- IS NOT NULL: `field IS NOT NULL`
+
+DuckDB re-applies all filters after the scan for correctness, so unsupported filters (LIKE, IS NULL, OR, etc.) still work -- they just scan all documents first.
+
+Use `EXPLAIN` to see which filters are pushed down:
+
+```sql
+EXPLAIN SELECT * FROM firestore_scan('users') WHERE status = 'active' AND age > 25;
+-- Shows "Firestore Pushed Filters: status EQUAL 'active', age GREATER_THAN 25"
+```
 
 ## Building from Source
 
@@ -134,21 +240,6 @@ npm install -g firebase-tools
 firebase emulators:exec --only firestore --project test-project \
     "./test/scripts/run_integration_tests.sh"
 ```
-
-## Type Mapping
-
-| Firestore Type | DuckDB Type |
-|----------------|-------------|
-| string | VARCHAR |
-| integer | BIGINT |
-| double | DOUBLE |
-| boolean | BOOLEAN |
-| timestamp | TIMESTAMP |
-| array | LIST |
-| map | STRUCT |
-| null | NULL |
-| geoPoint | STRUCT(latitude DOUBLE, longitude DOUBLE) |
-| reference | VARCHAR |
 
 ## License
 

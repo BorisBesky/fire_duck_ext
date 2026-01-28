@@ -96,6 +96,11 @@ echo "FIRESTORE_EMULATOR_HOST: $FIRESTORE_EMULATOR_HOST"
 # Wait for emulator to be fully ready
 sleep 3
 
+# Clear all emulator data to ensure a clean state on every run
+echo "Clearing emulator data..."
+curl -s -X DELETE "http://$FIRESTORE_EMULATOR_HOST/emulator/v1/projects/test-project/databases/(default)/documents" > /dev/null
+echo "Emulator data cleared."
+
 # Seed test data
 echo "Seeding test data..."
 
@@ -918,6 +923,92 @@ SELECT * FROM firestore_delete('pushdown_test', 'pt2');
 SELECT * FROM firestore_delete('pushdown_test', 'pt3');
 SELECT * FROM firestore_delete('pushdown_test', 'pt4');
 SELECT * FROM firestore_delete('pushdown_test', 'pt5');
+" > /dev/null
+
+# ============================================
+# Vector Type Tests
+# ============================================
+
+# Test 47: Vector type (reading)
+echo "Test 47: Vector type support (reading)..."
+# Seed documents with vector embeddings (Firestore REST API vector format)
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"cat"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":1.0},{"doubleValue":2.0},{"doubleValue":3.0}]}}}}}}}' > /dev/null
+
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"dog"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":4.0},{"doubleValue":5.0},{"doubleValue":6.0}]}}}}}}}' > /dev/null
+
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"bird"},"vector":{"mapValue":{"fields":{"__type__":{"stringValue":"__vector__"},"value":{"arrayValue":{"values":[{"doubleValue":7.0},{"doubleValue":8.0},{"doubleValue":9.0}]}}}}}}}' > /dev/null
+
+# Verify column type is DOUBLE[3]
+VEC_TYPE=$(run_query "SELECT column_type FROM (DESCRIBE SELECT vector FROM firestore_scan('embeddings'));")
+assert_eq "$VEC_TYPE" "DOUBLE[3]" "Vector is DOUBLE[3] type"
+
+# Verify vector values are read correctly
+VEC_VAL=$(run_query "SELECT vector[1] FROM firestore_scan('embeddings') WHERE __document_id = 'emb1';")
+assert_eq "$VEC_VAL" "1.0" "Vector element [1] read correctly"
+
+VEC_VAL2=$(run_query "SELECT vector[2] FROM firestore_scan('embeddings') WHERE __document_id = 'emb2';")
+assert_eq "$VEC_VAL2" "5.0" "Vector element [2] of emb2 read correctly"
+
+VEC_VAL3=$(run_query "SELECT vector[3] FROM firestore_scan('embeddings') WHERE __document_id = 'emb3';")
+assert_eq "$VEC_VAL3" "9.0" "Vector element [3] of emb3 read correctly"
+
+# Verify count of documents
+VEC_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('embeddings');")
+assert_eq "$VEC_COUNT" "3" "All 3 vector documents read"
+
+# Test 48: Vector type (writing round-trip)
+echo "Test 48: Vector type support (writing round-trip)..."
+# Insert a new document with a vector using firestore_insert and ARRAY type
+run_query "
+SELECT * FROM firestore_insert('embeddings',
+    (SELECT 'fish' AS label, [10.0, 11.0, 12.0]::DOUBLE[3] AS vector),
+    document_id := '__auto__');
+" > /dev/null 2>&1 || true
+
+# Write a vector via firestore_update (updates an existing document)
+run_query "
+SELECT * FROM firestore_update('embeddings', 'emb1',
+    'vector', [100.0, 200.0, 300.0]::DOUBLE[3],
+    'label', 'updated_cat'
+);
+" > /dev/null
+
+# Verify the updated vector
+UPDATED_VEC1=$(run_query "SELECT vector[1] FROM firestore_scan('embeddings') WHERE __document_id = 'emb1';")
+assert_eq "$UPDATED_VEC1" "100.0" "Vector element [1] updated correctly"
+
+UPDATED_VEC2=$(run_query "SELECT vector[2] FROM firestore_scan('embeddings') WHERE __document_id = 'emb1';")
+assert_eq "$UPDATED_VEC2" "200.0" "Vector element [2] updated correctly"
+
+UPDATED_VEC3=$(run_query "SELECT vector[3] FROM firestore_scan('embeddings') WHERE __document_id = 'emb1';")
+assert_eq "$UPDATED_VEC3" "300.0" "Vector element [3] updated correctly"
+
+UPDATED_LABEL=$(run_query "SELECT label FROM firestore_scan('embeddings') WHERE __document_id = 'emb1';")
+assert_eq "$UPDATED_LABEL" "updated_cat" "Label updated alongside vector"
+
+# Test 49: Vector with NULL field
+echo "Test 49: Vector with NULL field..."
+curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/embeddings?documentId=emb_null" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"label":{"stringValue":"no_vector"}}}' > /dev/null
+
+NULL_VEC=$(run_query "SELECT vector IS NULL FROM firestore_scan('embeddings') WHERE __document_id = 'emb_null';")
+assert_eq "$NULL_VEC" "true" "Missing vector field is NULL"
+
+# Cleanup vector test data
+echo ""
+echo "Cleaning up vector test data..."
+run_query "
+SELECT * FROM firestore_delete('embeddings', 'emb1');
+SELECT * FROM firestore_delete('embeddings', 'emb2');
+SELECT * FROM firestore_delete('embeddings', 'emb3');
+SELECT * FROM firestore_delete('embeddings', 'emb_null');
 " > /dev/null
 
 echo ""

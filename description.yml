@@ -93,6 +93,7 @@ docs:
     | timestamp      | TIMESTAMP                                |
     | array          | LIST                                     |
     | map            | VARCHAR (JSON string)                    |
+    | vector         | ARRAY(DOUBLE, N) (embedding)             |
     | null           | NULL                                     |
     | geoPoint       | STRUCT(latitude DOUBLE, longitude DOUBLE) |
     | reference      | VARCHAR                                  |

@@ -53,6 +53,43 @@ static std::string Base64Decode(const std::string &encoded) {
 	return std::string(buffer.data(), actual_length);
 }
 
+// Check if a Firestore mapValue represents a vector (embedding)
+// Vectors are encoded as:
+//   { "mapValue": { "fields": {
+//       "__type__": { "stringValue": "__vector__" },
+//       "value": { "arrayValue": { "values": [ { "doubleValue": ... }, ... ] } }
+//   }}}
+static bool IsFirestoreVector(const json &value) {
+	if (!value.contains("mapValue"))
+		return false;
+	const auto &mv = value["mapValue"];
+	if (!mv.contains("fields"))
+		return false;
+	const auto &fields = mv["fields"];
+	if (!fields.contains("__type__"))
+		return false;
+	const auto &type_field = fields["__type__"];
+	if (!type_field.contains("stringValue"))
+		return false;
+	if (type_field["stringValue"].get<std::string>() != "__vector__")
+		return false;
+	if (!fields.contains("value"))
+		return false;
+	const auto &value_field = fields["value"];
+	if (!value_field.contains("arrayValue"))
+		return false;
+	return true;
+}
+
+// Get the dimension (number of elements) of a Firestore vector value
+static idx_t GetVectorDimension(const json &value) {
+	const auto &arr = value["mapValue"]["fields"]["value"]["arrayValue"];
+	if (arr.contains("values")) {
+		return arr["values"].size();
+	}
+	return 0;
+}
+
 bool IsFirestoreNull(const json &value) {
 	return value.contains("nullValue");
 }
@@ -72,6 +109,8 @@ std::string GetFirestoreTypeName(const json &value) {
 		return "geoPointValue";
 	if (value.contains("arrayValue"))
 		return "arrayValue";
+	if (IsFirestoreVector(value))
+		return "vectorValue";
 	if (value.contains("mapValue"))
 		return "mapValue";
 	if (value.contains("referenceValue"))
@@ -100,6 +139,12 @@ LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type) {
 		return LogicalType::BLOB;
 	if (firestore_type == "nullValue")
 		return LogicalType::VARCHAR; // Will be null
+
+	if (firestore_type == "vectorValue") {
+		// Vectors become ARRAY(DOUBLE, N) - dimension N is determined during schema inference
+		// Fallback to LIST(DOUBLE) when dimension is unknown
+		return LogicalType::LIST(LogicalType::DOUBLE);
+	}
 
 	if (firestore_type == "geoPointValue") {
 		// GeoPoints become STRUCT(latitude DOUBLE, longitude DOUBLE)
@@ -292,6 +337,39 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
 		return Value::LIST(element_type, list_values);
 	}
 
+	// Check for vector type (special mapValue with __type__: __vector__)
+	if (IsFirestoreVector(fv)) {
+		vector<Value> double_values;
+		const auto &arr = fv["mapValue"]["fields"]["value"]["arrayValue"];
+		if (arr.contains("values")) {
+			for (const auto &elem : arr["values"]) {
+				if (elem.contains("doubleValue")) {
+					double_values.push_back(Value::DOUBLE(elem["doubleValue"].get<double>()));
+				} else if (elem.contains("integerValue")) {
+					auto val = elem["integerValue"];
+					double dval;
+					if (val.is_string()) {
+						dval = std::stod(val.get<std::string>());
+					} else {
+						dval = static_cast<double>(val.get<int64_t>());
+					}
+					double_values.push_back(Value::DOUBLE(dval));
+				} else if (elem.contains("nullValue")) {
+					double_values.push_back(Value(LogicalType::DOUBLE));
+				} else {
+					FS_LOG_DEBUG("Unexpected element type in vector value: " + elem.dump());
+					double_values.push_back(Value(LogicalType::DOUBLE));
+				}
+			}
+		}
+
+		// Return as ARRAY if target type is ARRAY, otherwise as LIST
+		if (target_type.id() == LogicalTypeId::ARRAY) {
+			return Value::ARRAY(LogicalType::DOUBLE, double_values);
+		}
+		return Value::LIST(LogicalType::DOUBLE, double_values);
+	}
+
 	if (fv.contains("mapValue")) {
 		// Convert nested map to JSON string
 		if (fv["mapValue"].contains("fields")) {
@@ -337,11 +415,30 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
 	case LogicalTypeId::TINYINT:
 		return {{"integerValue", std::to_string(value.GetValue<int8_t>())}};
 
+	case LogicalTypeId::HUGEINT:
+		return {{"integerValue", value.GetValue<hugeint_t>().ToString()}};
+
+	case LogicalTypeId::UBIGINT:
+		return {{"integerValue", std::to_string(value.GetValue<uint64_t>())}};
+
+	case LogicalTypeId::UINTEGER:
+		return {{"integerValue", std::to_string(value.GetValue<uint32_t>())}};
+
+	case LogicalTypeId::USMALLINT:
+		return {{"integerValue", std::to_string(value.GetValue<uint16_t>())}};
+
+	case LogicalTypeId::UTINYINT:
+		return {{"integerValue", std::to_string(value.GetValue<uint8_t>())}};
+
 	case LogicalTypeId::DOUBLE:
 		return {{"doubleValue", value.GetValue<double>()}};
 
 	case LogicalTypeId::FLOAT:
 		return {{"doubleValue", static_cast<double>(value.GetValue<float>())}};
+
+	case LogicalTypeId::DECIMAL:
+		// DECIMAL types (e.g., 3.14 literal inferred as DECIMAL(3,2))
+		return {{"doubleValue", value.GetValue<double>()}};
 
 	case LogicalTypeId::BOOLEAN:
 		return {{"booleanValue", value.GetValue<bool>()}};
@@ -373,6 +470,23 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
 			arr_values.push_back(DuckDBValueToFirestore(elem, element_type));
 		}
 		return {{"arrayValue", {{"values", arr_values}}}};
+	}
+
+	case LogicalTypeId::ARRAY: {
+		// ARRAY(DOUBLE, N) -> Firestore vector format (mapValue with __type__: __vector__)
+		json arr_values = json::array();
+		auto &children = ArrayValue::GetChildren(value);
+		for (auto &elem : children) {
+			if (elem.IsNull()) {
+				arr_values.push_back({{"doubleValue", 0.0}});
+			} else {
+				arr_values.push_back({{"doubleValue", elem.GetValue<double>()}});
+			}
+		}
+		return {{"mapValue",
+		         {{"fields",
+		           {{"__type__", {{"stringValue", "__vector__"}}},
+		            {"value", {{"arrayValue", {{"values", arr_values}}}}}}}}}};
 	}
 
 	case LogicalTypeId::STRUCT: {
@@ -619,6 +733,27 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 		FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, blob_data);
 		break;
 	}
+	case LogicalTypeId::ARRAY: {
+		// Handle ARRAY type (vectorValue - Firestore vector embeddings)
+		auto &child_vector = ArrayVector::GetEntry(vector);
+		auto array_size = ArrayType::GetSize(actual_type);
+		auto &child_values = ArrayValue::GetChildren(converted);
+
+		for (idx_t i = 0; i < array_size; i++) {
+			if (i < child_values.size()) {
+				auto &child_val = child_values[i];
+				if (child_val.IsNull()) {
+					FlatVector::SetNull(child_vector, index * array_size + i, true);
+				} else {
+					FlatVector::GetData<double>(child_vector)[index * array_size + i] = child_val.GetValue<double>();
+				}
+			} else {
+				// Dimension mismatch - pad with nulls
+				FlatVector::SetNull(child_vector, index * array_size + i, true);
+			}
+		}
+		break;
+	}
 	default:
 		// For complex types, convert to string representation
 		auto str = converted.ToString();
@@ -721,6 +856,24 @@ std::vector<InferredColumn> InferSchemaFromDocuments(const std::vector<json> &do
 			LogicalType element_type = InferArrayElementType(document_fields, field_name, sample_size);
 			col.type = LogicalType::LIST(element_type);
 			FS_LOG_DEBUG("Array field '" + field_name + "' inferred element type: " + element_type.ToString());
+		} else if (best_type == "vectorValue") {
+			// For vectors, determine dimension N from the first non-null vector
+			idx_t dimension = 0;
+			for (const auto &fields : document_fields) {
+				if (fields.contains(field_name) && IsFirestoreVector(fields[field_name])) {
+					dimension = GetVectorDimension(fields[field_name]);
+					if (dimension > 0)
+						break;
+				}
+			}
+			if (dimension > 0) {
+				col.type = LogicalType::ARRAY(LogicalType::DOUBLE, dimension);
+				FS_LOG_DEBUG("Vector field '" + field_name + "' inferred dimension: " + std::to_string(dimension));
+			} else {
+				// Fallback if no dimension could be determined
+				col.type = LogicalType::LIST(LogicalType::DOUBLE);
+				FS_LOG_DEBUG("Vector field '" + field_name + "' could not determine dimension, using LIST(DOUBLE)");
+			}
 		} else {
 			col.type = FirestoreTypeToDuckDB(best_type);
 		}
