@@ -39,6 +39,17 @@ struct FirestoreListResponse {
 	std::string next_page_token;
 };
 
+// Resolved document path for collection group-aware write operations
+struct ResolvedDocumentPath {
+	bool is_collection_group;
+	std::string document_path; // relative path after /documents/
+};
+
+// Resolves a collection + document_id into the correct document path.
+// For collection groups (~ prefix): strips ~, uses document_id as full path.
+// For regular collections: concatenates collection/document_id.
+ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const std::string &document_id);
+
 class FirestoreClient {
 public:
 	explicit FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials);

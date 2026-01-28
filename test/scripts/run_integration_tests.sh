@@ -330,6 +330,101 @@ assert_eq "$HAS_INITIAL" "false" "list_contains correctly reports 'initial' miss
 echo "Cleaning up array test data..."
 run_query "SELECT * FROM firestore_delete('array_test', 'arr1');" > /dev/null
 
+# =====================================================
+# Collection Group Write Tests
+# These test that write operations work with ~ prefix
+# using the nested orders data already seeded above
+# =====================================================
+
+# Test 18a: Collection group single update via ~ prefix
+echo "Test 18a: Collection group single update..."
+# order2 in user1/orders has status 'pending' - update it via collection group path
+run_query "SELECT * FROM firestore_update('~orders', 'users/user1/orders/order2', 'status', 'approved');" > /dev/null
+
+UPDATED_STATUS=$(run_query "SELECT status FROM firestore_scan('users/user1/orders') WHERE __document_id = 'order2';")
+assert_eq "$UPDATED_STATUS" "approved" "Collection group update changed order2 status to approved"
+
+# Test 18b: Collection group batch update via ~ prefix
+echo "Test 18b: Collection group batch update..."
+# Find all pending orders across users via collection group scan, update them
+run_query "
+SET VARIABLE cg_pending_orders = (SELECT list(__document_id) FROM firestore_scan('~orders') WHERE status = 'pending');
+SELECT * FROM firestore_update_batch('~orders', getvariable('cg_pending_orders'), 'status', 'processed');
+" > /dev/null
+
+CG_PENDING_REMAINING=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'pending';")
+assert_eq "$CG_PENDING_REMAINING" "0" "No pending orders remain after collection group batch update"
+
+CG_PROCESSED_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'processed';")
+assert_ge "$CG_PROCESSED_COUNT" 1 "At least 1 order processed via collection group batch update"
+
+# Test 18c: Collection group single delete via ~ prefix
+echo "Test 18c: Collection group single delete..."
+# First seed a temporary order to delete
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/users/user1/orders?documentId=order_temp" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"product": {"stringValue": "Temp"}, "quantity": {"integerValue": "1"}, "status": {"stringValue": "temp"}}}' > /dev/null
+
+BEFORE_CG_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('users/user1/orders');")
+
+run_query "SELECT * FROM firestore_delete('~orders', 'users/user1/orders/order_temp');" > /dev/null
+
+AFTER_CG_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('users/user1/orders');")
+EXPECTED_AFTER_DELETE=$((BEFORE_CG_DELETE - 1))
+assert_eq "$AFTER_CG_DELETE" "$EXPECTED_AFTER_DELETE" "Collection group delete removed 1 document"
+
+# Test 18d: Collection group batch delete via ~ prefix
+echo "Test 18d: Collection group batch delete..."
+# Seed temporary orders to delete
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/users/user1/orders?documentId=del_temp1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"product": {"stringValue": "TempDel1"}, "status": {"stringValue": "to_delete"}}}' > /dev/null
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/users/user2/orders?documentId=del_temp2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"product": {"stringValue": "TempDel2"}, "status": {"stringValue": "to_delete"}}}' > /dev/null
+
+BEFORE_BATCH_DEL=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'to_delete';")
+assert_eq "$BEFORE_BATCH_DEL" "2" "2 temporary orders seeded for batch delete"
+
+run_query "
+SET VARIABLE cg_del_ids = (SELECT list(__document_id) FROM firestore_scan('~orders') WHERE status = 'to_delete');
+SELECT * FROM firestore_delete_batch('~orders', getvariable('cg_del_ids'));
+" > /dev/null
+
+AFTER_BATCH_DEL=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'to_delete';")
+assert_eq "$AFTER_BATCH_DEL" "0" "Collection group batch delete removed all to_delete orders"
+
+# Test 18e: Collection group array operations via ~ prefix
+echo "Test 18e: Collection group array operations..."
+# Seed a subcollection document with an array field
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/users/user1/tags?documentId=tag1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields":{"labels":{"arrayValue":{"values":[{"stringValue":"alpha"},{"stringValue":"beta"}]}}}}' > /dev/null
+
+# Array append via collection group
+run_query "SELECT * FROM firestore_array_append('~tags', 'users/user1/tags/tag1', 'labels', ['gamma', 'alpha']);" > /dev/null
+
+CG_LABEL_COUNT=$(run_query "SELECT list_count(labels) FROM firestore_scan('users/user1/tags');")
+assert_eq "$CG_LABEL_COUNT" "4" "Collection group array append added 2 elements (duplicates allowed)"
+
+# Array union via collection group (should not add 'alpha' again)
+run_query "SELECT * FROM firestore_array_union('~tags', 'users/user1/tags/tag1', 'labels', ['delta', 'alpha']);" > /dev/null
+
+CG_LABEL_COUNT_AFTER_UNION=$(run_query "SELECT list_count(labels) FROM firestore_scan('users/user1/tags');")
+assert_eq "$CG_LABEL_COUNT_AFTER_UNION" "5" "Collection group array union added only 1 new element (delta)"
+
+CG_HAS_DELTA=$(run_query "SELECT list_contains(labels, 'delta') FROM firestore_scan('users/user1/tags');")
+assert_eq "$CG_HAS_DELTA" "true" "Collection group array union added 'delta'"
+
+# Array remove via collection group
+run_query "SELECT * FROM firestore_array_remove('~tags', 'users/user1/tags/tag1', 'labels', ['alpha']);" > /dev/null
+
+CG_ALPHA_COUNT=$(run_query "SELECT list_count(list_filter(labels, x -> x = 'alpha')) FROM firestore_scan('users/user1/tags');")
+assert_eq "$CG_ALPHA_COUNT" "0" "Collection group array remove removed all 'alpha' entries"
+
+# Cleanup collection group array test data
+run_query "SELECT * FROM firestore_delete('users/user1/tags', 'tag1');" > /dev/null
+
 # Test 19: GeoPoint type (reading)
 echo "Test 19: GeoPoint type support..."
 curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc1" \

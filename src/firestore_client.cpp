@@ -39,6 +39,23 @@ static bool ParseUrl(const std::string &url, std::string &scheme_host, std::stri
 	return true;
 }
 
+ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const std::string &document_id) {
+	ResolvedDocumentPath result;
+	if (!collection.empty() && collection[0] == '~') {
+		// Collection group: doc_id is already a full document path
+		result.is_collection_group = true;
+		result.document_path = document_id;
+	} else {
+		result.is_collection_group = false;
+		std::string clean_collection = collection;
+		if (!clean_collection.empty() && clean_collection[0] == '/') {
+			clean_collection = clean_collection.substr(1);
+		}
+		result.document_path = clean_collection + "/" + document_id;
+	}
+	return result;
+}
+
 FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials)
     : credentials_(std::move(credentials)) {
 	if (!credentials_) {
@@ -280,8 +297,8 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, const std::string &document_id) {
 	FS_LOG_DEBUG("Getting document: " + collection + "/" + document_id);
 
-	std::string path = collection + "/" + document_id;
-	std::string url = BuildUrl(path);
+	auto resolved = ResolveDocumentPath(collection, document_id);
+	std::string url = BuildUrl(resolved.document_path);
 
 	FirestoreErrorContext ctx;
 	ctx.withOperation("get").withCollection(collection).withDocument(document_id);
@@ -317,8 +334,8 @@ void FirestoreClient::UpdateDocument(const std::string &collection, const std::s
                                      const json &fields) {
 	FS_LOG_DEBUG("Updating document: " + collection + "/" + document_id);
 
-	std::string path = collection + "/" + document_id;
-	std::string url = BuildUrl(path);
+	auto resolved = ResolveDocumentPath(collection, document_id);
+	std::string url = BuildUrl(resolved.document_path);
 
 	// Add updateMask for all fields
 	bool has_params = (credentials_->type == FirestoreAuthType::API_KEY);
@@ -339,8 +356,8 @@ void FirestoreClient::UpdateDocument(const std::string &collection, const std::s
 void FirestoreClient::DeleteDocument(const std::string &collection, const std::string &document_id) {
 	FS_LOG_DEBUG("Deleting document: " + collection + "/" + document_id);
 
-	std::string path = collection + "/" + document_id;
-	std::string url = BuildUrl(path);
+	auto resolved = ResolveDocumentPath(collection, document_id);
+	std::string url = BuildUrl(resolved.document_path);
 
 	FirestoreErrorContext ctx;
 	ctx.withOperation("delete").withCollection(collection).withDocument(document_id);
@@ -393,12 +410,9 @@ void FirestoreClient::ArrayTransform(const std::string &collection, const std::s
 	}
 
 	// Build the document path
-	std::string clean_collection = collection;
-	if (!clean_collection.empty() && clean_collection[0] == '/') {
-		clean_collection = clean_collection.substr(1);
-	}
+	auto resolved = ResolveDocumentPath(collection, document_id);
 	std::string doc_path = "projects/" + credentials_->project_id + "/databases/" + credentials_->database_id +
-	                       "/documents/" + clean_collection + "/" + document_id;
+	                       "/documents/" + resolved.document_path;
 
 	// For ARRAY_APPEND with duplicates, we need to do read-modify-write
 	if (transform_type == ArrayTransformType::ARRAY_APPEND) {

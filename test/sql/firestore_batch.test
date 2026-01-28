@@ -374,6 +374,43 @@ SELECT * FROM firestore_delete_batch('profile', getvariable('pending_profiles'))
 ----
 
 # ============================================
+# Collection Group Batch Operations with ~ Prefix
+# Tests the new ~ prefix for collection group write operations
+# ============================================
+
+# Batch update using ~ prefix with full paths - fails at runtime
+statement error
+SELECT * FROM firestore_update_batch('~profile', getvariable('inactive_profiles'), 'status', 'reactivated');
+----
+
+# Batch delete using ~ prefix with full paths - fails at runtime
+statement error
+SELECT * FROM firestore_delete_batch('~profile', getvariable('pending_profiles'));
+----
+
+# Empty list with ~ prefix returns 0 (no documents to process)
+query I
+SELECT * FROM firestore_update_batch('~profile', []::VARCHAR[], 'status', 'active');
+----
+0
+
+query I
+SELECT * FROM firestore_delete_batch('~profile', []::VARCHAR[]);
+----
+0
+
+# NULL variable with ~ prefix returns 0 (handles NULL gracefully)
+query I
+SELECT * FROM firestore_update_batch('~profile', getvariable('nonexistent'), 'status', 'updated');
+----
+0
+
+query I
+SELECT * FROM firestore_delete_batch('~profile', getvariable('nonexistent'));
+----
+0
+
+# ============================================
 # Cleanup
 # ============================================
 

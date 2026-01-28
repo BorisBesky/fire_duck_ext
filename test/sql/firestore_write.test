@@ -216,6 +216,59 @@ SELECT * FROM firestore_delete_batch(
 );
 ----
 
+# ============================================
+# Collection Group Write Operations (~ prefix)
+# These test that write operations accept the ~ prefix
+# for collection group paths (fails at runtime, but binding succeeds)
+# ============================================
+
+# Single update with ~ collection group prefix
+statement error
+SELECT * FROM firestore_update('~orders', 'users/user1/orders/order1', 'status', 'shipped');
+----
+
+# Single delete with ~ collection group prefix
+statement error
+SELECT * FROM firestore_delete('~orders', 'users/user1/orders/order1');
+----
+
+# Batch update with ~ collection group prefix
+statement error
+SELECT * FROM firestore_update_batch('~orders', ['users/user1/orders/order1', 'users/user2/orders/order1'], 'status', 'cancelled');
+----
+
+# Batch delete with ~ collection group prefix
+statement error
+SELECT * FROM firestore_delete_batch('~orders', ['users/user1/orders/order1', 'users/user2/orders/order1']);
+----
+
+# Array union with ~ collection group prefix
+statement error
+SELECT * FROM firestore_array_union('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
+----
+
+# Array remove with ~ collection group prefix
+statement error
+SELECT * FROM firestore_array_remove('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
+----
+
+# Array append with ~ collection group prefix
+statement error
+SELECT * FROM firestore_array_append('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
+----
+
+# Empty list with ~ prefix returns 0 (no documents to process)
+query I
+SELECT * FROM firestore_update_batch('~orders', []::VARCHAR[], 'status', 'active');
+----
+0
+
+# Empty list for delete with ~ prefix returns 0
+query I
+SELECT * FROM firestore_delete_batch('~orders', []::VARCHAR[]);
+----
+0
+
 # Clean up
 statement ok
 DROP SECRET type_test;

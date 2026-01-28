@@ -462,13 +462,10 @@ static void FirestoreUpdateBatchFunction(ClientContext &context, TableFunctionIn
 					FS_LOG_WARN("Document not found during batch operation: " + doc_id);
 				}
 			} else {
-				std::string collection = bind_data.collection;
-				if (!collection.empty() && collection[0] == '/') {
-					collection = collection.substr(1);
-				}
+				auto resolved = ResolveDocumentPath(bind_data.collection, doc_id);
 				// Build full document path for batch write
 				std::string doc_path = "projects/" + bind_data.credentials->project_id + "/databases/" +
-				                       bind_data.credentials->database_id + "/documents/" + collection + "/" + doc_id;
+				                       bind_data.credentials->database_id + "/documents/" + resolved.document_path;
 
 				json write_op = {{"update", {{"name", doc_path}, {"fields", fields}}},
 				                 {"updateMask", {{"fieldPaths", bind_data.field_names}}}};
@@ -621,13 +618,10 @@ static void FirestoreDeleteBatchFunction(ClientContext &context, TableFunctionIn
 					FS_LOG_WARN("Document not found during batch operation: " + doc_id);
 				}
 			} else {
-				std::string collection = bind_data.collection;
-				if (!collection.empty() && collection[0] == '/') {
-					collection = collection.substr(1);
-				}
+				auto resolved = ResolveDocumentPath(bind_data.collection, doc_id);
 				// Build full document path for batch write
 				std::string doc_path = "projects/" + bind_data.credentials->project_id + "/databases/" +
-				                       bind_data.credentials->database_id + "/documents/" + collection + "/" + doc_id;
+				                       bind_data.credentials->database_id + "/documents/" + resolved.document_path;
 
 				json write_op = {{"delete", doc_path}};
 				writes.push_back(write_op);
