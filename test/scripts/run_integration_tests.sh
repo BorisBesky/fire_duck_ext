@@ -566,6 +566,186 @@ SELECT * FROM firestore_delete('files', 'file1');
 " > /dev/null
 
 # =====================================================
+# INSERT Function Tests
+# =====================================================
+
+echo ""
+echo "=== INSERT Function Tests ==="
+
+# Test I1: Insert single row with auto-generated ID
+echo "Test I1: Insert single row with auto-generated ID..."
+INSERT_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_test', (SELECT 'Alice' AS name, 30 AS age));")
+assert_eq "$INSERT_COUNT" "1" "Insert with auto-ID returns count 1"
+
+AUTO_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('insert_test');")
+assert_eq "$AUTO_COUNT" "1" "1 document exists after auto-ID insert"
+
+AUTO_NAME=$(run_query "SELECT name FROM firestore_scan('insert_test');")
+assert_eq "$AUTO_NAME" "Alice" "Auto-ID inserted document has correct name"
+
+AUTO_AGE=$(run_query "SELECT age FROM firestore_scan('insert_test');")
+assert_eq "$AUTO_AGE" "30" "Auto-ID inserted document has correct age"
+
+# Clean up auto-ID insert test
+run_query "
+SET VARIABLE auto_ids = (SELECT list(__document_id) FROM firestore_scan('insert_test'));
+SELECT * FROM firestore_delete_batch('insert_test', getvariable('auto_ids'));
+" > /dev/null
+
+# Test I2: Insert single row with explicit document_id
+echo "Test I2: Insert single row with explicit document_id..."
+INSERT_EXPLICIT=$(run_query "SELECT * FROM firestore_insert('insert_test',
+    (SELECT 'user_explicit' AS id, 'Bob' AS name, 25 AS age),
+    document_id := 'id');")
+assert_eq "$INSERT_EXPLICIT" "1" "Insert with explicit ID returns count 1"
+
+EXPLICIT_NAME=$(run_query "SELECT name FROM firestore_scan('insert_test') WHERE __document_id = 'user_explicit';")
+assert_eq "$EXPLICIT_NAME" "Bob" "Explicit-ID document has correct name"
+
+EXPLICIT_AGE=$(run_query "SELECT age FROM firestore_scan('insert_test') WHERE __document_id = 'user_explicit';")
+assert_eq "$EXPLICIT_AGE" "25" "Explicit-ID document has correct age"
+
+# Verify that the document_id column is NOT stored as a Firestore field
+# Should be __document_id, name, age (3 total, no 'id')
+COL_COUNT_CHECK=$(run_query "
+CREATE OR REPLACE TEMP TABLE ins_check2 AS SELECT * FROM firestore_scan('insert_test') WHERE __document_id = 'user_explicit';
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'ins_check2';
+")
+assert_eq "$COL_COUNT_CHECK" "3" "Document has 3 columns (__document_id, name, age) — 'id' excluded"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete('insert_test', 'user_explicit');" > /dev/null
+
+# Test I3: Multi-row insert with explicit document_id
+echo "Test I3: Multi-row insert from VALUES..."
+MULTI_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_test',
+    (SELECT * FROM (VALUES
+        ('u1', 'Alice', 30),
+        ('u2', 'Bob', 25),
+        ('u3', 'Charlie', 35)
+    ) AS t(id, name, age)),
+    document_id := 'id');")
+assert_eq "$MULTI_COUNT" "3" "Multi-row insert returns count 3"
+
+TOTAL_INSERTED=$(run_query "SELECT count(*) FROM firestore_scan('insert_test');")
+assert_eq "$TOTAL_INSERTED" "3" "3 documents exist after multi-row insert"
+
+ALICE_CHECK=$(run_query "SELECT name FROM firestore_scan('insert_test') WHERE __document_id = 'u1';")
+assert_eq "$ALICE_CHECK" "Alice" "Multi-insert u1 is Alice"
+
+CHARLIE_CHECK=$(run_query "SELECT age FROM firestore_scan('insert_test') WHERE __document_id = 'u3';")
+assert_eq "$CHARLIE_CHECK" "35" "Multi-insert u3 age is 35"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete_batch('insert_test', ['u1', 'u2', 'u3']);" > /dev/null
+
+# Test I4: Insert with various DuckDB types
+echo "Test I4: Insert with various DuckDB types..."
+TYPES_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_types', (
+    SELECT 'typed_doc' AS id,
+           'hello' AS str_col,
+           42 AS int_col,
+           3.14 AS dbl_col,
+           true AS bool_col
+), document_id := 'id');")
+assert_eq "$TYPES_COUNT" "1" "Typed insert returns count 1"
+
+STR_VAL=$(run_query "SELECT str_col FROM firestore_scan('insert_types');")
+assert_eq "$STR_VAL" "hello" "String type preserved"
+
+INT_VAL=$(run_query "SELECT int_col FROM firestore_scan('insert_types');")
+assert_eq "$INT_VAL" "42" "Integer type preserved"
+
+DBL_VAL=$(run_query "SELECT round(dbl_col, 2) FROM firestore_scan('insert_types');")
+assert_eq "$DBL_VAL" "3.14" "Double type preserved"
+
+BOOL_VAL=$(run_query "SELECT bool_col FROM firestore_scan('insert_types');")
+assert_eq "$BOOL_VAL" "true" "Boolean type preserved"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete('insert_types', 'typed_doc');" > /dev/null
+
+# Test I5: Insert into nested collection path
+echo "Test I5: Insert into nested collection path..."
+NESTED_COUNT=$(run_query "SELECT * FROM firestore_insert('users/user1/notes', (
+    SELECT 'note1' AS id, 'Remember to buy milk' AS content
+), document_id := 'id');")
+assert_eq "$NESTED_COUNT" "1" "Nested collection insert returns count 1"
+
+NESTED_CONTENT=$(run_query "SELECT content FROM firestore_scan('users/user1/notes') WHERE __document_id = 'note1';")
+assert_eq "$NESTED_CONTENT" "Remembertobuymilk" "Nested insert content is correct"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete('users/user1/notes', 'note1');" > /dev/null
+
+# Test I6: Insert from a DuckDB table (not just inline subquery)
+echo "Test I6: Insert from a DuckDB table..."
+TABLE_COUNT=$(run_query "
+CREATE TEMP TABLE src_data AS SELECT * FROM (VALUES
+    ('emp1', 'Engineering', 95000),
+    ('emp2', 'Marketing', 75000),
+    ('emp3', 'Engineering', 110000),
+    ('emp4', 'Sales', 65000)
+) AS t(emp_id, department, salary);
+SELECT * FROM firestore_insert('employees',
+    (SELECT * FROM src_data),
+    document_id := 'emp_id');
+")
+assert_eq "$TABLE_COUNT" "4" "Insert from table returns count 4"
+
+ENG_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('employees') WHERE department = 'Engineering';")
+assert_eq "$ENG_COUNT" "2" "2 Engineering employees inserted"
+
+SALARY_SUM=$(run_query "SELECT sum(salary) FROM firestore_scan('employees');")
+assert_eq "$SALARY_SUM" "345000" "Total salary sum correct"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete_batch('employees', ['emp1', 'emp2', 'emp3', 'emp4']);" > /dev/null
+
+# Test I7: Insert with auto-ID, multiple rows
+echo "Test I7: Multi-row auto-ID insert..."
+AUTO_MULTI=$(run_query "SELECT * FROM firestore_insert('auto_multi', (
+    SELECT * FROM (VALUES
+        ('Row1', 10),
+        ('Row2', 20),
+        ('Row3', 30)
+    ) AS t(label, value)
+));")
+assert_eq "$AUTO_MULTI" "3" "Auto-ID multi-row insert returns count 3"
+
+AUTO_TOTAL=$(run_query "SELECT count(*) FROM firestore_scan('auto_multi');")
+assert_eq "$AUTO_TOTAL" "3" "3 auto-ID documents created"
+
+VALUE_SUM=$(run_query "SELECT sum(value) FROM firestore_scan('auto_multi');")
+assert_eq "$VALUE_SUM" "60" "Sum of auto-ID values is 60"
+
+# Clean up
+run_query "
+SET VARIABLE auto_multi_ids = (SELECT list(__document_id) FROM firestore_scan('auto_multi'));
+SELECT * FROM firestore_delete_batch('auto_multi', getvariable('auto_multi_ids'));
+" > /dev/null
+
+# Test I8: Insert then update then verify (end-to-end workflow)
+echo "Test I8: Insert → Update → Scan workflow..."
+run_query "SELECT * FROM firestore_insert('workflow_test', (
+    SELECT 'wf1' AS id, 'pending' AS status, 0 AS retry_count
+), document_id := 'id');" > /dev/null
+
+run_query "SELECT * FROM firestore_update('workflow_test', 'wf1', 'status', 'active', 'retry_count', 1);" > /dev/null
+
+WF_STATUS=$(run_query "SELECT status FROM firestore_scan('workflow_test') WHERE __document_id = 'wf1';")
+assert_eq "$WF_STATUS" "active" "Workflow: status updated to active"
+
+WF_RETRY=$(run_query "SELECT retry_count FROM firestore_scan('workflow_test') WHERE __document_id = 'wf1';")
+assert_eq "$WF_RETRY" "1" "Workflow: retry_count updated to 1"
+
+# Clean up
+run_query "SELECT * FROM firestore_delete('workflow_test', 'wf1');" > /dev/null
+
+echo "Insert tests completed."
+echo ""
+
+# =====================================================
 # Filter Pushdown Tests
 # =====================================================
 # Note: The emulator may not support the Admin API for indexes,

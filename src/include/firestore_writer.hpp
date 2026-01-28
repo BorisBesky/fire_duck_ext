@@ -35,7 +35,8 @@ struct FirestoreWriteGlobalState : public GlobalTableFunctionState {
 // Register write-related functions
 void RegisterFirestoreWriteFunctions(ExtensionLoader &loader);
 
-// INSERT function: firestore_insert('collection', columns...)
+// INSERT function: SELECT * FROM firestore_insert('collection', (SELECT ...))
+// Optional: document_id := 'col_name' to use a column as document ID
 void RegisterFirestoreInsertFunction(ExtensionLoader &loader);
 
 // UPDATE function: firestore_update('collection', 'doc_id', 'field1', value1, ...)

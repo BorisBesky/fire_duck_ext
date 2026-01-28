@@ -1,0 +1,108 @@
+# name: test/sql/firestore_insert.test
+# description: Test Firestore INSERT operations via firestore_insert table-in-out function
+# group: [sql]
+
+require fire_duck_ext
+
+# ============================================
+# Error Handling - Missing credentials
+# ============================================
+
+statement error
+SELECT * FROM firestore_insert('users', (SELECT 'Alice' AS name, 30 AS age));
+----
+No Firestore credentials found
+
+# ============================================
+# Setup credentials
+# ============================================
+
+statement ok
+CREATE SECRET insert_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-key'
+);
+
+# ============================================
+# Bind-time validation
+# ============================================
+
+# document_id column must exist in input columns
+statement error
+SELECT * FROM firestore_insert('users',
+    (SELECT 'Alice' AS name, 30 AS age),
+    document_id := 'nonexistent');
+----
+document_id column 'nonexistent' not found
+
+# ============================================
+# Runtime behavior with fake credentials
+# ============================================
+
+# Auto-generated IDs: fails at runtime because CreateDocument is called directly
+statement error
+SELECT * FROM firestore_insert('users', (SELECT 'Alice' AS name, 30 AS age));
+----
+Firestore insert failed
+
+# Explicit document_id: batch path falls back gracefully, returns 0
+query I
+SELECT * FROM firestore_insert('users',
+    (SELECT 'user1' AS id, 'Alice' AS name, 30 AS age),
+    document_id := 'id');
+----
+0
+
+# Insert from a real table with explicit document_id
+statement ok
+CREATE TABLE source_data AS
+SELECT * FROM (VALUES
+    ('user1', 'Alice', 30),
+    ('user2', 'Bob', 25),
+    ('user3', 'Charlie', 35)
+) AS t(id, name, age);
+
+query I
+SELECT * FROM firestore_insert('users',
+    (SELECT * FROM source_data),
+    document_id := 'id');
+----
+0
+
+# Insert with various DuckDB types (auto-ID, fails at runtime)
+statement error
+SELECT * FROM firestore_insert('mixed_types', (
+    SELECT 'test' AS str_col,
+           42 AS int_col,
+           3.14 AS dbl_col,
+           true AS bool_col,
+           TIMESTAMP '2024-01-15 10:30:00' AS ts_col
+));
+----
+Firestore insert failed
+
+# Insert into nested collection path (auto-ID, fails at runtime)
+statement error
+SELECT * FROM firestore_insert('users/user1/orders',
+    (SELECT 'order1' AS order_id, 100.00 AS amount));
+----
+Firestore insert failed
+
+# Insert with explicit project_id override (auto-ID, fails at runtime)
+statement error
+SELECT * FROM firestore_insert('users',
+    (SELECT 'Alice' AS name),
+    project_id := 'other-project');
+----
+Firestore insert failed
+
+# ============================================
+# Cleanup
+# ============================================
+
+statement ok
+DROP TABLE source_data;
+
+statement ok
+DROP SECRET insert_test;

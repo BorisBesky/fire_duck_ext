@@ -5,37 +5,49 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/execution/execution_context.hpp"
 
 namespace duckdb {
 
-// Bind data for firestore_insert
+// ============================================================================
+// INSERT function implementation (table-in-out)
+// Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))
+//        SELECT * FROM firestore_insert('collection', (SELECT ...), document_id := 'id_col')
+// ============================================================================
+
 struct FirestoreInsertBindData : public TableFunctionData {
 	std::string collection;
 	std::shared_ptr<FirestoreCredentials> credentials;
 	std::vector<std::string> column_names;
 	std::vector<LogicalType> column_types;
 	std::optional<std::string> document_id_param;
+	idx_t document_id_column_index;
+	bool use_auto_ids;
+
+	FirestoreInsertBindData() : document_id_column_index(DConstants::INVALID_INDEX), use_auto_ids(true) {
+	}
 };
 
-// Global state for insert operation
 struct FirestoreInsertGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<FirestoreClient> client;
 	idx_t rows_inserted;
 	std::vector<json> batch_writes;
+	bool use_individual_ops;
+	bool count_emitted;
 
-	FirestoreInsertGlobalState() : rows_inserted(0) {
+	FirestoreInsertGlobalState() : rows_inserted(0), use_individual_ops(false), count_emitted(false) {
 	}
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
 
-// Bind function for firestore_insert
 static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<FirestoreInsertBindData>();
 
-	// Get collection name
+	// Get collection name (first positional argument)
 	result->collection = input.inputs[0].GetValue<string>();
 
 	// Process named parameters
@@ -65,14 +77,39 @@ static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, Tabl
 		throw BinderException("No Firestore credentials found for insert operation.");
 	}
 
-	// Return type is a count of inserted rows
+	// Capture input table schema (column names and types from the subquery)
+	result->column_names = input.input_table_names;
+	result->column_types = input.input_table_types;
+
+	if (result->column_names.empty()) {
+		throw BinderException("firestore_insert requires a subquery with at least one column. "
+		                      "Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))");
+	}
+
+	// Resolve document_id column if specified
+	if (result->document_id_param.has_value()) {
+		const auto &id_col = result->document_id_param.value();
+		bool found = false;
+		for (idx_t i = 0; i < result->column_names.size(); i++) {
+			if (result->column_names[i] == id_col) {
+				result->document_id_column_index = i;
+				result->use_auto_ids = false;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw BinderException("document_id column '" + id_col + "' not found in input columns.");
+		}
+	}
+
+	// Return type: single count column
 	names.push_back("count");
 	return_types.push_back(LogicalType::BIGINT);
 
 	return std::move(result);
 }
 
-// Init global state for insert
 static unique_ptr<GlobalTableFunctionState> FirestoreInsertInitGlobal(ClientContext &context,
                                                                       TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<FirestoreInsertBindData>();
@@ -81,22 +118,133 @@ static unique_ptr<GlobalTableFunctionState> FirestoreInsertInitGlobal(ClientCont
 	return std::move(global_state);
 }
 
-// Local state (minimal)
 static unique_ptr<LocalTableFunctionState> FirestoreInsertInitLocal(ExecutionContext &context,
                                                                     TableFunctionInitInput &input,
                                                                     GlobalTableFunctionState *global_state) {
 	return make_uniq<LocalTableFunctionState>();
 }
 
-// Insert function execution
-static void FirestoreInsertFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+// Flush accumulated batch writes to Firestore
+static void FlushInsertBatchWrites(FirestoreInsertBindData &bind_data, FirestoreInsertGlobalState &global_state) {
+	if (global_state.batch_writes.empty()) {
+		return;
+	}
+
+	try {
+		global_state.client->BatchWrite(global_state.batch_writes);
+		global_state.rows_inserted += global_state.batch_writes.size();
+	} catch (const FirestorePermissionException &) {
+		// BatchWrite requires admin auth - fall back to individual CreateDocument calls
+		FS_LOG_WARN("BatchWrite permission denied for insert, falling back to individual CreateDocument calls");
+		global_state.use_individual_ops = true;
+
+		for (auto &write_op : global_state.batch_writes) {
+			try {
+				std::string doc_path = write_op["update"]["name"].get<std::string>();
+				std::string doc_id = doc_path.substr(doc_path.rfind('/') + 1);
+				json fields = write_op["update"]["fields"];
+
+				global_state.client->CreateDocument(bind_data.collection, fields, doc_id);
+				global_state.rows_inserted++;
+			} catch (const std::exception &e) {
+				FS_LOG_WARN("Individual insert failed during fallback: " + std::string(e.what()));
+			}
+		}
+	}
+	global_state.batch_writes.clear();
+}
+
+// Table in-out function: receives input DataChunks and inserts rows into Firestore
+static OperatorResultType FirestoreInsertInOutFunction(ExecutionContext &context, TableFunctionInput &data,
+                                                       DataChunk &input, DataChunk &output) {
 	auto &bind_data = data.bind_data->CastNoConst<FirestoreInsertBindData>();
 	auto &global_state = data.global_state->Cast<FirestoreInsertGlobalState>();
 
-	// This function returns the count after all inserts
-	// The actual insertion happens in the in_out_function
-	FlatVector::GetData<int64_t>(output.data[0])[0] = global_state.rows_inserted;
+	const size_t BATCH_SIZE = 500;
+
+	for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
+		// Build Firestore fields JSON for this row
+		json fields;
+		std::string doc_id_value;
+
+		for (idx_t col_idx = 0; col_idx < input.ColumnCount(); col_idx++) {
+			// If this column is the document_id column, extract the ID and skip adding it as a field
+			if (col_idx == bind_data.document_id_column_index) {
+				Value id_val = input.GetValue(col_idx, row_idx);
+				if (id_val.IsNull()) {
+					throw InvalidInputException("firestore_insert: document_id column '" +
+					                            bind_data.document_id_param.value() + "' cannot be NULL at row " +
+					                            std::to_string(global_state.rows_inserted + row_idx));
+				}
+				doc_id_value = id_val.ToString();
+				continue;
+			}
+
+			const auto &col_name = bind_data.column_names[col_idx];
+			Value val = input.GetValue(col_idx, row_idx);
+			fields[col_name] = DuckDBValueToFirestore(val, bind_data.column_types[col_idx]);
+		}
+
+		if (bind_data.use_auto_ids) {
+			// Auto-generated IDs: must use individual CreateDocument calls
+			// (BatchWrite requires a full document path including the ID)
+			try {
+				global_state.client->CreateDocument(bind_data.collection, fields);
+				global_state.rows_inserted++;
+			} catch (const std::exception &e) {
+				throw InvalidInputException("Firestore insert failed at row " +
+				                            std::to_string(global_state.rows_inserted) + ": " +
+				                            std::string(e.what()));
+			}
+		} else if (global_state.use_individual_ops) {
+			// Fallback mode: individual CreateDocument calls with explicit ID
+			try {
+				global_state.client->CreateDocument(bind_data.collection, fields, doc_id_value);
+				global_state.rows_inserted++;
+			} catch (const std::exception &e) {
+				throw InvalidInputException("Firestore insert failed for document '" + doc_id_value +
+				                            "': " + std::string(e.what()));
+			}
+		} else {
+			// Batch mode: accumulate write operations
+			auto resolved = ResolveDocumentPath(bind_data.collection, doc_id_value);
+			std::string doc_path = "projects/" + bind_data.credentials->project_id + "/databases/" +
+			                       bind_data.credentials->database_id + "/documents/" + resolved.document_path;
+
+			json write_op = {{"update", {{"name", doc_path}, {"fields", fields}}}};
+			global_state.batch_writes.push_back(write_op);
+
+			if (global_state.batch_writes.size() >= BATCH_SIZE) {
+				FlushInsertBatchWrites(bind_data, global_state);
+			}
+		}
+	}
+
+	output.SetCardinality(0);
+	return OperatorResultType::NEED_MORE_INPUT;
+}
+
+// Finalize: flush remaining writes and emit the count
+static OperatorFinalizeResultType FirestoreInsertFinal(ExecutionContext &context, TableFunctionInput &data,
+                                                       DataChunk &output) {
+	auto &bind_data = data.bind_data->CastNoConst<FirestoreInsertBindData>();
+	auto &global_state = data.global_state->Cast<FirestoreInsertGlobalState>();
+
+	if (global_state.count_emitted) {
+		output.SetCardinality(0);
+		return OperatorFinalizeResultType::FINISHED;
+	}
+
+	// Flush any remaining batch writes
+	if (!bind_data.use_auto_ids && !global_state.batch_writes.empty()) {
+		FlushInsertBatchWrites(bind_data, global_state);
+	}
+
+	// Emit the final count
+	FlatVector::GetData<int64_t>(output.data[0])[0] = static_cast<int64_t>(global_state.rows_inserted);
 	output.SetCardinality(1);
+	global_state.count_emitted = true;
+	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 }
 
 // ============================================================================
@@ -837,11 +985,14 @@ struct FirestoreCopyGlobalState : public GlobalTableFunctionState {
 // ============================================================================
 
 void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
-	// Register firestore_insert table function
-	// This allows: INSERT INTO firestore_insert('collection') SELECT ...
-	TableFunction insert_func("firestore_insert", {LogicalType::VARCHAR}, // collection
-	                          FirestoreInsertFunction, FirestoreInsertBind, FirestoreInsertInitGlobal,
-	                          FirestoreInsertInitLocal);
+	// Register firestore_insert table function (table-in-out)
+	// Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))
+	//        SELECT * FROM firestore_insert('collection', (SELECT ...), document_id := 'id_col')
+	TableFunction insert_func("firestore_insert", {LogicalType::VARCHAR, LogicalType::TABLE}, nullptr,
+	                          FirestoreInsertBind, FirestoreInsertInitGlobal, FirestoreInsertInitLocal);
+
+	insert_func.in_out_function = FirestoreInsertInOutFunction;
+	insert_func.in_out_function_final = FirestoreInsertFinal;
 
 	insert_func.named_parameters["project_id"] = LogicalType::VARCHAR;
 	insert_func.named_parameters["credentials"] = LogicalType::VARCHAR;
