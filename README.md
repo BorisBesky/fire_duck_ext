@@ -76,6 +76,14 @@ CREATE SECRET dev_firestore (
     API_KEY 'your-api-key'
 );
 ```
+### Use environment variable
+```sql
+# Set the path to your service account JSON file
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+
+# Then run DuckDB - no secret creation needed!
+duckdb
+```
 
 ### Firebase Emulator
 ```sql
