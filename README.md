@@ -36,17 +36,17 @@ FROM firestore_scan('users')
 WHERE status = 'active';
 
 -- Insert documents from a subquery
-SELECT * FROM firestore_insert('users', (
+call firestore_insert('users', (
     SELECT 'Alice' AS name, 30 AS age
 ));
 
 -- Insert with explicit document IDs
-SELECT * FROM firestore_insert('users',
+call firestore_insert('users',
     (SELECT 'alice123' AS id, 'Alice' AS name, 30 AS age),
     document_id := 'id');
 
 -- Update documents
-SELECT * FROM firestore_update('users', 'user123', 'status', 'verified');
+call firestore_update('users', 'user123', 'status', 'verified');
 
 -- Batch update with DuckDB filtering
 SET VARIABLE ids = (
@@ -54,7 +54,7 @@ SET VARIABLE ids = (
     FROM firestore_scan('users')
     WHERE status = 'pending'
 );
-SELECT * FROM firestore_update_batch('users', getvariable('ids'), 'status', 'reviewed');
+call firestore_update_batch('users', getvariable('ids'), 'status', 'reviewed');
 ```
 
 ## Authentication
@@ -110,22 +110,22 @@ CREATE SECRET emulator (
 
 ```sql
 -- Auto-generated document IDs
-SELECT * FROM firestore_insert('users', (
+call firestore_insert('users', (
     SELECT name, age FROM read_csv('new_users.csv')
 ));
 
 -- Explicit document IDs from a column
-SELECT * FROM firestore_insert('users',
+call firestore_insert('users',
     (SELECT user_id, name, age FROM read_csv('new_users.csv')),
     document_id := 'user_id');
 
 -- Insert from a DuckDB table
-SELECT * FROM firestore_insert('employees',
+call firestore_insert('employees',
     (SELECT * FROM employee_staging),
     document_id := 'emp_id');
 
 -- Insert into nested collections
-SELECT * FROM firestore_insert('users/user1/notes', (
+call firestore_insert('users/user1/notes', (
     SELECT 'note1' AS id, 'Remember to buy milk' AS content
 ), document_id := 'id');
 ```
@@ -162,7 +162,7 @@ SELECT label, vector FROM firestore_scan('embeddings');
 SELECT label, vector[1] AS first_dim FROM firestore_scan('embeddings');
 
 -- Write vectors back (preserves Firestore vector format for vector search)
-SELECT * FROM firestore_update('embeddings', 'emb1',
+call firestore_update('embeddings', 'emb1',
     'vector', [100.0, 200.0, 300.0]::DOUBLE[3]);
 
 -- Compute distances between vectors
