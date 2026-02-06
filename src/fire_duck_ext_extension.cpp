@@ -44,10 +44,9 @@ static unique_ptr<FunctionData> FirestoreClearCacheBindAll(ClientContext &contex
 }
 
 // Bind for clear cache with collection argument
-static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext &context,
-                                                                   TableFunctionBindInput &input,
-                                                                   vector<LogicalType> &return_types,
-                                                                   vector<string> &names) {
+static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext &context, TableFunctionBindInput &input,
+                                                                  vector<LogicalType> &return_types,
+                                                                  vector<string> &names) {
 	// Table functions must return at least one column
 	names.push_back("success");
 	return_types.push_back(LogicalType::BOOLEAN);

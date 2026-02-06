@@ -11,8 +11,8 @@
 
 namespace duckdb {
 
-// Default schema cache TTL in seconds (5 minutes)
-static constexpr int64_t DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 300;
+// Default schema cache TTL in seconds (60 minutes)
+static constexpr int64_t DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 3600;
 
 // Configurable schema cache TTL (can be changed via environment variable FIRESTORE_SCHEMA_CACHE_TTL)
 static int64_t GetSchemaCacheTTL() {
@@ -283,13 +283,11 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		std::string display_name = is_collection_group ? result->collection.substr(1) : result->collection;
 
 		FirestoreErrorContext ctx;
-		ctx.withCollection(result->collection)
-		    .withProject(result->credentials->project_id)
-		    .withOperation("scan");
+		ctx.withCollection(result->collection).withProject(result->credentials->project_id).withOperation("scan");
 
-		throw FirestoreNotFoundError(FirestoreErrorCode::NOT_FOUND_COLLECTION,
-		                             collection_type + " '" + display_name + "' does not exist or contains no documents.",
-		                             ctx);
+		throw FirestoreNotFoundError(
+		    FirestoreErrorCode::NOT_FOUND_COLLECTION,
+		    collection_type + " '" + display_name + "' does not exist or contains no documents.", ctx);
 	}
 
 	// Always include __document_id as first column
