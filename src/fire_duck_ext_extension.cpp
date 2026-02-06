@@ -19,15 +19,42 @@ static void InitializeLogging() {
 	}
 }
 
-// Table function to clear the schema cache
+// Bind data for cache clear function
+struct FirestoreClearCacheBindData : public TableFunctionData {
+	std::string collection;
+};
+
+// Table function to clear the schema cache (all entries)
 static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	ClearFirestoreSchemaCache();
+	auto &bind_data = data.bind_data->Cast<FirestoreClearCacheBindData>();
+	ClearFirestoreSchemaCache(bind_data.collection);
 	output.SetCardinality(0);
 }
 
-static unique_ptr<FunctionData> FirestoreClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
-	return nullptr;
+// Bind for clear cache with no arguments (clears all)
+static unique_ptr<FunctionData> FirestoreClearCacheBindAll(ClientContext &context, TableFunctionBindInput &input,
+                                                           vector<LogicalType> &return_types, vector<string> &names) {
+	// Table functions must return at least one column
+	names.push_back("success");
+	return_types.push_back(LogicalType::BOOLEAN);
+
+	auto result = make_uniq<FirestoreClearCacheBindData>();
+	result->collection = ""; // Empty means clear all
+	return std::move(result);
+}
+
+// Bind for clear cache with collection argument
+static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext &context,
+                                                                   TableFunctionBindInput &input,
+                                                                   vector<LogicalType> &return_types,
+                                                                   vector<string> &names) {
+	// Table functions must return at least one column
+	names.push_back("success");
+	return_types.push_back(LogicalType::BOOLEAN);
+
+	auto result = make_uniq<FirestoreClearCacheBindData>();
+	result->collection = input.inputs[0].GetValue<string>();
+	return std::move(result);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -44,8 +71,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterFirestoreWriteFunctions(loader);
 
 	// Register cache clear function: SELECT * FROM firestore_clear_cache()
-	TableFunction clear_cache_func("firestore_clear_cache", {}, FirestoreClearCacheFunction, FirestoreClearCacheBind);
-	loader.RegisterFunction(clear_cache_func);
+	// Overload 1: No arguments - clears entire cache
+	TableFunction clear_cache_all("firestore_clear_cache", {}, FirestoreClearCacheFunction, FirestoreClearCacheBindAll);
+	loader.RegisterFunction(clear_cache_all);
+
+	// Overload 2: With collection argument - clears only that collection
+	TableFunction clear_cache_collection("firestore_clear_cache", {LogicalType::VARCHAR}, FirestoreClearCacheFunction,
+	                                     FirestoreClearCacheBindCollection);
+	loader.RegisterFunction(clear_cache_collection);
 }
 
 void FireDuckExtExtension::Load(ExtensionLoader &loader) {

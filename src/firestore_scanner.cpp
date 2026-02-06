@@ -56,10 +56,33 @@ static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
 static std::mutex schema_cache_mutex;
 
 // Function to clear the schema cache (exposed for testing/manual refresh)
-void ClearFirestoreSchemaCache() {
+// If collection is empty, clears entire cache. Otherwise clears entries matching the collection.
+void ClearFirestoreSchemaCache(const std::string &collection) {
 	std::lock_guard<std::mutex> lock(schema_cache_mutex);
-	schema_cache.clear();
-	FS_LOG_DEBUG("Schema cache cleared");
+	if (collection.empty()) {
+		schema_cache.clear();
+		FS_LOG_DEBUG("Schema cache cleared (all entries)");
+	} else {
+		// Clear entries that match the collection (cache key format is "project_id:collection")
+		auto it = schema_cache.begin();
+		int cleared = 0;
+		while (it != schema_cache.end()) {
+			// Check if the cache key ends with ":collection"
+			const std::string &key = it->first;
+			size_t colon_pos = key.find(':');
+			if (colon_pos != std::string::npos) {
+				std::string cached_collection = key.substr(colon_pos + 1);
+				if (cached_collection == collection) {
+					it = schema_cache.erase(it);
+					cleared++;
+					continue;
+				}
+			}
+			++it;
+		}
+		FS_LOG_DEBUG("Schema cache cleared for collection '" + collection + "': " + std::to_string(cleared) +
+		             " entries removed");
+	}
 }
 
 // Format a pushdown filter for EXPLAIN output

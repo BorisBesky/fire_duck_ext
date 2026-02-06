@@ -80,6 +80,7 @@ unique_ptr<LocalTableFunctionState> FirestoreScanInitLocal(ExecutionContext &con
 void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output);
 
 // Clear the schema cache (useful when schema changes or for testing)
-void ClearFirestoreSchemaCache();
+// If collection is empty, clears entire cache. Otherwise clears only entries for that collection.
+void ClearFirestoreSchemaCache(const std::string &collection = "");
 
 } // namespace duckdb
