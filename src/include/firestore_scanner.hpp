@@ -49,8 +49,8 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	bool uses_run_query = false; // Whether using :runQuery (true when filters pushed)
 
 	// Pagination optimization: track page size to detect end of results
-	int64_t query_page_size = 1000;   // The page size used in the query
-	bool last_page_was_full = true;   // Whether last fetch returned a full page
+	int64_t query_page_size = 1000; // The page size used in the query
+	bool last_page_was_full = true; // Whether last fetch returned a full page
 
 	FirestoreScanGlobalState() : current_index(0), finished(false) {
 	}
