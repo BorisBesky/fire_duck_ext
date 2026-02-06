@@ -7,6 +7,7 @@
 #include "firestore_logger.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/function/table_function.hpp"
 #include <cstdlib>
 
 namespace duckdb {
@@ -16,6 +17,17 @@ static void InitializeLogging() {
 	if (log_level) {
 		FirestoreLogger::Instance().SetLogLevel(ParseLogLevel(log_level));
 	}
+}
+
+// Table function to clear the schema cache
+static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	ClearFirestoreSchemaCache();
+	output.SetCardinality(0);
+}
+
+static unique_ptr<FunctionData> FirestoreClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+	return nullptr;
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -30,6 +42,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register write functions
 	RegisterFirestoreWriteFunctions(loader);
+
+	// Register cache clear function: SELECT * FROM firestore_clear_cache()
+	TableFunction clear_cache_func("firestore_clear_cache", {}, FirestoreClearCacheFunction, FirestoreClearCacheBind);
+	loader.RegisterFunction(clear_cache_func);
 }
 
 void FireDuckExtExtension::Load(ExtensionLoader &loader) {

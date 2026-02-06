@@ -6,14 +6,61 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include <chrono>
 
 namespace duckdb {
 
-// Cache of inferred schemas for collections
-static std::unordered_map<std::string, std::vector<std::pair<std::string, LogicalType>>> schema_cache;
-// Cache of index metadata for collections
-static std::unordered_map<std::string, std::shared_ptr<FirestoreIndexCache>> index_cache_map;
+// Default schema cache TTL in seconds (5 minutes)
+static constexpr int64_t DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 300;
+
+// Configurable schema cache TTL (can be changed via environment variable FIRESTORE_SCHEMA_CACHE_TTL)
+static int64_t GetSchemaCacheTTL() {
+	static int64_t ttl = -1;
+	if (ttl < 0) {
+		const char *env_ttl = std::getenv("FIRESTORE_SCHEMA_CACHE_TTL");
+		if (env_ttl) {
+			try {
+				ttl = std::stoll(env_ttl);
+				if (ttl < 0) {
+					ttl = 0; // 0 means disabled
+				}
+			} catch (...) {
+				ttl = DEFAULT_SCHEMA_CACHE_TTL_SECONDS;
+			}
+		} else {
+			ttl = DEFAULT_SCHEMA_CACHE_TTL_SECONDS;
+		}
+		FS_LOG_DEBUG("Schema cache TTL set to " + std::to_string(ttl) + " seconds");
+	}
+	return ttl;
+}
+
+// Cached schema entry with timestamp
+struct CachedSchemaEntry {
+	std::vector<std::pair<std::string, LogicalType>> schema;
+	std::shared_ptr<FirestoreIndexCache> index_cache;
+	std::chrono::steady_clock::time_point cached_at;
+
+	bool IsExpired() const {
+		int64_t ttl = GetSchemaCacheTTL();
+		if (ttl == 0) {
+			return true; // Cache disabled
+		}
+		auto age = std::chrono::steady_clock::now() - cached_at;
+		return age > std::chrono::seconds(ttl);
+	}
+};
+
+// Cache of inferred schemas and index metadata for collections
+static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
 static std::mutex schema_cache_mutex;
+
+// Function to clear the schema cache (exposed for testing/manual refresh)
+void ClearFirestoreSchemaCache() {
+	std::lock_guard<std::mutex> lock(schema_cache_mutex);
+	schema_cache.clear();
+	FS_LOG_DEBUG("Schema cache cleared");
+}
 
 // Format a pushdown filter for EXPLAIN output
 static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
@@ -159,17 +206,17 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	{
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		auto it = schema_cache.find(cache_key);
-		if (it != schema_cache.end()) {
-			// Schema found in cache, use it
+		if (it != schema_cache.end() && !it->second.IsExpired()) {
+			// Schema found in cache and not expired, use it
 			FS_LOG_DEBUG("Schema found in cache for collection: " + result->collection);
 			FS_LOG_DEBUG("Cache key: " + cache_key);
-			FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.size()));
+			FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.schema.size()));
 
 			// Always include __document_id as first column
 			names.push_back("__document_id");
 			return_types.push_back(LogicalType::VARCHAR);
 
-			for (const auto &[col_name, col_type] : it->second) {
+			for (const auto &[col_name, col_type] : it->second.schema) {
 				names.push_back(col_name);
 				return_types.push_back(col_type);
 				result->column_names.push_back(col_name);
@@ -177,24 +224,22 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			}
 
 			// Also restore index cache if available
-			auto idx_it = index_cache_map.find(cache_key);
-			if (idx_it != index_cache_map.end()) {
-				result->index_cache = idx_it->second;
+			if (it->second.index_cache) {
+				result->index_cache = it->second.index_cache;
 				FS_LOG_DEBUG("Index cache restored from cache");
 			}
 
 			return std::move(result);
+		} else if (it != schema_cache.end()) {
+			// Cache entry expired, remove it
+			FS_LOG_DEBUG("Schema cache expired for collection: " + result->collection);
+			schema_cache.erase(it);
 		}
 	}
 
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials);
 	auto schema = client.InferSchema(result->collection);
-
-	{
-		std::lock_guard<std::mutex> lock(schema_cache_mutex);
-		schema_cache[cache_key] = schema;
-	}
 
 	// Always include __document_id as first column
 	names.push_back("__document_id");
@@ -239,10 +284,15 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		result->index_cache->default_single_field_enabled = true;
 	}
 
-	// Store index cache for future queries
+	// Store schema and index cache for future queries
 	{
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
-		index_cache_map[cache_key] = result->index_cache;
+		CachedSchemaEntry entry;
+		entry.schema = schema;
+		entry.index_cache = result->index_cache;
+		entry.cached_at = std::chrono::steady_clock::now();
+		schema_cache[cache_key] = std::move(entry);
+		FS_LOG_DEBUG("Schema cached for: " + cache_key);
 	}
 
 	return std::move(result);
