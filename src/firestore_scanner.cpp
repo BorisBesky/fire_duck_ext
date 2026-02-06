@@ -2,6 +2,7 @@
 #include "firestore_types.hpp"
 #include "firestore_secrets.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_error.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -82,6 +83,9 @@ void ClearFirestoreSchemaCache(const std::string &collection) {
 		}
 		FS_LOG_DEBUG("Schema cache cleared for collection '" + collection + "': " + std::to_string(cleared) +
 		             " entries removed");
+		if (cleared == 0) {
+			FS_LOG_WARN("No cache entries found for collection: " + collection);
+		}
 	}
 }
 
@@ -230,29 +234,37 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		auto it = schema_cache.find(cache_key);
 		if (it != schema_cache.end() && !it->second.IsExpired()) {
-			// Schema found in cache and not expired, use it
-			FS_LOG_DEBUG("Schema found in cache for collection: " + result->collection);
-			FS_LOG_DEBUG("Cache key: " + cache_key);
-			FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.schema.size()));
+			// Check if cached schema is empty (collection was empty when cached)
+			// If so, remove stale entry and re-infer to get fresh error
+			if (it->second.schema.empty()) {
+				FS_LOG_DEBUG("Removing empty cached schema for collection: " + result->collection);
+				schema_cache.erase(it);
+				// Fall through to re-infer schema
+			} else {
+				// Schema found in cache and not expired, use it
+				FS_LOG_DEBUG("Schema found in cache for collection: " + result->collection);
+				FS_LOG_DEBUG("Cache key: " + cache_key);
+				FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.schema.size()));
 
-			// Always include __document_id as first column
-			names.push_back("__document_id");
-			return_types.push_back(LogicalType::VARCHAR);
+				// Always include __document_id as first column
+				names.push_back("__document_id");
+				return_types.push_back(LogicalType::VARCHAR);
 
-			for (const auto &[col_name, col_type] : it->second.schema) {
-				names.push_back(col_name);
-				return_types.push_back(col_type);
-				result->column_names.push_back(col_name);
-				result->column_types.push_back(col_type);
+				for (const auto &[col_name, col_type] : it->second.schema) {
+					names.push_back(col_name);
+					return_types.push_back(col_type);
+					result->column_names.push_back(col_name);
+					result->column_types.push_back(col_type);
+				}
+
+				// Also restore index cache if available
+				if (it->second.index_cache) {
+					result->index_cache = it->second.index_cache;
+					FS_LOG_DEBUG("Index cache restored from cache");
+				}
+
+				return std::move(result);
 			}
-
-			// Also restore index cache if available
-			if (it->second.index_cache) {
-				result->index_cache = it->second.index_cache;
-				FS_LOG_DEBUG("Index cache restored from cache");
-			}
-
-			return std::move(result);
 		} else if (it != schema_cache.end()) {
 			// Cache entry expired, remove it
 			FS_LOG_DEBUG("Schema cache expired for collection: " + result->collection);
@@ -263,6 +275,22 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials);
 	auto schema = client.InferSchema(result->collection);
+
+	// Check if collection exists (has documents)
+	if (schema.empty()) {
+		bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
+		std::string collection_type = is_collection_group ? "Collection group" : "Collection";
+		std::string display_name = is_collection_group ? result->collection.substr(1) : result->collection;
+
+		FirestoreErrorContext ctx;
+		ctx.withCollection(result->collection)
+		    .withProject(result->credentials->project_id)
+		    .withOperation("scan");
+
+		throw FirestoreNotFoundError(FirestoreErrorCode::NOT_FOUND_COLLECTION,
+		                             collection_type + " '" + display_name + "' does not exist or contains no documents.",
+		                             ctx);
+	}
 
 	// Always include __document_id as first column
 	names.push_back("__document_id");
