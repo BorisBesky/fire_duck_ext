@@ -9,6 +9,12 @@
 
 namespace duckdb {
 
+// Cache of inferred schemas for collections
+static std::unordered_map<std::string, std::vector<std::pair<std::string, LogicalType>>> schema_cache;
+// Cache of index metadata for collections
+static std::unordered_map<std::string, std::shared_ptr<FirestoreIndexCache>> index_cache_map;
+static std::mutex schema_cache_mutex;
+
 // Format a pushdown filter for EXPLAIN output
 static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
 	if (f.is_unary) {
@@ -149,9 +155,46 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		    "create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.");
 	}
 
+	std::string cache_key = result->credentials->project_id + ":" + result->collection;
+	{
+		std::lock_guard<std::mutex> lock(schema_cache_mutex);
+		auto it = schema_cache.find(cache_key);
+		if (it != schema_cache.end()) {
+			// Schema found in cache, use it
+			FS_LOG_DEBUG("Schema found in cache for collection: " + result->collection);
+			FS_LOG_DEBUG("Cache key: " + cache_key);
+			FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.size()));
+
+			// Always include __document_id as first column
+			names.push_back("__document_id");
+			return_types.push_back(LogicalType::VARCHAR);
+
+			for (const auto &[col_name, col_type] : it->second) {
+				names.push_back(col_name);
+				return_types.push_back(col_type);
+				result->column_names.push_back(col_name);
+				result->column_types.push_back(col_type);
+			}
+
+			// Also restore index cache if available
+			auto idx_it = index_cache_map.find(cache_key);
+			if (idx_it != index_cache_map.end()) {
+				result->index_cache = idx_it->second;
+				FS_LOG_DEBUG("Index cache restored from cache");
+			}
+
+			return std::move(result);
+		}
+	}
+
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials);
 	auto schema = client.InferSchema(result->collection);
+
+	{
+		std::lock_guard<std::mutex> lock(schema_cache_mutex);
+		schema_cache[cache_key] = schema;
+	}
 
 	// Always include __document_id as first column
 	names.push_back("__document_id");
@@ -194,6 +237,12 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		            ". Assuming default single-field indexes.");
 		result->index_cache->fetch_succeeded = true;
 		result->index_cache->default_single_field_enabled = true;
+	}
+
+	// Store index cache for future queries
+	{
+		std::lock_guard<std::mutex> lock(schema_cache_mutex);
+		index_cache_map[cache_key] = result->index_cache;
 	}
 
 	return std::move(result);
@@ -313,6 +362,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		global_state->structured_query = sq;
 		global_state->uses_run_query = true;
+		global_state->query_page_size = page_size;
 
 		FS_LOG_DEBUG("Filter pushdown active: " + std::to_string(global_state->pushdown_result.pushed_filters.size()) +
 		             " filters pushed to Firestore");
@@ -320,6 +370,9 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		try {
 			response = global_state->client->RunQuery(bind_data.collection, sq, bind_data.is_collection_group);
 			global_state->next_page_token = ""; // runQuery uses cursor-based pagination
+			// Check if this page is full (may need pagination) or partial (we're done)
+			global_state->last_page_was_full =
+			    (static_cast<int64_t>(response.documents.size()) >= global_state->query_page_size);
 		} catch (const std::exception &e) {
 			// Fallback: if runQuery fails, disable pushdown and use ListDocuments
 			FS_LOG_WARN("RunQuery with filters failed, falling back to full scan: " + std::string(e.what()));
@@ -404,7 +457,8 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		if (global_state.current_index >= global_state.documents.size()) {
 			if (global_state.uses_run_query) {
 				// Cursor-based pagination for :runQuery
-				if (global_state.documents.empty()) {
+				// If the last page wasn't full, we've reached the end - no need to fetch more
+				if (!global_state.last_page_was_full || global_state.documents.empty()) {
 					break;
 				}
 
@@ -418,6 +472,10 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 				auto response =
 				    global_state.client->RunQuery(bind_data.collection, paginated_query, bind_data.is_collection_group);
+
+				// Track if this page is full for next iteration
+				global_state.last_page_was_full =
+				    (static_cast<int64_t>(response.documents.size()) >= global_state.query_page_size);
 
 				if (response.documents.empty()) {
 					break;

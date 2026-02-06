@@ -1,12 +1,19 @@
 #include "firestore_secrets.hpp"
+#include "firestore_logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 namespace duckdb {
 
 // Secret type name
 static constexpr const char *FIRESTORE_SECRET_TYPE = "firestore";
+
+// Credentials cache - keeps credentials with their access tokens alive across queries
+static std::unordered_map<std::string, std::shared_ptr<FirestoreCredentials>> credentials_cache;
+static std::mutex credentials_cache_mutex;
 
 // Create secret from configuration options
 static unique_ptr<BaseSecret> CreateFirestoreSecretFromConfig(ClientContext &context, CreateSecretInput &input) {
@@ -138,6 +145,32 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
                                                                   const std::optional<std::string> &credentials_path,
                                                                   const std::optional<std::string> &api_key,
                                                                   const std::optional<std::string> &database_id) {
+	// Build a cache key based on the credential source
+	std::string cache_key;
+	if (credentials_path.has_value()) {
+		cache_key = "path:" + credentials_path.value();
+	} else if (api_key.has_value() && project_id.has_value()) {
+		cache_key = "apikey:" + project_id.value();
+	} else {
+		// For secrets and env var, use a generic key since they're singletons
+		cache_key = "default";
+	}
+
+	// Check cache first
+	{
+		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+		auto it = credentials_cache.find(cache_key);
+		if (it != credentials_cache.end()) {
+			auto cached_creds = it->second;
+			// Apply database_id if explicitly provided (may differ per query)
+			if (database_id.has_value()) {
+				cached_creds->database_id = database_id.value();
+			}
+			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
+			return cached_creds;
+		}
+	}
+
 	std::shared_ptr<FirestoreCredentials> creds;
 
 	// Priority 1: Explicit credentials path
@@ -172,6 +205,13 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 	// Apply database_id if explicitly provided (overrides secret value)
 	if (database_id.has_value()) {
 		creds->database_id = database_id.value();
+	}
+
+	// Store in cache
+	{
+		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+		credentials_cache[cache_key] = creds;
+		FS_LOG_DEBUG("Credentials cached for: " + cache_key);
 	}
 
 	return creds;

@@ -4,12 +4,24 @@
 #include "firestore_scanner.hpp"
 #include "firestore_writer.hpp"
 #include "firestore_secrets.hpp"
+#include "firestore_logger.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include <cstdlib>
 
 namespace duckdb {
 
+static void InitializeLogging() {
+	const char *log_level = std::getenv("FIRESTORE_LOG_LEVEL");
+	if (log_level) {
+		FirestoreLogger::Instance().SetLogLevel(ParseLogLevel(log_level));
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
+	// Initialize logging from environment variable
+	InitializeLogging();
+
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);
 
