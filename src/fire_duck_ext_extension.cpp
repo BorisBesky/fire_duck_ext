@@ -4,9 +4,11 @@
 #include "firestore_scanner.hpp"
 #include "firestore_writer.hpp"
 #include "firestore_secrets.hpp"
+#include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/function/table_function.hpp"
 #include <cstdlib>
 
@@ -59,6 +61,12 @@ static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext 
 static void LoadInternal(ExtensionLoader &loader) {
 	// Initialize logging from environment variable
 	InitializeLogging();
+
+	// Register extension options
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption("firestore_schema_cache_ttl", "Schema cache TTL in seconds (0 to disable caching)",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::SchemaCacheTTLSeconds()),
+	                          FirestoreSettings::SetSchemaCacheTTLSeconds);
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);

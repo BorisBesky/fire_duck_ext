@@ -1,6 +1,7 @@
 #include "firestore_scanner.hpp"
 #include "firestore_types.hpp"
 #include "firestore_secrets.hpp"
+#include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
 #include "firestore_error.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -11,31 +12,6 @@
 
 namespace duckdb {
 
-// Default schema cache TTL in seconds (60 minutes)
-static constexpr int64_t DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 3600;
-
-// Configurable schema cache TTL (can be changed via environment variable FIRESTORE_SCHEMA_CACHE_TTL)
-static int64_t GetSchemaCacheTTL() {
-	static int64_t ttl = -1;
-	if (ttl < 0) {
-		const char *env_ttl = std::getenv("FIRESTORE_SCHEMA_CACHE_TTL");
-		if (env_ttl) {
-			try {
-				ttl = std::stoll(env_ttl);
-				if (ttl < 0) {
-					ttl = 0; // 0 means disabled
-				}
-			} catch (...) {
-				ttl = DEFAULT_SCHEMA_CACHE_TTL_SECONDS;
-			}
-		} else {
-			ttl = DEFAULT_SCHEMA_CACHE_TTL_SECONDS;
-		}
-		FS_LOG_DEBUG("Schema cache TTL set to " + std::to_string(ttl) + " seconds");
-	}
-	return ttl;
-}
-
 // Cached schema entry with timestamp
 struct CachedSchemaEntry {
 	std::vector<std::pair<std::string, LogicalType>> schema;
@@ -43,7 +19,7 @@ struct CachedSchemaEntry {
 	std::chrono::steady_clock::time_point cached_at;
 
 	bool IsExpired() const {
-		int64_t ttl = GetSchemaCacheTTL();
+		int64_t ttl = FirestoreSettings::SchemaCacheTTLSeconds();
 		if (ttl == 0) {
 			return true; // Cache disabled
 		}
