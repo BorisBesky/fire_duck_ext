@@ -145,19 +145,26 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
                                                                   const std::optional<std::string> &credentials_path,
                                                                   const std::optional<std::string> &api_key,
                                                                   const std::optional<std::string> &database_id) {
-	// Build a cache key based on the credential source
+	// Only cache credentials from file paths (service accounts) since they need token refresh caching.
+	// Secrets and env vars are not cached to ensure proper test isolation and to pick up
+	// any changes to secrets during the session.
 	std::string cache_key;
+	bool should_cache = false;
+
 	if (credentials_path.has_value()) {
 		cache_key = "path:" + credentials_path.value();
-	} else if (api_key.has_value() && project_id.has_value()) {
-		cache_key = "apikey:" + project_id.value();
+		should_cache = true;
 	} else {
-		// For secrets and env var, use a generic key since they're singletons
-		cache_key = "default";
+		// Check environment variable path for caching
+		const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
+		if (env_creds && strlen(env_creds) > 0 && !api_key.has_value()) {
+			cache_key = "env:" + std::string(env_creds);
+			should_cache = true;
+		}
 	}
 
-	// Check cache first
-	{
+	// Check cache first (only for file-based credentials)
+	if (should_cache) {
 		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
 		auto it = credentials_cache.find(cache_key);
 		if (it != credentials_cache.end()) {
@@ -207,8 +214,8 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		creds->database_id = database_id.value();
 	}
 
-	// Store in cache
-	{
+	// Store in cache (only for file-based credentials that need token refresh)
+	if (should_cache) {
 		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
 		credentials_cache[cache_key] = creds;
 		FS_LOG_DEBUG("Credentials cached for: " + cache_key);
