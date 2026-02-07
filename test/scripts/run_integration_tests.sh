@@ -1058,6 +1058,37 @@ SELECT 'wildcard_works';
 " 2>&1 | tail -1 | tr -d '[:space:]"')
 assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wildcard database secret"
 
+# Test 53b: firestore_connect with DATABASES list secret
+echo "Test 53b: firestore_connect with DATABASES list secret..."
+DATABASES_LIST_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET list_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CALL firestore_connect('(default)');
+SELECT 'list_default_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DATABASES_LIST_RESULT" "list_default_ok" "firestore_connect works with DATABASES list (matching first entry)"
+
+DATABASES_LIST_OTHER=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET list_test2 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CALL firestore_connect('other-db');
+SELECT 'list_other_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DATABASES_LIST_OTHER" "list_other_ok" "firestore_connect works with DATABASES list (matching second entry)"
+
+DATABASES_LIST_NOMATCH=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET list_test3 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CALL firestore_connect('unknown-db');
+SELECT 'should_not_reach';
+" 2>&1 | grep -i "No Firestore credentials found" | head -1)
+if [ -n "$DATABASES_LIST_NOMATCH" ]; then
+    echo "PASS: firestore_connect fails for database not in DATABASES list"
+else
+    echo "FAIL: firestore_connect should fail for database not in DATABASES list"
+    exit 1
+fi
+
 # Test 54: firestore_connect fails for non-matching database
 echo "Test 54: firestore_connect fails for non-matching database..."
 NOMATCH_RESULT=$($DUCKDB -unsigned -csv -noheader -c "

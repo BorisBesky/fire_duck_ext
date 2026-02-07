@@ -155,6 +155,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["database"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["limit"] = LogicalType::BIGINT;
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
+	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
 
 	// Enable projection pushdown for efficiency
 	scan_func.projection_pushdown = true;
@@ -192,6 +193,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->limit = kv.second.GetValue<int64_t>();
 		} else if (kv.first == "order_by") {
 			result->order_by = kv.second.GetValue<string>();
+		} else if (kv.first == "show_missing") {
+			result->show_missing = kv.second.GetValue<bool>();
 		}
 	}
 
@@ -251,20 +254,29 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials);
-	auto schema = client.InferSchema(result->collection);
+	auto schema = client.InferSchema(result->collection, 100, result->show_missing);
 
 	// Check if collection exists (has documents)
 	if (schema.empty()) {
-		bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
-		std::string collection_type = is_collection_group ? "Collection group" : "Collection";
-		std::string display_name = is_collection_group ? result->collection.substr(1) : result->collection;
+		// When show_missing is enabled, an empty schema means all documents are phantom
+		// (no fields, only subcollections). Return only __document_id column so users
+		// can discover document IDs.
+		if (result->show_missing) {
+			FS_LOG_DEBUG("Collection '" + result->collection +
+			             "' contains only phantom/missing documents (no fields). "
+			             "Returning __document_id only.");
+		} else {
+			bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
+			std::string collection_type = is_collection_group ? "Collection group" : "Collection";
+			std::string display_name = is_collection_group ? result->collection.substr(1) : result->collection;
 
-		FirestoreErrorContext ctx;
-		ctx.withCollection(result->collection).withProject(result->credentials->project_id).withOperation("scan");
+			FirestoreErrorContext ctx;
+			ctx.withCollection(result->collection).withProject(result->credentials->project_id).withOperation("scan");
 
-		throw FirestoreNotFoundError(
-		    FirestoreErrorCode::NOT_FOUND_COLLECTION,
-		    collection_type + " '" + display_name + "' does not exist or contains no documents.", ctx);
+			throw FirestoreNotFoundError(
+			    FirestoreErrorCode::NOT_FOUND_COLLECTION,
+			    collection_type + " '" + display_name + "' does not exist or contains no documents.", ctx);
+		}
 	}
 
 	// Always include __document_id as first column
@@ -457,6 +469,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			global_state->structured_query = {};
 
 			FirestoreQuery query;
+			query.show_missing = bind_data.show_missing;
 			if (bind_data.limit.has_value()) {
 				query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
 			}
@@ -476,6 +489,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	} else {
 		// No filter pushdown - use existing query paths
 		FirestoreQuery query;
+		query.show_missing = bind_data.show_missing;
 		if (bind_data.limit.has_value()) {
 			query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
 		}
@@ -566,6 +580,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				}
 
 				FirestoreQuery query;
+				query.show_missing = bind_data.show_missing;
 				query.page_token = global_state.next_page_token;
 				if (bind_data.order_by.has_value()) {
 					query.order_by = bind_data.order_by.value();

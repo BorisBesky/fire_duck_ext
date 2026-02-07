@@ -60,6 +60,10 @@ call firestore_update_batch('users', getvariable('ids'), 'status', 'reviewed');
 ## Authentication
 
 ### Service Account (Recommended for production)
+
+`SERVICE_ACCOUNT_JSON` accepts either a **file path** or the **full JSON text** of a service account key.
+
+**File path:**
 ```sql
 CREATE SECRET prod_firestore (
     TYPE firestore,
@@ -68,22 +72,81 @@ CREATE SECRET prod_firestore (
 );
 ```
 
+**Inline JSON:**
+```sql
+CREATE SECRET prod_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    SERVICE_ACCOUNT_JSON '{
+        "type": "service_account",
+        "project_id": "my-project",
+        "private_key_id": "key123abc",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
+        "client_email": "firestore-sa@my-project.iam.gserviceaccount.com",
+        "client_id": "123456789",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token"
+    }'
+);
+```
+
 ### API Key (For development/testing)
+
+An API key provides unauthenticated access and is suitable for development, testing, or accessing public Firestore databases. API key auth does not support `batchWrite`, so batch operations fall back to individual requests.
+
 ```sql
 CREATE SECRET dev_firestore (
     TYPE firestore,
     PROJECT_ID 'my-project',
-    API_KEY 'your-api-key'
+    API_KEY 'AIzaSyYourApiKeyHere'
 );
 ```
-### Use environment variable
-```sql
+
+### Environment Variable
+```bash
 # Set the path to your service account JSON file
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 
 # Then run DuckDB - no secret creation needed!
 duckdb
 ```
+The extension automatically reads `GOOGLE_APPLICATION_CREDENTIALS` on startup and creates an internal secret that matches all databases (`DATABASE '*'`), so no `CREATE SECRET` is needed.
+
+### Custom Database
+```sql
+-- Single named database (with service account)
+CREATE SECRET my_secret (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    SERVICE_ACCOUNT_JSON '/path/to/credentials.json',
+    DATABASE 'my-database'
+);
+
+-- Single named database (with API key)
+CREATE SECRET my_secret (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourApiKeyHere',
+    DATABASE 'my-database'
+);
+
+-- Multiple databases
+CREATE SECRET my_secret (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    SERVICE_ACCOUNT_JSON '/path/to/credentials.json',
+    DATABASES ['(default)', 'my-other-db']
+);
+
+-- Wildcard (matches all databases)
+CREATE SECRET my_secret (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    SERVICE_ACCOUNT_JSON '/path/to/credentials.json',
+    DATABASE '*'
+);
+```
+If `DATABASE`/`DATABASES` is omitted, it defaults to `(default)`.
 
 ### Firebase Emulator
 ```sql
@@ -201,6 +264,22 @@ Use `EXPLAIN` to see which filters are pushed down:
 EXPLAIN SELECT * FROM firestore_scan('users') WHERE status = 'active' AND age > 25;
 -- Shows "Firestore Pushed Filters: status EQUAL 'active', age GREATER_THAN 25"
 ```
+
+## Missing Documents
+
+By default, `firestore_scan()` includes "phantom" documents — documents that have no fields but serve as parent paths for subcollections. This matches the behavior of the Firebase Console and is controlled by the `show_missing` parameter (default: `true`).
+
+```sql
+-- Default: includes phantom/missing documents
+SELECT * FROM firestore_scan('artifacts/default-app-id/users');
+
+-- Opt out to only return documents with fields
+SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing := false);
+```
+
+When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.
+
+> **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
 
 ## Building from Source
 

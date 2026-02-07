@@ -26,6 +26,9 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Collection group query flag - when true, __document_id returns full path
 	bool is_collection_group = false;
 
+	// Show missing/phantom documents (documents with no fields, only subcollections)
+	bool show_missing = true;
+
 	// Index cache - populated at bind time for filter pushdown
 	std::shared_ptr<FirestoreIndexCache> index_cache;
 

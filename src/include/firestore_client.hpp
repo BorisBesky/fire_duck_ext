@@ -31,6 +31,7 @@ struct FirestoreQuery {
 	std::optional<int64_t> limit;
 	std::optional<std::string> page_token;
 	int64_t page_size = 1000; // Max allowed by Firestore
+	bool show_missing = true; // Include phantom documents (no fields, only subcollections)
 };
 
 // Response from listing documents
@@ -88,7 +89,7 @@ public:
 	// Use ~ prefix for collection group queries (e.g., "~profile")
 	// Returns pairs of (field_name, DuckDB LogicalType)
 	std::vector<std::pair<std::string, LogicalType>> InferSchema(const std::string &collection,
-	                                                             int64_t sample_size = 100);
+	                                                             int64_t sample_size = 100, bool show_missing = true);
 
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,

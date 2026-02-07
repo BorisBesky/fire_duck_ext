@@ -96,8 +96,15 @@ static unique_ptr<BaseSecret> CreateFirestoreSecretFromConfig(ClientContext &con
 	result->secret_map["project_id"] = project_id->second.ToString();
 
 	// Get database_id (optional, defaults to "(default)")
+	// Supports both DATABASE 'single-db' (VARCHAR) and DATABASES ['db1', 'db2'] (LIST)
+	auto databases = input.options.find("databases");
 	auto database_id = input.options.find("database");
-	if (database_id != input.options.end()) {
+	if (databases != input.options.end() && database_id != input.options.end()) {
+		throw InvalidInputException("Cannot specify both 'database' and 'databases' - use one or the other");
+	}
+	if (databases != input.options.end()) {
+		result->secret_map["database_id"] = databases->second;
+	} else if (database_id != input.options.end()) {
 		result->secret_map["database_id"] = database_id->second.ToString();
 	} else {
 		result->secret_map["database_id"] = Value("(default)");
@@ -147,6 +154,7 @@ void RegisterFirestoreSecretType(ExtensionLoader &loader) {
 	config_function.named_parameters["service_account_json"] = LogicalType::VARCHAR;
 	config_function.named_parameters["api_key"] = LogicalType::VARCHAR;
 	config_function.named_parameters["database"] = LogicalType::VARCHAR;
+	config_function.named_parameters["databases"] = LogicalType::LIST(LogicalType::VARCHAR);
 
 	loader.RegisterFunction(config_function);
 }

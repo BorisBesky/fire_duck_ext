@@ -265,6 +265,12 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	add_param("pageSize", std::to_string(query.page_size));
 
+	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
+	// Only send showMissing=true when talking to production Firestore.
+	if (query.show_missing && GetEmulatorHost().empty()) {
+		add_param("showMissing", "true");
+	}
+
 	if (query.page_token.has_value()) {
 		add_param("pageToken", query.page_token.value());
 	}
@@ -669,11 +675,12 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 }
 
 std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
-                                                                              int64_t sample_size) {
+                                                                              int64_t sample_size, bool show_missing) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
 	FirestoreQuery query;
 	query.page_size = std::min(sample_size, static_cast<int64_t>(1000));
+	query.show_missing = show_missing;
 
 	FirestoreListResponse response;
 
@@ -695,6 +702,10 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 	std::map<std::string, idx_t> vector_dimensions;
 
 	for (const auto &doc : response.documents) {
+		// Skip phantom/missing documents (no fields) during schema inference
+		if (doc.fields.empty() || doc.fields.is_null()) {
+			continue;
+		}
 		for (auto it = doc.fields.begin(); it != doc.fields.end(); ++it) {
 			const std::string &field_name = it.key();
 			const json &field_value = it.value();
