@@ -1,13 +1,68 @@
 #include "firestore_scanner.hpp"
 #include "firestore_types.hpp"
 #include "firestore_secrets.hpp"
+#include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_error.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include <chrono>
 
 namespace duckdb {
+
+// Cached schema entry with timestamp
+struct CachedSchemaEntry {
+	std::vector<std::pair<std::string, LogicalType>> schema;
+	std::shared_ptr<FirestoreIndexCache> index_cache;
+	std::chrono::steady_clock::time_point cached_at;
+
+	bool IsExpired(int64_t ttl_seconds) const {
+		if (ttl_seconds == 0) {
+			return true; // Cache disabled
+		}
+		auto age = std::chrono::steady_clock::now() - cached_at;
+		return age > std::chrono::seconds(ttl_seconds);
+	}
+};
+
+// Cache of inferred schemas and index metadata for collections
+static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
+static std::mutex schema_cache_mutex;
+
+// Function to clear the schema cache (exposed for testing/manual refresh)
+// If collection is empty, clears entire cache. Otherwise clears entries matching the collection.
+void ClearFirestoreSchemaCache(const std::string &collection) {
+	std::lock_guard<std::mutex> lock(schema_cache_mutex);
+	if (collection.empty()) {
+		schema_cache.clear();
+		FS_LOG_DEBUG("Schema cache cleared (all entries)");
+	} else {
+		// Clear entries that match the collection (cache key format is "project_id:database_id:collection")
+		auto it = schema_cache.begin();
+		int cleared = 0;
+		while (it != schema_cache.end()) {
+			// Check if the cache key ends with ":collection"
+			const std::string &key = it->first;
+			size_t colon_pos = key.rfind(':'); // Find LAST colon to extract collection
+			if (colon_pos != std::string::npos) {
+				std::string cached_collection = key.substr(colon_pos + 1);
+				if (cached_collection == collection) {
+					it = schema_cache.erase(it);
+					cleared++;
+					continue;
+				}
+			}
+			++it;
+		}
+		FS_LOG_DEBUG("Schema cache cleared for collection '" + collection + "': " + std::to_string(cleared) +
+		             " entries removed");
+		if (cleared == 0) {
+			FS_LOG_WARN("No cache entries found for collection: " + collection);
+		}
+	}
+}
 
 // Format a pushdown filter for EXPLAIN output
 static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
@@ -149,9 +204,68 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		    "create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.");
 	}
 
+	std::string cache_key =
+	    result->credentials->project_id + ":" + result->credentials->database_id + ":" + result->collection;
+	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
+	{
+		std::lock_guard<std::mutex> lock(schema_cache_mutex);
+		auto it = schema_cache.find(cache_key);
+		if (it != schema_cache.end() && !it->second.IsExpired(ttl_seconds)) {
+			// Check if cached schema is empty (collection was empty when cached)
+			// If so, remove stale entry and re-infer to get fresh error
+			if (it->second.schema.empty()) {
+				FS_LOG_DEBUG("Removing empty cached schema for collection: " + result->collection);
+				schema_cache.erase(it);
+				// Fall through to re-infer schema
+			} else {
+				// Schema found in cache and not expired, use it
+				FS_LOG_DEBUG("Schema found in cache for collection: " + result->collection);
+				FS_LOG_DEBUG("Cache key: " + cache_key);
+				FS_LOG_DEBUG("Schema cache hit, columns: " + std::to_string(it->second.schema.size()));
+
+				// Always include __document_id as first column
+				names.push_back("__document_id");
+				return_types.push_back(LogicalType::VARCHAR);
+
+				for (const auto &[col_name, col_type] : it->second.schema) {
+					names.push_back(col_name);
+					return_types.push_back(col_type);
+					result->column_names.push_back(col_name);
+					result->column_types.push_back(col_type);
+				}
+
+				// Also restore index cache if available
+				if (it->second.index_cache) {
+					result->index_cache = it->second.index_cache;
+					FS_LOG_DEBUG("Index cache restored from cache");
+				}
+
+				return std::move(result);
+			}
+		} else if (it != schema_cache.end()) {
+			// Cache entry expired, remove it
+			FS_LOG_DEBUG("Schema cache expired for collection: " + result->collection);
+			schema_cache.erase(it);
+		}
+	}
+
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials);
 	auto schema = client.InferSchema(result->collection);
+
+	// Check if collection exists (has documents)
+	if (schema.empty()) {
+		bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
+		std::string collection_type = is_collection_group ? "Collection group" : "Collection";
+		std::string display_name = is_collection_group ? result->collection.substr(1) : result->collection;
+
+		FirestoreErrorContext ctx;
+		ctx.withCollection(result->collection).withProject(result->credentials->project_id).withOperation("scan");
+
+		throw FirestoreNotFoundError(
+		    FirestoreErrorCode::NOT_FOUND_COLLECTION,
+		    collection_type + " '" + display_name + "' does not exist or contains no documents.", ctx);
+	}
 
 	// Always include __document_id as first column
 	names.push_back("__document_id");
@@ -194,6 +308,17 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		            ". Assuming default single-field indexes.");
 		result->index_cache->fetch_succeeded = true;
 		result->index_cache->default_single_field_enabled = true;
+	}
+
+	// Store schema and index cache for future queries
+	{
+		std::lock_guard<std::mutex> lock(schema_cache_mutex);
+		CachedSchemaEntry entry;
+		entry.schema = schema;
+		entry.index_cache = result->index_cache;
+		entry.cached_at = std::chrono::steady_clock::now();
+		schema_cache[cache_key] = std::move(entry);
+		FS_LOG_DEBUG("Schema cached for: " + cache_key);
 	}
 
 	return std::move(result);
@@ -313,6 +438,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		global_state->structured_query = sq;
 		global_state->uses_run_query = true;
+		global_state->query_page_size = page_size;
 
 		FS_LOG_DEBUG("Filter pushdown active: " + std::to_string(global_state->pushdown_result.pushed_filters.size()) +
 		             " filters pushed to Firestore");
@@ -320,6 +446,9 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		try {
 			response = global_state->client->RunQuery(bind_data.collection, sq, bind_data.is_collection_group);
 			global_state->next_page_token = ""; // runQuery uses cursor-based pagination
+			// Check if this page is full (may need pagination) or partial (we're done)
+			global_state->last_page_was_full =
+			    (static_cast<int64_t>(response.documents.size()) >= global_state->query_page_size);
 		} catch (const std::exception &e) {
 			// Fallback: if runQuery fails, disable pushdown and use ListDocuments
 			FS_LOG_WARN("RunQuery with filters failed, falling back to full scan: " + std::string(e.what()));
@@ -404,7 +533,8 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		if (global_state.current_index >= global_state.documents.size()) {
 			if (global_state.uses_run_query) {
 				// Cursor-based pagination for :runQuery
-				if (global_state.documents.empty()) {
+				// If the last page wasn't full, we've reached the end - no need to fetch more
+				if (!global_state.last_page_was_full || global_state.documents.empty()) {
 					break;
 				}
 
@@ -418,6 +548,10 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 				auto response =
 				    global_state.client->RunQuery(bind_data.collection, paginated_query, bind_data.is_collection_group);
+
+				// Track if this page is full for next iteration
+				global_state.last_page_was_full =
+				    (static_cast<int64_t>(response.documents.size()) >= global_state.query_page_size);
 
 				if (response.documents.empty()) {
 					break;

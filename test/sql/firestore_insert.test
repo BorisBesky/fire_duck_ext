@@ -11,7 +11,7 @@ require fire_duck_ext
 statement error
 SELECT * FROM firestore_insert('users', (SELECT 'Alice' AS name, 30 AS age));
 ----
-No Firestore credentials found
+No Firestore credentials found for insert operation
 
 # ============================================
 # Setup credentials

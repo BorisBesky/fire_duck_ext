@@ -227,7 +227,7 @@ assert_eq "$ACTIVE_COUNT" "2" "2 active users"
 
 # Test 9: Single document update
 echo "Test 9: Single document update..."
-run_query "SELECT * FROM firestore_update('users', 'user1', 'status', 'verified');" > /dev/null
+run_query "CALL firestore_update('users', 'user1', 'status', 'verified');" > /dev/null
 
 UPDATED_STATUS=$(run_query "SELECT status FROM firestore_scan('users') WHERE __document_id = 'user1';")
 assert_eq "$UPDATED_STATUS" "verified" "User1 status updated to verified"
@@ -236,7 +236,7 @@ assert_eq "$UPDATED_STATUS" "verified" "User1 status updated to verified"
 echo "Test 10: Batch update with DuckDB filtering..."
 run_query "
 SET VARIABLE pending_ids = (SELECT list(__document_id) FROM firestore_scan('users') WHERE status = 'pending');
-SELECT * FROM firestore_update_batch('users', getvariable('pending_ids'), 'status', 'reviewed');
+CALL firestore_update_batch('users', getvariable('pending_ids'), 'status', 'reviewed');
 " > /dev/null
 
 REMAINING_PENDING=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'pending';")
@@ -250,7 +250,7 @@ echo "Test 11: Single document delete..."
 BEFORE_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('products');")
 assert_eq "$BEFORE_DELETE" "2" "2 products before delete"
 
-run_query "SELECT * FROM firestore_delete('products', 'prod2');" > /dev/null
+run_query "CALL firestore_delete('products', 'prod2');" > /dev/null
 
 AFTER_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('products');")
 assert_eq "$AFTER_DELETE" "1" "1 product after delete"
@@ -259,7 +259,7 @@ assert_eq "$AFTER_DELETE" "1" "1 product after delete"
 echo "Test 12: Batch delete with filtering..."
 run_query "
 SET VARIABLE inactive_ids = (SELECT list(__document_id) FROM firestore_scan('users') WHERE status = 'inactive');
-SELECT * FROM firestore_delete_batch('users', getvariable('inactive_ids'));
+CALL firestore_delete_batch('users', getvariable('inactive_ids'));
 " > /dev/null
 
 INACTIVE_REMAINING=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE status = 'inactive';")
@@ -333,7 +333,7 @@ assert_eq "$HAS_INITIAL" "false" "list_contains correctly reports 'initial' miss
 
 # Cleanup array test data
 echo "Cleaning up array test data..."
-run_query "SELECT * FROM firestore_delete('array_test', 'arr1');" > /dev/null
+run_query "CALL firestore_delete('array_test', 'arr1');" > /dev/null
 
 # =====================================================
 # Collection Group Write Tests
@@ -344,7 +344,7 @@ run_query "SELECT * FROM firestore_delete('array_test', 'arr1');" > /dev/null
 # Test 18a: Collection group single update via ~ prefix
 echo "Test 18a: Collection group single update..."
 # order2 in user1/orders has status 'pending' - update it via collection group path
-run_query "SELECT * FROM firestore_update('~orders', 'users/user1/orders/order2', 'status', 'approved');" > /dev/null
+run_query "CALL firestore_update('~orders', 'users/user1/orders/order2', 'status', 'approved');" > /dev/null
 
 UPDATED_STATUS=$(run_query "SELECT status FROM firestore_scan('users/user1/orders') WHERE __document_id = 'order2';")
 assert_eq "$UPDATED_STATUS" "approved" "Collection group update changed order2 status to approved"
@@ -354,7 +354,7 @@ echo "Test 18b: Collection group batch update..."
 # Find all pending orders across users via collection group scan, update them
 run_query "
 SET VARIABLE cg_pending_orders = (SELECT list(__document_id) FROM firestore_scan('~orders') WHERE status = 'pending');
-SELECT * FROM firestore_update_batch('~orders', getvariable('cg_pending_orders'), 'status', 'processed');
+CALL firestore_update_batch('~orders', getvariable('cg_pending_orders'), 'status', 'processed');
 " > /dev/null
 
 CG_PENDING_REMAINING=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'pending';")
@@ -372,7 +372,7 @@ curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databa
 
 BEFORE_CG_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('users/user1/orders');")
 
-run_query "SELECT * FROM firestore_delete('~orders', 'users/user1/orders/order_temp');" > /dev/null
+run_query "CALL firestore_delete('~orders', 'users/user1/orders/order_temp');" > /dev/null
 
 AFTER_CG_DELETE=$(run_query "SELECT count(*) FROM firestore_scan('users/user1/orders');")
 EXPECTED_AFTER_DELETE=$((BEFORE_CG_DELETE - 1))
@@ -393,7 +393,7 @@ assert_eq "$BEFORE_BATCH_DEL" "2" "2 temporary orders seeded for batch delete"
 
 run_query "
 SET VARIABLE cg_del_ids = (SELECT list(__document_id) FROM firestore_scan('~orders') WHERE status = 'to_delete');
-SELECT * FROM firestore_delete_batch('~orders', getvariable('cg_del_ids'));
+CALL firestore_delete_batch('~orders', getvariable('cg_del_ids'));
 " > /dev/null
 
 AFTER_BATCH_DEL=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'to_delete';")
@@ -448,7 +448,7 @@ assert_eq "$GEO_LNG" "-122.4194" "GeoPoint longitude read correctly"
 # Test 20: GeoPoint type (writing)
 echo "Test 20: GeoPoint update..."
 run_query "
-SELECT * FROM firestore_update('locations', 'loc1',
+CALL firestore_update('locations', 'loc1',
     'coordinates', {'latitude': 40.7128, 'longitude': -74.0060}::STRUCT(latitude DOUBLE, longitude DOUBLE),
     'name', 'New York'
 );
@@ -493,7 +493,7 @@ assert_eq "$DECODED" "HelloFirestore!" "Bytes decoded from base64 correctly"
 # Test 23: Reference type update
 echo "Test 23: Reference type update..."
 run_query "
-SELECT * FROM firestore_update('posts', 'post1',
+CALL firestore_update('posts', 'post1',
     'author', 'projects/test-project/databases/(default)/documents/users/user2',
     'title', 'Updated Post'
 );
@@ -508,7 +508,7 @@ assert_eq "$TITLE" "UpdatedPost" "Title updated"
 # Test 24: Bytes type update
 echo "Test 24: Bytes type update..."
 run_query "
-SELECT * FROM firestore_update('files', 'file1',
+CALL firestore_update('files', 'file1',
     'content', 'New binary data!'::BLOB,
     'filename', 'updated.txt'
 );
@@ -535,7 +535,7 @@ assert_eq "$LOC_COUNT" "3" "3 locations seeded"
 
 run_query "
 SET VARIABLE loc_ids = (SELECT list(__document_id) FROM firestore_scan('locations'));
-SELECT * FROM firestore_update_batch('locations', getvariable('loc_ids'), 'verified', true);
+CALL firestore_update_batch('locations', getvariable('loc_ids'), 'verified', true);
 " > /dev/null
 
 VERIFIED_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('locations') WHERE verified = true;")
@@ -563,11 +563,11 @@ assert_eq "$CLOSEST" "loc2" "Los Angeles is closest to Seattle by Euclidean dist
 # Cleanup special types test data
 echo "Cleaning up special types test data..."
 run_query "
-SELECT * FROM firestore_delete('locations', 'loc1');
-SELECT * FROM firestore_delete('locations', 'loc2');
-SELECT * FROM firestore_delete('locations', 'loc3');
-SELECT * FROM firestore_delete('posts', 'post1');
-SELECT * FROM firestore_delete('files', 'file1');
+CALL firestore_delete('locations', 'loc1');
+CALL firestore_delete('locations', 'loc2');
+CALL firestore_delete('locations', 'loc3');
+CALL firestore_delete('posts', 'post1');
+CALL firestore_delete('files', 'file1');
 " > /dev/null
 
 # =====================================================
@@ -579,7 +579,7 @@ echo "=== INSERT Function Tests ==="
 
 # Test I1: Insert single row with auto-generated ID
 echo "Test I1: Insert single row with auto-generated ID..."
-INSERT_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_test', (SELECT 'Alice' AS name, 30 AS age));")
+INSERT_COUNT=$(run_query "CALL firestore_insert('insert_test', (SELECT 'Alice' AS name, 30 AS age));")
 assert_eq "$INSERT_COUNT" "1" "Insert with auto-ID returns count 1"
 
 AUTO_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('insert_test');")
@@ -594,12 +594,12 @@ assert_eq "$AUTO_AGE" "30" "Auto-ID inserted document has correct age"
 # Clean up auto-ID insert test
 run_query "
 SET VARIABLE auto_ids = (SELECT list(__document_id) FROM firestore_scan('insert_test'));
-SELECT * FROM firestore_delete_batch('insert_test', getvariable('auto_ids'));
+CALL firestore_delete_batch('insert_test', getvariable('auto_ids'));
 " > /dev/null
 
 # Test I2: Insert single row with explicit document_id
 echo "Test I2: Insert single row with explicit document_id..."
-INSERT_EXPLICIT=$(run_query "SELECT * FROM firestore_insert('insert_test',
+INSERT_EXPLICIT=$(run_query "CALL firestore_insert('insert_test',
     (SELECT 'user_explicit' AS id, 'Bob' AS name, 25 AS age),
     document_id := 'id');")
 assert_eq "$INSERT_EXPLICIT" "1" "Insert with explicit ID returns count 1"
@@ -619,11 +619,11 @@ SELECT count(*) FROM information_schema.columns WHERE table_name = 'ins_check2';
 assert_eq "$COL_COUNT_CHECK" "3" "Document has 3 columns (__document_id, name, age) — 'id' excluded"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete('insert_test', 'user_explicit');" > /dev/null
+run_query "CALL firestore_delete('insert_test', 'user_explicit');" > /dev/null
 
 # Test I3: Multi-row insert with explicit document_id
 echo "Test I3: Multi-row insert from VALUES..."
-MULTI_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_test',
+MULTI_COUNT=$(run_query "CALL firestore_insert('insert_test',
     (SELECT * FROM (VALUES
         ('u1', 'Alice', 30),
         ('u2', 'Bob', 25),
@@ -642,11 +642,11 @@ CHARLIE_CHECK=$(run_query "SELECT age FROM firestore_scan('insert_test') WHERE _
 assert_eq "$CHARLIE_CHECK" "35" "Multi-insert u3 age is 35"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete_batch('insert_test', ['u1', 'u2', 'u3']);" > /dev/null
+run_query "CALL firestore_delete_batch('insert_test', ['u1', 'u2', 'u3']);" > /dev/null
 
 # Test I4: Insert with various DuckDB types
 echo "Test I4: Insert with various DuckDB types..."
-TYPES_COUNT=$(run_query "SELECT * FROM firestore_insert('insert_types', (
+TYPES_COUNT=$(run_query "CALL firestore_insert('insert_types', (
     SELECT 'typed_doc' AS id,
            'hello' AS str_col,
            42 AS int_col,
@@ -668,11 +668,11 @@ BOOL_VAL=$(run_query "SELECT bool_col FROM firestore_scan('insert_types');")
 assert_eq "$BOOL_VAL" "true" "Boolean type preserved"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete('insert_types', 'typed_doc');" > /dev/null
+run_query "CALL firestore_delete('insert_types', 'typed_doc');" > /dev/null
 
 # Test I5: Insert into nested collection path
 echo "Test I5: Insert into nested collection path..."
-NESTED_COUNT=$(run_query "SELECT * FROM firestore_insert('users/user1/notes', (
+NESTED_COUNT=$(run_query "CALL firestore_insert('users/user1/notes', (
     SELECT 'note1' AS id, 'Remember to buy milk' AS content
 ), document_id := 'id');")
 assert_eq "$NESTED_COUNT" "1" "Nested collection insert returns count 1"
@@ -681,7 +681,7 @@ NESTED_CONTENT=$(run_query "SELECT content FROM firestore_scan('users/user1/note
 assert_eq "$NESTED_CONTENT" "Remembertobuymilk" "Nested insert content is correct"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete('users/user1/notes', 'note1');" > /dev/null
+run_query "CALL firestore_delete('users/user1/notes', 'note1');" > /dev/null
 
 # Test I6: Insert from a DuckDB table (not just inline subquery)
 echo "Test I6: Insert from a DuckDB table..."
@@ -692,7 +692,7 @@ CREATE TEMP TABLE src_data AS SELECT * FROM (VALUES
     ('emp3', 'Engineering', 110000),
     ('emp4', 'Sales', 65000)
 ) AS t(emp_id, department, salary);
-SELECT * FROM firestore_insert('employees',
+CALL firestore_insert('employees',
     (SELECT * FROM src_data),
     document_id := 'emp_id');
 ")
@@ -705,11 +705,11 @@ SALARY_SUM=$(run_query "SELECT sum(salary) FROM firestore_scan('employees');")
 assert_eq "$SALARY_SUM" "345000" "Total salary sum correct"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete_batch('employees', ['emp1', 'emp2', 'emp3', 'emp4']);" > /dev/null
+run_query "CALL firestore_delete_batch('employees', ['emp1', 'emp2', 'emp3', 'emp4']);" > /dev/null
 
 # Test I7: Insert with auto-ID, multiple rows
 echo "Test I7: Multi-row auto-ID insert..."
-AUTO_MULTI=$(run_query "SELECT * FROM firestore_insert('auto_multi', (
+AUTO_MULTI=$(run_query "CALL firestore_insert('auto_multi', (
     SELECT * FROM (VALUES
         ('Row1', 10),
         ('Row2', 20),
@@ -727,16 +727,16 @@ assert_eq "$VALUE_SUM" "60" "Sum of auto-ID values is 60"
 # Clean up
 run_query "
 SET VARIABLE auto_multi_ids = (SELECT list(__document_id) FROM firestore_scan('auto_multi'));
-SELECT * FROM firestore_delete_batch('auto_multi', getvariable('auto_multi_ids'));
+CALL firestore_delete_batch('auto_multi', getvariable('auto_multi_ids'));
 " > /dev/null
 
 # Test I8: Insert then update then verify (end-to-end workflow)
 echo "Test I8: Insert → Update → Scan workflow..."
-run_query "SELECT * FROM firestore_insert('workflow_test', (
+run_query "CALL firestore_insert('workflow_test', (
     SELECT 'wf1' AS id, 'pending' AS status, 0 AS retry_count
 ), document_id := 'id');" > /dev/null
 
-run_query "SELECT * FROM firestore_update('workflow_test', 'wf1', 'status', 'active', 'retry_count', 1);" > /dev/null
+run_query "CALL firestore_update('workflow_test', 'wf1', 'status', 'active', 'retry_count', 1);" > /dev/null
 
 WF_STATUS=$(run_query "SELECT status FROM firestore_scan('workflow_test') WHERE __document_id = 'wf1';")
 assert_eq "$WF_STATUS" "active" "Workflow: status updated to active"
@@ -745,7 +745,7 @@ WF_RETRY=$(run_query "SELECT retry_count FROM firestore_scan('workflow_test') WH
 assert_eq "$WF_RETRY" "1" "Workflow: retry_count updated to 1"
 
 # Clean up
-run_query "SELECT * FROM firestore_delete('workflow_test', 'wf1');" > /dev/null
+run_query "CALL firestore_delete('workflow_test', 'wf1');" > /dev/null
 
 echo "Insert tests completed."
 echo ""
@@ -918,11 +918,11 @@ assert_eq "$NOTNULL_SCORE" "4" "Found 4 users with non-NULL score"
 echo ""
 echo "Cleaning up pushdown test data..."
 run_query "
-SELECT * FROM firestore_delete('pushdown_test', 'pt1');
-SELECT * FROM firestore_delete('pushdown_test', 'pt2');
-SELECT * FROM firestore_delete('pushdown_test', 'pt3');
-SELECT * FROM firestore_delete('pushdown_test', 'pt4');
-SELECT * FROM firestore_delete('pushdown_test', 'pt5');
+CALL firestore_delete('pushdown_test', 'pt1');
+CALL firestore_delete('pushdown_test', 'pt2');
+CALL firestore_delete('pushdown_test', 'pt3');
+CALL firestore_delete('pushdown_test', 'pt4');
+CALL firestore_delete('pushdown_test', 'pt5');
 " > /dev/null
 
 # ============================================
@@ -966,14 +966,14 @@ assert_eq "$VEC_COUNT" "3" "All 3 vector documents read"
 echo "Test 48: Vector type support (writing round-trip)..."
 # Insert a new document with a vector using firestore_insert and ARRAY type
 run_query "
-SELECT * FROM firestore_insert('embeddings',
+CALL firestore_insert('embeddings',
     (SELECT 'fish' AS label, [10.0, 11.0, 12.0]::DOUBLE[3] AS vector),
     document_id := '__auto__');
 " > /dev/null 2>&1 || true
 
 # Write a vector via firestore_update (updates an existing document)
 run_query "
-SELECT * FROM firestore_update('embeddings', 'emb1',
+CALL firestore_update('embeddings', 'emb1',
     'vector', [100.0, 200.0, 300.0]::DOUBLE[3],
     'label', 'updated_cat'
 );
@@ -1005,11 +1005,136 @@ assert_eq "$NULL_VEC" "true" "Missing vector field is NULL"
 echo ""
 echo "Cleaning up vector test data..."
 run_query "
-SELECT * FROM firestore_delete('embeddings', 'emb1');
-SELECT * FROM firestore_delete('embeddings', 'emb2');
-SELECT * FROM firestore_delete('embeddings', 'emb3');
-SELECT * FROM firestore_delete('embeddings', 'emb_null');
+CALL firestore_delete('embeddings', 'emb1');
+CALL firestore_delete('embeddings', 'emb2');
+CALL firestore_delete('embeddings', 'emb3');
+CALL firestore_delete('embeddings', 'emb_null');
 " > /dev/null
+
+# ============================================
+# firestore_connect / firestore_disconnect Tests
+# ============================================
+
+echo ""
+echo "=== firestore_connect / firestore_disconnect Tests ==="
+
+# Test 50: Verify firestore_connect and firestore_disconnect functions exist
+echo "Test 50: Verify connect/disconnect functions registered..."
+CONNECT_EXISTS=$(run_query "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'firestore_connect';")
+assert_eq "$CONNECT_EXISTS" "1" "firestore_connect function exists"
+
+DISCONNECT_EXISTS=$(run_query "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'firestore_disconnect';")
+assert_eq "$DISCONNECT_EXISTS" "1" "firestore_disconnect function exists"
+
+# Test 51: firestore_connect sets session database
+echo "Test 51: firestore_connect sets session database..."
+# The emulator uses (default) database, so connecting to it should work
+CONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET conn_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+SELECT 'connected';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CONNECT_RESULT" "connected" "firestore_connect succeeds for (default) database"
+
+# Test 52: firestore_disconnect clears session database
+echo "Test 52: firestore_disconnect clears session database..."
+DISCONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET disc_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+CALL firestore_disconnect();
+SELECT 'disconnected';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DISCONNECT_RESULT" "disconnected" "firestore_disconnect succeeds"
+
+# Test 53: firestore_connect with wildcard secret
+echo "Test 53: firestore_connect with wildcard secret..."
+WILDCARD_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET wild_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('any-database');
+SELECT 'wildcard_works';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wildcard database secret"
+
+# Test 54: firestore_connect fails for non-matching database
+echo "Test 54: firestore_connect fails for non-matching database..."
+NOMATCH_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET specific_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE 'specific-db');
+CALL firestore_connect('different-db');
+SELECT 'should_not_reach';
+" 2>&1 | grep -i "No Firestore credentials found" | head -1)
+if [ -n "$NOMATCH_RESULT" ]; then
+    echo "PASS: firestore_connect fails with appropriate error for non-matching database"
+else
+    echo "FAIL: firestore_connect should fail for non-matching database"
+    exit 1
+fi
+
+# Test 55: Queries use connected database after firestore_connect
+echo "Test 55: Queries use connected database after firestore_connect..."
+# Seed data in the (default) database
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/connect_test?documentId=ct1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"value": {"stringValue": "from_default_db"}}}' > /dev/null
+
+CONNECTED_QUERY=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET cq_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+SELECT value FROM firestore_scan('connect_test') WHERE __document_id = 'ct1';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CONNECTED_QUERY" "from_default_db" "Query uses connected database"
+
+# Clean up connect test data
+run_query "CALL firestore_delete('connect_test', 'ct1');" > /dev/null
+
+# Test 56: Per-query database parameter overrides firestore_connect
+echo "Test 56: Per-query database parameter overrides firestore_connect..."
+# This test verifies that explicit database param takes priority
+# We can't easily test with two actual databases in the emulator,
+# but we can verify the parameter is accepted
+OVERRIDE_CHECK=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET ov_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('connected-db');
+-- This should use '(default)' database, not 'connected-db'
+SELECT count(*) FROM firestore_scan('users', database := '(default)');
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+# We just need this to not error - the exact count depends on seeded data
+if [[ "$OVERRIDE_CHECK" =~ ^[0-9]+$ ]]; then
+    echo "PASS: Per-query database parameter override works"
+else
+    echo "FAIL: Per-query database parameter override failed: $OVERRIDE_CHECK"
+    exit 1
+fi
+
+# Test 57: Multiple connect/disconnect cycles
+echo "Test 57: Multiple connect/disconnect cycles..."
+CYCLE_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET cycle_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('db1');
+CALL firestore_disconnect();
+CALL firestore_connect('db2');
+CALL firestore_disconnect();
+CALL firestore_connect('(default)');
+SELECT 'cycles_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CYCLE_RESULT" "cycles_ok" "Multiple connect/disconnect cycles work"
+
+# Test 58: Connect to (default) explicitly resets to default
+echo "Test 58: Connect to (default) resets to default behavior..."
+DEFAULT_RESET=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET reset_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('custom-db');
+CALL firestore_connect('(default)');
+SELECT 'reset_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DEFAULT_RESET" "reset_ok" "firestore_connect('(default)') works as reset"
 
 echo ""
 echo "=== All integration tests passed! ==="

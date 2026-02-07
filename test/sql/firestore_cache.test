@@ -1,0 +1,109 @@
+# name: test/sql/firestore_cache.test
+# description: Test firestore schema cache functions
+# group: [sql]
+
+# Require the extension
+require fire_duck_ext
+
+# ============================================
+# firestore_clear_cache() Function Tests
+# ============================================
+
+# Test: firestore_clear_cache() with no arguments should succeed
+statement ok
+CALL firestore_clear_cache();
+
+# Test: firestore_clear_cache() with collection argument should succeed
+statement ok
+CALL firestore_clear_cache('users');
+
+# Test: firestore_clear_cache() with collection group argument should succeed
+statement ok
+CALL firestore_clear_cache('~orders');
+
+# Test: firestore_clear_cache() with nested collection should succeed
+statement ok
+CALL firestore_clear_cache('users/user1/orders');
+
+# Test: firestore_clear_cache() with empty string should succeed (same as no argument)
+statement ok
+CALL firestore_clear_cache('');
+
+# ============================================
+# Cache Behavior Tests
+# ============================================
+
+# Create a secret for testing (required for firestore_scan to work)
+statement ok
+CREATE SECRET cache_test_firestore (
+    TYPE firestore,
+    PROJECT_ID 'cache-test-project',
+    API_KEY 'cache-test-key'
+);
+
+# Test: Clear cache before testing to ensure clean state
+statement ok
+CALL firestore_clear_cache();
+
+# Test: Calling firestore_scan will fail (no real Firestore), but cache functions should still work
+statement error
+SELECT * FROM firestore_scan('test_collection');
+----
+
+# Test: Clear cache for specific collection after failed scan
+statement ok
+CALL firestore_clear_cache('test_collection');
+
+# Test: Clear all cache after failed scan
+statement ok
+CALL firestore_clear_cache();
+
+# ============================================
+# Multiple Collection Cache Clear Tests
+# ============================================
+
+# Clear specific collections one by one
+statement ok
+CALL firestore_clear_cache('collection1');
+
+statement ok
+CALL firestore_clear_cache('collection2');
+
+statement ok
+CALL firestore_clear_cache('~collection_group1');
+
+# Clear all at once
+statement ok
+CALL firestore_clear_cache();
+
+# ============================================
+# Edge Cases
+# ============================================
+
+# Test: Clear cache with special characters in collection name
+statement ok
+CALL firestore_clear_cache('users/user-123/orders');
+
+# Test: Multiple consecutive cache clears should not cause issues
+statement ok
+CALL firestore_clear_cache();
+
+statement ok
+CALL firestore_clear_cache();
+
+statement ok
+CALL firestore_clear_cache();
+
+# Test: Clear specific then clear all
+statement ok
+CALL firestore_clear_cache('users');
+
+statement ok
+CALL firestore_clear_cache();
+
+
+# ============================================
+# Clean up
+# ============================================
+statement ok
+DROP SECRET cache_test_firestore;

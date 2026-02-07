@@ -12,8 +12,8 @@ namespace duckdb {
 
 // ============================================================================
 // INSERT function implementation (table-in-out)
-// Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))
-//        SELECT * FROM firestore_insert('collection', (SELECT ...), document_id := 'id_col')
+// Usage: CALL firestore_insert('collection', (SELECT col1, col2 FROM ...))
+//        CALL firestore_insert('collection', (SELECT ...), document_id := 'id_col')
 // ============================================================================
 
 struct FirestoreInsertBindData : public TableFunctionData {
@@ -83,7 +83,7 @@ static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, Tabl
 
 	if (result->column_names.empty()) {
 		throw BinderException("firestore_insert requires a subquery with at least one column. "
-		                      "Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))");
+		                      "Usage: CALL firestore_insert('collection', (SELECT col1, col2 FROM ...))");
 	}
 
 	// Resolve document_id column if specified
@@ -248,7 +248,7 @@ static OperatorFinalizeResultType FirestoreInsertFinal(ExecutionContext &context
 
 // ============================================================================
 // UPDATE function implementation
-// Usage: SELECT * FROM firestore_update('collection', 'doc_id', 'field1', value1, ...)
+// Usage: CALL firestore_update('collection', 'doc_id', 'field1', value1, ...)
 // ============================================================================
 
 struct FirestoreUpdateBindData : public TableFunctionData {
@@ -378,7 +378,7 @@ static void FirestoreUpdateFunction(ClientContext &context, TableFunctionInput &
 
 // ============================================================================
 // DELETE function implementation
-// Usage: SELECT * FROM firestore_delete('collection', 'doc_id')
+// Usage: CALL firestore_delete('collection', 'doc_id')
 // ============================================================================
 
 struct FirestoreDeleteBindData : public TableFunctionData {
@@ -474,7 +474,7 @@ static void FirestoreDeleteFunction(ClientContext &context, TableFunctionInput &
 
 // ============================================================================
 // BATCH UPDATE function implementation
-// Usage: SELECT * FROM firestore_update_batch('collection', ['id1','id2',...], 'field1', value1, ...)
+// Usage: CALL firestore_update_batch('collection', ['id1','id2',...], 'field1', value1, ...)
 // ============================================================================
 
 struct FirestoreUpdateBatchBindData : public TableFunctionData {
@@ -656,7 +656,7 @@ static void FirestoreUpdateBatchFunction(ClientContext &context, TableFunctionIn
 
 // ============================================================================
 // BATCH DELETE function implementation
-// Usage: SELECT * FROM firestore_delete_batch('collection', ['id1','id2',...])
+// Usage: CALL firestore_delete_batch('collection', ['id1','id2',...])
 // ============================================================================
 
 struct FirestoreDeleteBatchBindData : public TableFunctionData {
@@ -985,8 +985,8 @@ struct FirestoreCopyGlobalState : public GlobalTableFunctionState {
 
 void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	// Register firestore_insert table function (table-in-out)
-	// Usage: SELECT * FROM firestore_insert('collection', (SELECT col1, col2 FROM ...))
-	//        SELECT * FROM firestore_insert('collection', (SELECT ...), document_id := 'id_col')
+	// Usage: CALL firestore_insert('collection', (SELECT col1, col2 FROM ...))
+	//        CALL firestore_insert('collection', (SELECT ...), document_id := 'id_col')
 	TableFunction insert_func("firestore_insert", {LogicalType::VARCHAR, LogicalType::TABLE}, nullptr,
 	                          FirestoreInsertBind, FirestoreInsertInitGlobal, FirestoreInsertInitLocal);
 
@@ -1002,7 +1002,7 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(insert_func);
 
 	// Register firestore_update table function
-	// Usage: SELECT * FROM firestore_update('collection', 'doc_id', 'field1', value1, ...)
+	// Usage: CALL firestore_update('collection', 'doc_id', 'field1', value1, ...)
 	TableFunction update_func("firestore_update",
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR}, // collection, document_id
 	                          FirestoreUpdateFunction, FirestoreUpdateBind, FirestoreUpdateInitGlobal);
@@ -1016,7 +1016,7 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(update_func);
 
 	// Register firestore_delete table function
-	// Usage: SELECT * FROM firestore_delete('collection', 'doc_id')
+	// Usage: CALL firestore_delete('collection', 'doc_id')
 	TableFunction delete_func("firestore_delete",
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR}, // collection, document_id
 	                          FirestoreDeleteFunction, FirestoreDeleteBind, FirestoreDeleteInitGlobal);
@@ -1029,7 +1029,7 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(delete_func);
 
 	// Register firestore_update_batch table function
-	// Usage: SELECT * FROM firestore_update_batch('collection', ['id1','id2'], 'field1', value1, ...)
+	// Usage: CALL firestore_update_batch('collection', ['id1','id2'], 'field1', value1, ...)
 	TableFunction update_batch_func(
 	    "firestore_update_batch", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
 	    FirestoreUpdateBatchFunction, FirestoreUpdateBatchBind, FirestoreUpdateBatchInitGlobal);
@@ -1043,7 +1043,7 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(update_batch_func);
 
 	// Register firestore_delete_batch table function
-	// Usage: SELECT * FROM firestore_delete_batch('collection', ['id1','id2'])
+	// Usage: CALL firestore_delete_batch('collection', ['id1','id2'])
 	TableFunction delete_batch_func(
 	    "firestore_delete_batch", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
 	    FirestoreDeleteBatchFunction, FirestoreDeleteBatchBind, FirestoreDeleteBatchInitGlobal);
