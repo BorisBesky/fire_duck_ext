@@ -14,9 +14,9 @@ void RegisterFirestoreSecretType(ExtensionLoader &loader);
 
 // Get Firestore credentials from the secret manager
 // If target_database is provided, only returns credentials that match that database
-std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientContext &context,
-                                                                        const std::string &secret_name = "",
-                                                                        const std::optional<std::string> &target_database = std::nullopt);
+std::shared_ptr<FirestoreCredentials>
+GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &secret_name = "",
+                                  const std::optional<std::string> &target_database = std::nullopt);
 
 // Try to get credentials from various sources (secret, parameters, env)
 std::shared_ptr<FirestoreCredentials>

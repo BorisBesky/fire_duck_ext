@@ -140,9 +140,9 @@ bool DatabaseMatchesSecret(const Value &secret_db_value, const std::string &targ
 	return false;
 }
 
-std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientContext &context,
-                                                                        const std::string &secret_name,
-                                                                        const std::optional<std::string> &target_database) {
+std::shared_ptr<FirestoreCredentials>
+GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &secret_name,
+                                  const std::optional<std::string> &target_database) {
 	auto &secret_manager = SecretManager::Get(context);
 
 	// Try to find a firestore secret
@@ -199,6 +199,31 @@ std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientCo
 		}
 	}
 
+	// Check cache for secret-based credentials (keeps access token alive across queries)
+	std::string cache_key;
+	if (auth_type == "service_account") {
+		auto sa_json_it = secret.secret_map.find("service_account_json");
+		if (sa_json_it == secret.secret_map.end()) {
+			throw InvalidInputException("Firestore secret missing service_account_json");
+		}
+		cache_key = "secret:service_account:" + sa_json_it->second.ToString() + ":" + database_id;
+	} else if (auth_type == "api_key") {
+		auto api_key_it = secret.secret_map.find("api_key");
+		if (api_key_it == secret.secret_map.end()) {
+			throw InvalidInputException("Firestore secret missing api_key");
+		}
+		cache_key = "secret:api_key:" + project_id + ":" + database_id + ":" + api_key_it->second.ToString();
+	}
+
+	if (!cache_key.empty()) {
+		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+		auto it = credentials_cache.find(cache_key);
+		if (it != credentials_cache.end()) {
+			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
+			return it->second;
+		}
+	}
+
 	std::shared_ptr<FirestoreCredentials> creds;
 	if (auth_type == "service_account") {
 		auto sa_json_it = secret.secret_map.find("service_account_json");
@@ -218,6 +243,13 @@ std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientCo
 
 	// Set database_id on credentials
 	creds->database_id = database_id;
+
+	// Store secret-based credentials in cache
+	if (!cache_key.empty()) {
+		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+		credentials_cache[cache_key] = creds;
+		FS_LOG_DEBUG("Credentials cached for: " + cache_key);
+	}
 	return creds;
 }
 
@@ -235,9 +267,8 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		effective_database_id = GetConnectedDatabase(context);
 	}
 
-	// Only cache credentials from file paths (service accounts) since they need token refresh caching.
-	// Secrets and env vars are not cached to ensure proper test isolation and to pick up
-	// any changes to secrets during the session.
+	// Only cache credentials from file paths/env vars here; secret-based caching is handled
+	// inside GetFirestoreCredentialsFromSecret.
 	// Cache key includes database_id to avoid returning wrong database for cached credentials.
 	std::string cache_key;
 	bool should_cache = false;

@@ -204,8 +204,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		    "create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.");
 	}
 
-	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
-	                        result->collection;
+	std::string cache_key =
+	    result->credentials->project_id + ":" + result->credentials->database_id + ":" + result->collection;
 	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);

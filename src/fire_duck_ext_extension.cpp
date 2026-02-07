@@ -27,7 +27,8 @@ struct FirestoreOneShotState : public GlobalTableFunctionState {
 	bool finished = false;
 };
 
-static unique_ptr<GlobalTableFunctionState> FirestoreOneShotInit(ClientContext &context, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> FirestoreOneShotInit(ClientContext &context,
+                                                                 TableFunctionInitInput &input) {
 	return make_uniq<FirestoreOneShotState>();
 }
 
@@ -55,7 +56,7 @@ static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInp
 static unique_ptr<FunctionData> FirestoreClearCacheBindAll(ClientContext &context, TableFunctionBindInput &input,
                                                            vector<LogicalType> &return_types, vector<string> &names) {
 	// Table functions must return at least one column
-	names.push_back("success");
+	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 
 	auto result = make_uniq<FirestoreClearCacheBindData>();
@@ -68,7 +69,7 @@ static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext 
                                                                   vector<LogicalType> &return_types,
                                                                   vector<string> &names) {
 	// Table functions must return at least one column
-	names.push_back("success");
+	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 
 	auto result = make_uniq<FirestoreClearCacheBindData>();
@@ -88,7 +89,7 @@ struct FirestoreConnectBindData : public TableFunctionData {
 // Bind for firestore_connect(database_id)
 static unique_ptr<FunctionData> FirestoreConnectBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types, vector<string> &names) {
-	names.push_back("success");
+	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 
 	auto result = make_uniq<FirestoreConnectBindData>();
@@ -126,7 +127,7 @@ static void FirestoreConnectFunction(ClientContext &context, TableFunctionInput 
 // Bind for firestore_disconnect()
 static unique_ptr<FunctionData> FirestoreDisconnectBind(ClientContext &context, TableFunctionBindInput &input,
                                                         vector<LogicalType> &return_types, vector<string> &names) {
-	names.push_back("success");
+	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 	return make_uniq<TableFunctionData>();
 }
