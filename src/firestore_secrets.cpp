@@ -66,7 +66,7 @@ void EnsureFirestoreEnvSecret(DatabaseInstance &db) {
 		auto secret =
 		    make_uniq<KeyValueSecret>(vector<string> {}, FIRESTORE_SECRET_TYPE, "env", FIRESTORE_ENV_SECRET_NAME);
 		secret->secret_map["project_id"] = creds->project_id;
-		secret->secret_map["database_id"] = Value("(default)");
+		secret->secret_map["database_id"] = Value("*");
 		secret->secret_map["service_account_json"] = std::string(env_creds);
 		secret->secret_map["auth_type"] = Value("service_account");
 
