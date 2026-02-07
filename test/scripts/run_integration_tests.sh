@@ -1011,5 +1011,130 @@ CALL firestore_delete('embeddings', 'emb3');
 CALL firestore_delete('embeddings', 'emb_null');
 " > /dev/null
 
+# ============================================
+# firestore_connect / firestore_disconnect Tests
+# ============================================
+
+echo ""
+echo "=== firestore_connect / firestore_disconnect Tests ==="
+
+# Test 50: Verify firestore_connect and firestore_disconnect functions exist
+echo "Test 50: Verify connect/disconnect functions registered..."
+CONNECT_EXISTS=$(run_query "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'firestore_connect';")
+assert_eq "$CONNECT_EXISTS" "1" "firestore_connect function exists"
+
+DISCONNECT_EXISTS=$(run_query "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'firestore_disconnect';")
+assert_eq "$DISCONNECT_EXISTS" "1" "firestore_disconnect function exists"
+
+# Test 51: firestore_connect sets session database
+echo "Test 51: firestore_connect sets session database..."
+# The emulator uses (default) database, so connecting to it should work
+CONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET conn_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+SELECT 'connected';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CONNECT_RESULT" "connected" "firestore_connect succeeds for (default) database"
+
+# Test 52: firestore_disconnect clears session database
+echo "Test 52: firestore_disconnect clears session database..."
+DISCONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET disc_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+CALL firestore_disconnect();
+SELECT 'disconnected';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DISCONNECT_RESULT" "disconnected" "firestore_disconnect succeeds"
+
+# Test 53: firestore_connect with wildcard secret
+echo "Test 53: firestore_connect with wildcard secret..."
+WILDCARD_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET wild_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('any-database');
+SELECT 'wildcard_works';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wildcard database secret"
+
+# Test 54: firestore_connect fails for non-matching database
+echo "Test 54: firestore_connect fails for non-matching database..."
+NOMATCH_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET specific_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE 'specific-db');
+CALL firestore_connect('different-db');
+SELECT 'should_not_reach';
+" 2>&1 | grep -i "No Firestore credentials found" | head -1)
+if [ -n "$NOMATCH_RESULT" ]; then
+    echo "PASS: firestore_connect fails with appropriate error for non-matching database"
+else
+    echo "FAIL: firestore_connect should fail for non-matching database"
+    exit 1
+fi
+
+# Test 55: Queries use connected database after firestore_connect
+echo "Test 55: Queries use connected database after firestore_connect..."
+# Seed data in the (default) database
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/connect_test?documentId=ct1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"value": {"stringValue": "from_default_db"}}}' > /dev/null
+
+CONNECTED_QUERY=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET cq_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CALL firestore_connect('(default)');
+SELECT value FROM firestore_scan('connect_test') WHERE __document_id = 'ct1';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CONNECTED_QUERY" "from_default_db" "Query uses connected database"
+
+# Clean up connect test data
+run_query "CALL firestore_delete('connect_test', 'ct1');" > /dev/null
+
+# Test 56: Per-query database parameter overrides firestore_connect
+echo "Test 56: Per-query database parameter overrides firestore_connect..."
+# This test verifies that explicit database param takes priority
+# We can't easily test with two actual databases in the emulator,
+# but we can verify the parameter is accepted
+OVERRIDE_CHECK=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET ov_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('connected-db');
+-- This should use '(default)' database, not 'connected-db'
+SELECT count(*) FROM firestore_scan('users', database := '(default)');
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+# We just need this to not error - the exact count depends on seeded data
+if [[ "$OVERRIDE_CHECK" =~ ^[0-9]+$ ]]; then
+    echo "PASS: Per-query database parameter override works"
+else
+    echo "FAIL: Per-query database parameter override failed: $OVERRIDE_CHECK"
+    exit 1
+fi
+
+# Test 57: Multiple connect/disconnect cycles
+echo "Test 57: Multiple connect/disconnect cycles..."
+CYCLE_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET cycle_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('db1');
+CALL firestore_disconnect();
+CALL firestore_connect('db2');
+CALL firestore_disconnect();
+CALL firestore_connect('(default)');
+SELECT 'cycles_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$CYCLE_RESULT" "cycles_ok" "Multiple connect/disconnect cycles work"
+
+# Test 58: Connect to (default) explicitly resets to default
+echo "Test 58: Connect to (default) resets to default behavior..."
+DEFAULT_RESET=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET reset_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CALL firestore_connect('custom-db');
+CALL firestore_connect('(default)');
+SELECT 'reset_ok';
+" 2>&1 | tail -1 | tr -d '[:space:]"')
+assert_eq "$DEFAULT_RESET" "reset_ok" "firestore_connect('(default)') works as reset"
+
 echo ""
 echo "=== All integration tests passed! ==="

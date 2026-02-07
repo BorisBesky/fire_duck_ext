@@ -15,6 +15,11 @@ static constexpr const char *FIRESTORE_SECRET_TYPE = "firestore";
 static std::unordered_map<std::string, std::shared_ptr<FirestoreCredentials>> credentials_cache;
 static std::mutex credentials_cache_mutex;
 
+// Session-scoped connected database storage
+// Maps ClientContext pointer to the connected database_id
+static std::unordered_map<const ClientContext *, std::string> connected_databases;
+static std::mutex connected_db_mutex;
+
 // Create secret from configuration options
 static unique_ptr<BaseSecret> CreateFirestoreSecretFromConfig(ClientContext &context, CreateSecretInput &input) {
 	auto scope = input.scope;
@@ -83,8 +88,61 @@ void RegisterFirestoreSecretType(ExtensionLoader &loader) {
 	loader.RegisterFunction(config_function);
 }
 
+// ============================================================================
+// Session-scoped database connection management
+// ============================================================================
+
+std::optional<std::string> GetConnectedDatabase(ClientContext &context) {
+	std::lock_guard<std::mutex> lock(connected_db_mutex);
+	auto it = connected_databases.find(&context);
+	if (it != connected_databases.end()) {
+		return it->second;
+	}
+	return std::nullopt;
+}
+
+void SetConnectedDatabase(ClientContext &context, const std::string &database_id) {
+	std::lock_guard<std::mutex> lock(connected_db_mutex);
+	connected_databases[&context] = database_id;
+	FS_LOG_DEBUG("Connected to database: " + database_id);
+}
+
+void ClearConnectedDatabase(ClientContext &context) {
+	std::lock_guard<std::mutex> lock(connected_db_mutex);
+	connected_databases.erase(&context);
+	FS_LOG_DEBUG("Disconnected from database");
+}
+
+bool DatabaseMatchesSecret(const Value &secret_db_value, const std::string &target_db) {
+	// Handle VARCHAR type (single value or wildcard)
+	if (secret_db_value.type().id() == LogicalTypeId::VARCHAR) {
+		std::string db_str = secret_db_value.ToString();
+		// Wildcard matches all databases
+		if (db_str == "*") {
+			return true;
+		}
+		// Exact match
+		return db_str == target_db;
+	}
+
+	// Handle LIST type (array of databases)
+	if (secret_db_value.type().id() == LogicalTypeId::LIST) {
+		auto &list = ListValue::GetChildren(secret_db_value);
+		for (const auto &item : list) {
+			if (item.ToString() == target_db) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Unknown type - no match
+	return false;
+}
+
 std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientContext &context,
-                                                                        const std::string &secret_name) {
+                                                                        const std::string &secret_name,
+                                                                        const std::optional<std::string> &target_database) {
 	auto &secret_manager = SecretManager::Get(context);
 
 	// Try to find a firestore secret
@@ -96,6 +154,23 @@ std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientCo
 	}
 
 	auto &secret = dynamic_cast<const KeyValueSecret &>(secret_match.GetSecret());
+
+	// If target database is specified, check if this secret matches
+	if (target_database.has_value()) {
+		auto database_id_it = secret.secret_map.find("database_id");
+		if (database_id_it != secret.secret_map.end()) {
+			if (!DatabaseMatchesSecret(database_id_it->second, target_database.value())) {
+				// This secret doesn't match the target database
+				FS_LOG_DEBUG("Secret doesn't match target database: " + target_database.value());
+				return nullptr;
+			}
+		} else {
+			// No database_id in secret means it only works for "(default)"
+			if (target_database.value() != "(default)") {
+				return nullptr;
+			}
+		}
+	}
 
 	// Get project ID
 	auto project_id_it = secret.secret_map.find("project_id");
@@ -111,11 +186,17 @@ std::shared_ptr<FirestoreCredentials> GetFirestoreCredentialsFromSecret(ClientCo
 	}
 	std::string auth_type = auth_type_it->second.ToString();
 
-	// Get database_id (optional, defaults to "(default)")
-	std::string database_id = "(default)";
+	// Get database_id - use target_database if specified, otherwise from secret
+	std::string database_id = target_database.value_or("(default)");
 	auto database_id_it = secret.secret_map.find("database_id");
-	if (database_id_it != secret.secret_map.end()) {
-		database_id = database_id_it->second.ToString();
+	if (!target_database.has_value() && database_id_it != secret.secret_map.end()) {
+		// If no target specified, use the secret's database_id (if it's a single value)
+		if (database_id_it->second.type().id() == LogicalTypeId::VARCHAR) {
+			std::string db_val = database_id_it->second.ToString();
+			if (db_val != "*") {
+				database_id = db_val;
+			}
+		}
 	}
 
 	std::shared_ptr<FirestoreCredentials> creds;
@@ -145,20 +226,31 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
                                                                   const std::optional<std::string> &credentials_path,
                                                                   const std::optional<std::string> &api_key,
                                                                   const std::optional<std::string> &database_id) {
+	// Determine effective database_id:
+	// 1. Explicit database_id parameter takes priority
+	// 2. Fall back to connected database (from firestore_connect)
+	// 3. Otherwise use default behavior (from secret or "(default)")
+	std::optional<std::string> effective_database_id = database_id;
+	if (!effective_database_id.has_value()) {
+		effective_database_id = GetConnectedDatabase(context);
+	}
+
 	// Only cache credentials from file paths (service accounts) since they need token refresh caching.
 	// Secrets and env vars are not cached to ensure proper test isolation and to pick up
 	// any changes to secrets during the session.
+	// Cache key includes database_id to avoid returning wrong database for cached credentials.
 	std::string cache_key;
 	bool should_cache = false;
+	std::string db_suffix = effective_database_id.value_or("(default)");
 
 	if (credentials_path.has_value()) {
-		cache_key = "path:" + credentials_path.value();
+		cache_key = "path:" + credentials_path.value() + ":" + db_suffix;
 		should_cache = true;
 	} else {
 		// Check environment variable path for caching
 		const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
 		if (env_creds && strlen(env_creds) > 0 && !api_key.has_value()) {
-			cache_key = "env:" + std::string(env_creds);
+			cache_key = "env:" + std::string(env_creds) + ":" + db_suffix;
 			should_cache = true;
 		}
 	}
@@ -168,13 +260,8 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
 		auto it = credentials_cache.find(cache_key);
 		if (it != credentials_cache.end()) {
-			auto cached_creds = it->second;
-			// Apply database_id if explicitly provided (may differ per query)
-			if (database_id.has_value()) {
-				cached_creds->database_id = database_id.value();
-			}
 			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
-			return cached_creds;
+			return it->second;
 		}
 	}
 
@@ -191,9 +278,9 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		}
 		creds = FirestoreAuthManager::CreateApiKeyCredentials(project_id.value(), api_key.value());
 	}
-	// Priority 3: DuckDB secret manager
+	// Priority 3: DuckDB secret manager (with database filtering)
 	else {
-		creds = GetFirestoreCredentialsFromSecret(context);
+		creds = GetFirestoreCredentialsFromSecret(context, "", effective_database_id);
 	}
 
 	// Priority 4: GOOGLE_APPLICATION_CREDENTIALS environment variable
@@ -209,9 +296,9 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		return nullptr;
 	}
 
-	// Apply database_id if explicitly provided (overrides secret value)
-	if (database_id.has_value()) {
-		creds->database_id = database_id.value();
+	// Apply effective_database_id (overrides secret value)
+	if (effective_database_id.has_value()) {
+		creds->database_id = effective_database_id.value();
 	}
 
 	// Store in cache (only for file-based credentials that need token refresh)

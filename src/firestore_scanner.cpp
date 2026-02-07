@@ -40,13 +40,13 @@ void ClearFirestoreSchemaCache(const std::string &collection) {
 		schema_cache.clear();
 		FS_LOG_DEBUG("Schema cache cleared (all entries)");
 	} else {
-		// Clear entries that match the collection (cache key format is "project_id:collection")
+		// Clear entries that match the collection (cache key format is "project_id:database_id:collection")
 		auto it = schema_cache.begin();
 		int cleared = 0;
 		while (it != schema_cache.end()) {
 			// Check if the cache key ends with ":collection"
 			const std::string &key = it->first;
-			size_t colon_pos = key.find(':');
+			size_t colon_pos = key.rfind(':'); // Find LAST colon to extract collection
 			if (colon_pos != std::string::npos) {
 				std::string cached_collection = key.substr(colon_pos + 1);
 				if (cached_collection == collection) {
@@ -205,7 +205,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		    "create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.");
 	}
 
-	std::string cache_key = result->credentials->project_id + ":" + result->collection;
+	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
+	                        result->collection;
 	{
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		auto it = schema_cache.find(cache_key);
