@@ -48,7 +48,7 @@ void ClearFirestoreCredentialsCache() {
 
 void EnsureFirestoreEnvSecret(DatabaseInstance &db) {
 	const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
-	if (!env_creds || strlen(env_creds) == 0) {
+	if (!env_creds || std::string(env_creds).empty()) {
 		return;
 	}
 

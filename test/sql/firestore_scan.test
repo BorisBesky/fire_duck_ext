@@ -9,7 +9,7 @@ require fire_duck_ext
 statement error
 SELECT * FROM firestore_scan('test_collection');
 ----
-|No Firestore credentials found. Provide credentials parameter, create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.
+No Firestore credentials found. Provide credentials parameter, create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.
 
 # Test with explicit parameters (will fail without valid credentials)
 statement error

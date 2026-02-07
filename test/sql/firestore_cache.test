@@ -48,6 +48,8 @@ CALL firestore_clear_cache();
 # Test: Calling firestore_scan will fail (no real Firestore), but cache functions should still work
 statement error
 SELECT * FROM firestore_scan('test_collection');
+----
+
 # Test: Clear cache for specific collection after failed scan
 statement ok
 CALL firestore_clear_cache('test_collection');

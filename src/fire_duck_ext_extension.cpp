@@ -47,7 +47,6 @@ static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInp
 
 	auto &bind_data = data.bind_data->Cast<FirestoreClearCacheBindData>();
 	ClearFirestoreSchemaCache(bind_data.collection);
-	ClearFirestoreCredentialsCache();
 	FlatVector::GetData<bool>(output.data[0])[0] = true;
 	output.SetCardinality(1);
 	state.finished = true;
@@ -167,7 +166,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register write functions
 	RegisterFirestoreWriteFunctions(loader);
 
-	// Register cache clear function: SELECT * FROM firestore_clear_cache()
+	// Register cache clear function: call firestore_clear_cache()
 	// Overload 1: No arguments - clears entire cache
 	TableFunction clear_cache_all("firestore_clear_cache", {}, FirestoreClearCacheFunction, FirestoreClearCacheBindAll,
 	                              FirestoreOneShotInit);
