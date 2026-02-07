@@ -18,13 +18,12 @@ struct CachedSchemaEntry {
 	std::shared_ptr<FirestoreIndexCache> index_cache;
 	std::chrono::steady_clock::time_point cached_at;
 
-	bool IsExpired() const {
-		int64_t ttl = FirestoreSettings::SchemaCacheTTLSeconds();
-		if (ttl == 0) {
+	bool IsExpired(int64_t ttl_seconds) const {
+		if (ttl_seconds == 0) {
 			return true; // Cache disabled
 		}
 		auto age = std::chrono::steady_clock::now() - cached_at;
-		return age > std::chrono::seconds(ttl);
+		return age > std::chrono::seconds(ttl_seconds);
 	}
 };
 
@@ -207,10 +206,11 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
 	                        result->collection;
+	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		auto it = schema_cache.find(cache_key);
-		if (it != schema_cache.end() && !it->second.IsExpired()) {
+		if (it != schema_cache.end() && !it->second.IsExpired(ttl_seconds)) {
 			// Check if cached schema is empty (collection was empty when cached)
 			// If so, remove stale entry and re-infer to get fresh error
 			if (it->second.schema.empty()) {

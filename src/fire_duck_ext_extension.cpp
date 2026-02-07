@@ -152,7 +152,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register extension options
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("firestore_schema_cache_ttl", "Schema cache TTL in seconds (0 to disable caching)",
-	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::SchemaCacheTTLSeconds()),
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultSchemaCacheTTLSeconds),
 	                          FirestoreSettings::SetSchemaCacheTTLSeconds);
 
 	// Register the firestore secret type for credential management
