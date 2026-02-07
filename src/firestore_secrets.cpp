@@ -280,16 +280,22 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 	}
 
 	if (!cache_key.empty()) {
-		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
-		auto it = credentials_cache.find(cache_key);
-		if (it != credentials_cache.end()) {
+		std::shared_ptr<FirestoreCredentials> cached_creds;
+		{
+			std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+			auto it = credentials_cache.find(cache_key);
+			if (it != credentials_cache.end()) {
+				cached_creds = it->second;
+			}
+		}
+		if (cached_creds) {
 			auto refreshed_match = secret_manager.LookupSecret(transaction, "firestore", FIRESTORE_SECRET_TYPE);
 			if (!refreshed_match.HasMatch()) {
 				PurgeSecretCredentialsCache();
 				return nullptr;
 			}
 			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
-			return it->second;
+			return cached_creds;
 		}
 	}
 
