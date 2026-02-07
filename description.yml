@@ -1,7 +1,7 @@
 extension:
   name: fire_duck_ext
   description: Query Google Cloud Firestore directly from DuckDB using SQL
-  version: 0.1.0
+  version: 0.1.1
   language: C++
   build: cmake
   license: MIT

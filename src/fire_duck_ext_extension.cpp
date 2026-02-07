@@ -200,7 +200,7 @@ std::string FireDuckExtExtension::Version() const {
 #ifdef EXT_VERSION_FIRE_DUCK_EXT
 	return EXT_VERSION_FIRE_DUCK_EXT;
 #else
-	return "v0.1.0";
+	return "v0.1.1";
 #endif
 }
 
