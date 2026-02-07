@@ -66,7 +66,7 @@ void EnsureFirestoreEnvSecret(DatabaseInstance &db) {
 		auto secret =
 		    make_uniq<KeyValueSecret>(vector<string> {}, FIRESTORE_SECRET_TYPE, "env", FIRESTORE_ENV_SECRET_NAME);
 		secret->secret_map["project_id"] = creds->project_id;
-		secret->secret_map["database_id"] = Value("(default)");
+		secret->secret_map["database_id"] = Value("*");
 		secret->secret_map["service_account_json"] = std::string(env_creds);
 		secret->secret_map["auth_type"] = Value("service_account");
 
@@ -280,16 +280,22 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 	}
 
 	if (!cache_key.empty()) {
-		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
-		auto it = credentials_cache.find(cache_key);
-		if (it != credentials_cache.end()) {
+		std::shared_ptr<FirestoreCredentials> cached_creds;
+		{
+			std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+			auto it = credentials_cache.find(cache_key);
+			if (it != credentials_cache.end()) {
+				cached_creds = it->second;
+			}
+		}
+		if (cached_creds) {
 			auto refreshed_match = secret_manager.LookupSecret(transaction, "firestore", FIRESTORE_SECRET_TYPE);
 			if (!refreshed_match.HasMatch()) {
 				PurgeSecretCredentialsCache();
 				return nullptr;
 			}
 			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
-			return it->second;
+			return cached_creds;
 		}
 	}
 
