@@ -1,19 +1,82 @@
 #include "firestore_secrets.hpp"
 #include "firestore_logger.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/enums/on_create_conflict.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace duckdb {
 
 // Secret type name
 static constexpr const char *FIRESTORE_SECRET_TYPE = "firestore";
+static constexpr const char *FIRESTORE_ENV_SECRET_NAME = "__firestore_env__";
 
 // Credentials cache - keeps credentials with their access tokens alive across queries
 static std::unordered_map<std::string, std::shared_ptr<FirestoreCredentials>> credentials_cache;
 static std::mutex credentials_cache_mutex;
+
+static void PurgeSecretCredentialsCache() {
+	std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+	int removed = 0;
+	for (auto it = credentials_cache.begin(); it != credentials_cache.end();) {
+		if (it->first.rfind("secret:", 0) == 0) {
+			it = credentials_cache.erase(it);
+			removed++;
+			continue;
+		}
+		++it;
+	}
+	if (removed > 0) {
+		FS_LOG_DEBUG("Secret credentials cache purged: " + std::to_string(removed) + " entries removed");
+	}
+}
+
+void ClearFirestoreCredentialsCache() {
+	std::lock_guard<std::mutex> lock(credentials_cache_mutex);
+	if (credentials_cache.empty()) {
+		return;
+	}
+	int removed = static_cast<int>(credentials_cache.size());
+	credentials_cache.clear();
+	FS_LOG_DEBUG("Credentials cache cleared: " + std::to_string(removed) + " entries removed");
+}
+
+void EnsureFirestoreEnvSecret(DatabaseInstance &db) {
+	const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
+	if (!env_creds || strlen(env_creds) == 0) {
+		return;
+	}
+
+	auto &secret_manager = SecretManager::Get(db);
+	auto transaction = CatalogTransaction::GetSystemTransaction(db);
+
+	// If the env secret already exists, don't override it.
+	auto existing = secret_manager.GetSecretByName(transaction, FIRESTORE_ENV_SECRET_NAME);
+	if (existing) {
+		return;
+	}
+
+	try {
+		auto creds = FirestoreAuthManager::LoadServiceAccount(env_creds);
+		auto secret =
+		    make_uniq<KeyValueSecret>(vector<string> {}, FIRESTORE_SECRET_TYPE, "env", FIRESTORE_ENV_SECRET_NAME);
+		secret->secret_map["project_id"] = creds->project_id;
+		secret->secret_map["database_id"] = Value("(default)");
+		secret->secret_map["service_account_json"] = std::string(env_creds);
+		secret->secret_map["auth_type"] = Value("service_account");
+
+		secret_manager.RegisterSecret(transaction, std::move(secret), OnCreateConflict::IGNORE_ON_CONFLICT,
+		                              SecretPersistType::TEMPORARY);
+		FS_LOG_DEBUG("Env Firestore secret registered: " + std::string(FIRESTORE_ENV_SECRET_NAME));
+	} catch (const std::exception &ex) {
+		FS_LOG_WARN("Failed to register env Firestore secret: " + std::string(ex.what()));
+	}
+}
 
 // Session-scoped connected database storage
 // Maps ClientContext pointer to the connected database_id
@@ -150,6 +213,7 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 	auto secret_match = secret_manager.LookupSecret(transaction, "firestore", FIRESTORE_SECRET_TYPE);
 
 	if (!secret_match.HasMatch()) {
+		PurgeSecretCredentialsCache();
 		return nullptr;
 	}
 
@@ -219,6 +283,11 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 		std::lock_guard<std::mutex> lock(credentials_cache_mutex);
 		auto it = credentials_cache.find(cache_key);
 		if (it != credentials_cache.end()) {
+			auto refreshed_match = secret_manager.LookupSecret(transaction, "firestore", FIRESTORE_SECRET_TYPE);
+			if (!refreshed_match.HasMatch()) {
+				PurgeSecretCredentialsCache();
+				return nullptr;
+			}
 			FS_LOG_DEBUG("Credentials cache hit for: " + cache_key);
 			return it->second;
 		}
@@ -267,7 +336,7 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 		effective_database_id = GetConnectedDatabase(context);
 	}
 
-	// Only cache credentials from file paths/env vars here; secret-based caching is handled
+	// Only cache credentials from file paths here; secret-based caching is handled
 	// inside GetFirestoreCredentialsFromSecret.
 	// Cache key includes database_id to avoid returning wrong database for cached credentials.
 	std::string cache_key;
@@ -277,13 +346,6 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 	if (credentials_path.has_value()) {
 		cache_key = "path:" + credentials_path.value() + ":" + db_suffix;
 		should_cache = true;
-	} else {
-		// Check environment variable path for caching
-		const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
-		if (env_creds && strlen(env_creds) > 0 && !api_key.has_value()) {
-			cache_key = "env:" + std::string(env_creds) + ":" + db_suffix;
-			should_cache = true;
-		}
 	}
 
 	// Check cache first (only for file-based credentials)
@@ -312,14 +374,6 @@ std::shared_ptr<FirestoreCredentials> ResolveFirestoreCredentials(ClientContext 
 	// Priority 3: DuckDB secret manager (with database filtering)
 	else {
 		creds = GetFirestoreCredentialsFromSecret(context, "", effective_database_id);
-	}
-
-	// Priority 4: GOOGLE_APPLICATION_CREDENTIALS environment variable
-	if (!creds) {
-		const char *env_creds = std::getenv("GOOGLE_APPLICATION_CREDENTIALS");
-		if (env_creds && strlen(env_creds) > 0) {
-			creds = FirestoreAuthManager::LoadServiceAccount(env_creds);
-		}
 	}
 
 	// No credentials found

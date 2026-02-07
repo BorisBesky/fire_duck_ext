@@ -47,6 +47,7 @@ static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInp
 
 	auto &bind_data = data.bind_data->Cast<FirestoreClearCacheBindData>();
 	ClearFirestoreSchemaCache(bind_data.collection);
+	ClearFirestoreCredentialsCache();
 	FlatVector::GetData<bool>(output.data[0])[0] = true;
 	output.SetCardinality(1);
 	state.finished = true;
@@ -158,6 +159,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);
+	EnsureFirestoreEnvSecret(loader.GetDatabaseInstance());
 
 	// Register table scan function: firestore_scan('collection')
 	RegisterFirestoreScanFunction(loader);

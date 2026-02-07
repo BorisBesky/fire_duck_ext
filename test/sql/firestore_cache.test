@@ -100,3 +100,10 @@ CALL firestore_clear_cache('users');
 
 statement ok
 CALL firestore_clear_cache();
+
+
+# ============================================
+# Clean up
+# ============================================
+statement ok
+DROP SECRET cache_test_firestore;

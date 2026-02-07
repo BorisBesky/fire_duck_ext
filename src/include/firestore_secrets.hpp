@@ -12,6 +12,9 @@ class ExtensionLoader;
 // Register the firestore secret type and providers
 void RegisterFirestoreSecretType(ExtensionLoader &loader);
 
+// Create the env-backed secret if GOOGLE_APPLICATION_CREDENTIALS is set
+void EnsureFirestoreEnvSecret(DatabaseInstance &db);
+
 // Get Firestore credentials from the secret manager
 // If target_database is provided, only returns credentials that match that database
 std::shared_ptr<FirestoreCredentials>
@@ -24,6 +27,9 @@ ResolveFirestoreCredentials(ClientContext &context, const std::optional<std::str
                             const std::optional<std::string> &credentials_path,
                             const std::optional<std::string> &api_key,
                             const std::optional<std::string> &database_id = std::nullopt);
+
+// Clear all cached credentials (service account and API key)
+void ClearFirestoreCredentialsCache();
 
 // ============================================================================
 // Session-scoped database connection management
