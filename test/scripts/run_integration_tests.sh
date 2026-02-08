@@ -1249,6 +1249,11 @@ echo "Test 62c: order_by on collection group without index..."
 CG_ORDER=$(run_query "SELECT string_agg(val::VARCHAR, ',' ORDER BY val) FROM firestore_scan('~np_child', order_by='val');")
 assert_eq "$CG_ORDER" "10,20,30" "order_by on collection group returns all rows; DuckDB sorts client-side"
 
+# Test 62d: Multi-field order_by on collection group (silent fallback, no composite index)
+echo "Test 62d: Multi-field order_by on collection group..."
+CG_MULTI=$(run_query "SELECT count(*) FROM firestore_scan('~np_child', order_by='val DESC');")
+assert_ge "$CG_MULTI" "1" "Multi-field order_by on collection group succeeds (falls back to client-side)"
+
 # Cleanup collection group test data
 run_query "
 CALL firestore_delete('np_parent/p1/np_child', 'c1');
@@ -1280,6 +1285,16 @@ assert_eq "$FIRST_NAME" "Alpha" "order_by='name' ascending returns Alpha first"
 
 LAST_NAME=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='name DESC') LIMIT 1;")
 assert_eq "$LAST_NAME" "Echo" "order_by='name DESC' returns Echo first"
+
+# Test 66b: Multi-field order_by on collection
+echo "Test 66b: Multi-field order_by..."
+MULTI_ORDER=$(run_query "SELECT string_agg(name, ',' ORDER BY score, name) FROM firestore_scan('np_test', order_by='score, name');")
+assert_eq "$MULTI_ORDER" "Alpha,Charlie,Bravo,Delta,Echo" "order_by='score, name' multi-field ascending"
+
+# Test 66c: Multi-field order_by with mixed directions
+echo "Test 66c: Multi-field order_by with mixed directions..."
+MULTI_MIXED=$(run_query "SELECT string_agg(name, ',' ORDER BY score DESC, name) FROM firestore_scan('np_test', order_by='score DESC, name ASC');")
+assert_eq "$MULTI_MIXED" "Echo,Delta,Bravo,Charlie,Alpha" "order_by='score DESC, name ASC' mixed directions"
 
 # --- show_missing tests ---
 

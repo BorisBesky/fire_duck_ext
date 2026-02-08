@@ -201,12 +201,15 @@ SELECT * FROM firestore_scan('users', database='my-other-db');
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `scan_limit` | BIGINT | Maximum number of documents to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. Use SQL `LIMIT` when you need exact result-count control. |
-| `order_by` | VARCHAR | Server-side ordering. Specify a field name, optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`). |
+| `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). Multi-field ordering requires a composite index. |
 | `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
 SELECT * FROM firestore_scan('leaderboard', order_by='score DESC', scan_limit=10);
+
+-- Multi-field ordering
+SELECT * FROM firestore_scan('leaderboard', order_by='category, score DESC');
 
 -- Exclude phantom/missing documents
 SELECT * FROM firestore_scan('users', show_missing=false);

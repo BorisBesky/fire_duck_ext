@@ -90,28 +90,28 @@ static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
 	return f.field_path + " " + f.firestore_op + " " + val_str;
 }
 
-// Returns true if the order_by field has a supporting index for the query's scope.
+// Returns true if the order_by fields have supporting indexes for the query's scope.
+// Single-field ordering uses single-field indexes; multi-field ordering requires composite indexes.
 // When no index exists (e.g. collection group without explicit index), returns false
 // so the caller can skip server-side ordering and let DuckDB sort client-side.
 static bool CanOrderByOnServer(const FirestoreScanBindData &bind_data) {
-	if (!bind_data.order_by.has_value()) {
+	if (bind_data.parsed_order_by.empty()) {
 		return false;
 	}
 	if (!bind_data.index_cache || !bind_data.index_cache->fetch_succeeded) {
 		return true; // Conservative: assume ordering works when index info unavailable
 	}
 
-	// Parse field name from order_by string (e.g. "score DESC" → "score")
-	std::string field_name = bind_data.order_by.value();
-	size_t space = field_name.find(' ');
-	if (space != std::string::npos) {
-		field_name = field_name.substr(0, space);
-	}
-
 	auto scope = bind_data.is_collection_group ? FirestoreIndex::QueryScope::COLLECTION_GROUP
 	                                           : FirestoreIndex::QueryScope::COLLECTION;
 
-	return HasSingleFieldIndex(field_name, *bind_data.index_cache, scope);
+	if (bind_data.parsed_order_by.size() == 1) {
+		// Single-field: use single-field index check
+		return HasSingleFieldIndex(bind_data.parsed_order_by[0].field_path, *bind_data.index_cache, scope);
+	}
+
+	// Multi-field: requires composite index with matching field order and directions
+	return HasCompositeOrderByIndex(bind_data.parsed_order_by, *bind_data.index_cache, scope);
 }
 
 // pushdown_complex_filter callback: extracts filter expressions for Firestore pushdown
@@ -217,6 +217,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->limit = kv.second.GetValue<int64_t>();
 		} else if (kv.first == "order_by") {
 			result->order_by = kv.second.GetValue<string>();
+			result->parsed_order_by = ParseOrderByString(result->order_by.value());
 		} else if (kv.first == "show_missing") {
 			result->show_missing = kv.second.GetValue<bool>();
 		}
@@ -421,19 +422,23 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		// Add orderBy - Firestore requires inequality/range filter fields to appear
 		// before __name__ in the orderBy clause
 		if (CanOrderByOnServer(bind_data)) {
-			std::string order_str = bind_data.order_by.value();
-			std::string field_name = order_str;
-			std::string direction = "ASCENDING";
-			size_t space_pos = order_str.find(' ');
-			if (space_pos != std::string::npos) {
-				field_name = order_str.substr(0, space_pos);
-				std::string dir_str = order_str.substr(space_pos + 1);
-				if (dir_str == "DESC" || dir_str == "desc") {
-					direction = "DESCENDING";
+			json order_by_arr = json::array();
+			for (auto &ob : bind_data.parsed_order_by) {
+				order_by_arr.push_back({{"field", {{"fieldPath", ob.field_path}}}, {"direction", ob.direction}});
+			}
+			// Append __name__ for cursor-based pagination if not already present
+			bool has_name = false;
+			for (auto &ob : bind_data.parsed_order_by) {
+				if (ob.field_path == "__name__") {
+					has_name = true;
+					break;
 				}
 			}
-			sq["orderBy"] = {{{"field", {{"fieldPath", field_name}}}, {"direction", direction}}};
-		} else if (bind_data.order_by.has_value()) {
+			if (!has_name) {
+				order_by_arr.push_back({{"field", {{"fieldPath", "__name__"}}}, {"direction", "ASCENDING"}});
+			}
+			sq["orderBy"] = order_by_arr;
+		} else if (!bind_data.parsed_order_by.empty()) {
 			FS_LOG_DEBUG("Skipping server-side order_by in pushdown query (no supporting index)");
 		}
 
@@ -504,8 +509,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			// need to fetch full pages to avoid missing matching documents.
 			// The scan_limit is still enforced in FirestoreScanFunction after DuckDB filtering.
 			if (CanOrderByOnServer(bind_data)) {
-				query.order_by = bind_data.order_by.value();
-			} else if (bind_data.order_by.has_value()) {
+				query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
+			} else if (!bind_data.parsed_order_by.empty()) {
 				FS_LOG_DEBUG("Skipping server-side order_by in fallback (no supporting index)");
 			}
 
@@ -529,8 +534,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
 		}
 		if (CanOrderByOnServer(bind_data)) {
-			query.order_by = bind_data.order_by.value();
-		} else if (bind_data.order_by.has_value()) {
+			query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
+		} else if (!bind_data.parsed_order_by.empty()) {
 			FS_LOG_DEBUG("Skipping server-side order_by (no supporting index); DuckDB will sort client-side");
 		}
 
@@ -595,13 +600,28 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 					break;
 				}
 
-				// Use the last document's __name__ as cursor for startAfter
+				// Build cursor values from last document for all orderBy fields
 				auto &last_doc = global_state.documents.back();
-				json cursor_value = {{"referenceValue", last_doc.name}};
+				json cursor_values = json::array();
+
+				if (global_state.structured_query.contains("orderBy")) {
+					for (auto &ob_entry : global_state.structured_query["orderBy"]) {
+						std::string fp = ob_entry["field"]["fieldPath"].get<std::string>();
+						if (fp == "__name__") {
+							cursor_values.push_back({{"referenceValue", last_doc.name}});
+						} else if (last_doc.fields.contains(fp)) {
+							cursor_values.push_back(last_doc.fields[fp]);
+						} else {
+							cursor_values.push_back({{"nullValue", nullptr}});
+						}
+					}
+				} else {
+					cursor_values.push_back({{"referenceValue", last_doc.name}});
+				}
 
 				// Update the structured query with startAt cursor
 				json paginated_query = global_state.structured_query;
-				paginated_query["startAt"] = {{"values", {cursor_value}}, {"before", false}};
+				paginated_query["startAt"] = {{"values", cursor_values}, {"before", false}};
 
 				auto response =
 				    global_state.client->RunQuery(bind_data.collection, paginated_query, bind_data.is_collection_group);
@@ -625,8 +645,8 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				FirestoreQuery query;
 				query.show_missing = bind_data.show_missing;
 				query.page_token = global_state.next_page_token;
-				if (bind_data.order_by.has_value()) {
-					query.order_by = bind_data.order_by.value();
+				if (!bind_data.parsed_order_by.empty()) {
+					query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
 				}
 
 				auto response = global_state.client->ListDocuments(bind_data.collection, query);

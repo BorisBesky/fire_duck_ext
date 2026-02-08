@@ -22,6 +22,7 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Query options
 	std::optional<int64_t> limit;
 	std::optional<std::string> order_by;
+	std::vector<OrderByField> parsed_order_by; // Parsed from order_by string at bind time
 
 	// Collection group query flag - when true, __document_id returns full path
 	bool is_collection_group = false;

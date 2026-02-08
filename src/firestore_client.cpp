@@ -479,21 +479,12 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 	    {"limit", query.page_size}};
 
 	if (query.order_by.has_value()) {
-		// Parse order_by (e.g., "createdAt DESC")
-		std::string order_str = query.order_by.value();
-		std::string field_name = order_str;
-		std::string direction = "ASCENDING";
-
-		size_t space_pos = order_str.find(' ');
-		if (space_pos != std::string::npos) {
-			field_name = order_str.substr(0, space_pos);
-			std::string dir_str = order_str.substr(space_pos + 1);
-			if (dir_str == "DESC" || dir_str == "desc") {
-				direction = "DESCENDING";
-			}
+		auto parsed = ParseOrderByString(query.order_by.value());
+		json order_by_arr = json::array();
+		for (auto &ob : parsed) {
+			order_by_arr.push_back({{"field", {{"fieldPath", ob.field_path}}}, {"direction", ob.direction}});
 		}
-
-		structured_query["orderBy"] = {{{"field", {{"fieldPath", field_name}}}, {"direction", direction}}};
+		structured_query["orderBy"] = order_by_arr;
 	}
 
 	FirestoreErrorContext ctx;
