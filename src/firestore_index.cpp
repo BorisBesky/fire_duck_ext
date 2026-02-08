@@ -127,8 +127,9 @@ json BuildWhereClause(const std::vector<FirestorePushdownFilter> &filters) {
 
 bool HasSingleFieldIndex(const std::string &field_path, const FirestoreIndexCache &cache,
                          FirestoreIndex::QueryScope scope) {
-	// If default single-field indexing is enabled, every field has indexes
-	if (cache.default_single_field_enabled) {
+	// Default single-field indexes only cover COLLECTION scope, not COLLECTION_GROUP.
+	// Collection group queries require explicit collection group-scoped indexes.
+	if (cache.default_single_field_enabled && scope == FirestoreIndex::QueryScope::COLLECTION) {
 		return true;
 	}
 

@@ -51,6 +51,11 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	json structured_query;       // Cached StructuredQuery for pagination
 	bool uses_run_query = false; // Whether using :runQuery (true when filters pushed)
 
+	// When true, filter pushdown failed and DuckDB filters client-side.
+	// scan_limit must NOT be enforced in FirestoreScanFunction because
+	// it would cut off rows before DuckDB's FILTER node runs.
+	bool pushdown_failed = false;
+
 	// Pagination optimization: track page size to detect end of results
 	int64_t query_page_size = 1000; // The page size used in the query
 	bool last_page_was_full = true; // Whether last fetch returned a full page

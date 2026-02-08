@@ -267,7 +267,9 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
 	// Only send showMissing=true when talking to production Firestore.
-	if (query.show_missing && GetEmulatorHost().empty()) {
+	// Firestore API does not allow showMissing and orderBy together (HTTP 400),
+	// so skip showMissing when an order_by is specified.
+	if (query.show_missing && GetEmulatorHost().empty() && !query.order_by.has_value()) {
 		add_param("showMissing", "true");
 	}
 

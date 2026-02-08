@@ -175,33 +175,72 @@ CREATE SECRET emulator (
 | `firestore_array_remove('collection', 'doc_id', 'field', ['v1', ...])` | Remove from array |
 | `firestore_array_append('collection', 'doc_id', 'field', ['v1', ...])` | Append to array |
 
-## Insert
+## Named Parameters
 
-`firestore_insert` takes a collection name and a subquery, and inserts each row as a Firestore document.
+All functions accept these credential override parameters, allowing per-call control over which project and database to target:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `database` | VARCHAR | Override the database ID for this call (instead of the secret's default). |
+| `project_id` | VARCHAR | Override the project ID for this call. |
+| `api_key` | VARCHAR | Override the API key for this call. |
+| `credentials` | VARCHAR | Path to a service account JSON file to use for this call. |
+
+```sql
+-- Write to a specific database
+CALL firestore_update('users', 'user1', 'status', 'active', database='my-other-db');
+
+-- Read from a specific database
+SELECT * FROM firestore_scan('users', database='my-other-db');
+```
+
+### Scan Parameters
+
+`firestore_scan` accepts additional parameters:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `scan_limit` | BIGINT | Maximum number of documents to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. Use SQL `LIMIT` when you need exact result-count control. |
+| `order_by` | VARCHAR | Server-side ordering. Specify a field name, optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`). |
+| `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
+
+```sql
+-- Fetch only the top 10 documents ordered by score
+SELECT * FROM firestore_scan('leaderboard', order_by='score DESC', scan_limit=10);
+
+-- Exclude phantom/missing documents
+SELECT * FROM firestore_scan('users', show_missing=false);
+```
+
+### Insert Parameters
+
+`firestore_insert` accepts one additional parameter:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `document_id` | VARCHAR | Column name to use as the Firestore document ID. That column is excluded from the document fields. If omitted, Firestore auto-generates IDs. |
 
 ```sql
 -- Auto-generated document IDs
-call firestore_insert('users', (
+CALL firestore_insert('users', (
     SELECT name, age FROM read_csv('new_users.csv')
 ));
 
 -- Explicit document IDs from a column
-call firestore_insert('users',
+CALL firestore_insert('users',
     (SELECT user_id, name, age FROM read_csv('new_users.csv')),
     document_id := 'user_id');
 
 -- Insert from a DuckDB table
-call firestore_insert('employees',
+CALL firestore_insert('employees',
     (SELECT * FROM employee_staging),
     document_id := 'emp_id');
 
 -- Insert into nested collections
-call firestore_insert('users/user1/notes', (
+CALL firestore_insert('users/user1/notes', (
     SELECT 'note1' AS id, 'Remember to buy milk' AS content
 ), document_id := 'id');
 ```
-
-The `document_id` parameter specifies which column to use as the Firestore document ID. That column is excluded from the document fields. If omitted, Firestore auto-generates IDs.
 
 ## Type Mapping
 
@@ -274,7 +313,7 @@ By default, `firestore_scan()` includes "phantom" documents — documents that h
 SELECT * FROM firestore_scan('artifacts/default-app-id/users');
 
 -- Opt out to only return documents with fields
-SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing := false);
+SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing=false);
 ```
 
 When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.

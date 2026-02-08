@@ -90,6 +90,30 @@ static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
 	return f.field_path + " " + f.firestore_op + " " + val_str;
 }
 
+// Returns true if the order_by field has a supporting index for the query's scope.
+// When no index exists (e.g. collection group without explicit index), returns false
+// so the caller can skip server-side ordering and let DuckDB sort client-side.
+static bool CanOrderByOnServer(const FirestoreScanBindData &bind_data) {
+	if (!bind_data.order_by.has_value()) {
+		return false;
+	}
+	if (!bind_data.index_cache || !bind_data.index_cache->fetch_succeeded) {
+		return true; // Conservative: assume ordering works when index info unavailable
+	}
+
+	// Parse field name from order_by string (e.g. "score DESC" → "score")
+	std::string field_name = bind_data.order_by.value();
+	size_t space = field_name.find(' ');
+	if (space != std::string::npos) {
+		field_name = field_name.substr(0, space);
+	}
+
+	auto scope = bind_data.is_collection_group ? FirestoreIndex::QueryScope::COLLECTION_GROUP
+	                                           : FirestoreIndex::QueryScope::COLLECTION;
+
+	return HasSingleFieldIndex(field_name, *bind_data.index_cache, scope);
+}
+
 // pushdown_complex_filter callback: extracts filter expressions for Firestore pushdown
 // but leaves all expressions in the vector so DuckDB re-applies them as post-scan filters.
 // This ensures correctness - Firestore filtering is used for performance (reduce network transfer)
@@ -153,7 +177,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["credentials"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["database"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["limit"] = LogicalType::BIGINT;
+	scan_func.named_parameters["scan_limit"] = LogicalType::BIGINT;
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
 
@@ -189,7 +213,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			api_key = kv.second.GetValue<string>();
 		} else if (kv.first == "database") {
 			database_id = kv.second.GetValue<string>();
-		} else if (kv.first == "limit") {
+		} else if (kv.first == "scan_limit") {
 			result->limit = kv.second.GetValue<int64_t>();
 		} else if (kv.first == "order_by") {
 			result->order_by = kv.second.GetValue<string>();
@@ -396,7 +420,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		// Add orderBy - Firestore requires inequality/range filter fields to appear
 		// before __name__ in the orderBy clause
-		if (bind_data.order_by.has_value()) {
+		if (CanOrderByOnServer(bind_data)) {
 			std::string order_str = bind_data.order_by.value();
 			std::string field_name = order_str;
 			std::string direction = "ASCENDING";
@@ -409,7 +433,11 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 				}
 			}
 			sq["orderBy"] = {{{"field", {{"fieldPath", field_name}}}, {"direction", direction}}};
-		} else {
+		} else if (bind_data.order_by.has_value()) {
+			FS_LOG_DEBUG("Skipping server-side order_by in pushdown query (no supporting index)");
+		}
+
+		if (!sq.contains("orderBy")) {
 			// Build orderBy: inequality/range fields first, then __name__ last.
 			// Firestore requires inequality filter fields (range, NOT_EQUAL, NOT_IN,
 			// IS_NOT_NULL) to appear in orderBy before __name__.
@@ -467,14 +495,18 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			global_state->pushdown_result = FirestoreFilterResult {};
 			global_state->uses_run_query = false;
 			global_state->structured_query = {};
+			global_state->pushdown_failed = true;
 
 			FirestoreQuery query;
 			query.show_missing = bind_data.show_missing;
-			if (bind_data.limit.has_value()) {
-				query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
-			}
-			if (bind_data.order_by.has_value()) {
+			// Note: do NOT apply scan_limit to page_size here. The filters that were
+			// supposed to run on Firestore will now run client-side in DuckDB, so we
+			// need to fetch full pages to avoid missing matching documents.
+			// The scan_limit is still enforced in FirestoreScanFunction after DuckDB filtering.
+			if (CanOrderByOnServer(bind_data)) {
 				query.order_by = bind_data.order_by.value();
+			} else if (bind_data.order_by.has_value()) {
+				FS_LOG_DEBUG("Skipping server-side order_by in fallback (no supporting index)");
 			}
 
 			if (bind_data.is_collection_group) {
@@ -490,11 +522,16 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		// No filter pushdown - use existing query paths
 		FirestoreQuery query;
 		query.show_missing = bind_data.show_missing;
-		if (bind_data.limit.has_value()) {
+		// Only apply scan_limit to page_size when there are no unpushed filters.
+		// If DuckDB will filter client-side, we need full pages to avoid missing matches.
+		bool unpushed = !bind_data.candidate_pushdown_filters.empty();
+		if (bind_data.limit.has_value() && !unpushed) {
 			query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
 		}
-		if (bind_data.order_by.has_value()) {
+		if (CanOrderByOnServer(bind_data)) {
 			query.order_by = bind_data.order_by.value();
+		} else if (bind_data.order_by.has_value()) {
+			FS_LOG_DEBUG("Skipping server-side order_by (no supporting index); DuckDB will sort client-side");
 		}
 
 		if (bind_data.is_collection_group) {
@@ -531,8 +568,14 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	idx_t count = 0;
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
-	// Apply limit if specified
-	if (bind_data.limit.has_value()) {
+	// Apply limit if specified.
+	// Skip when DuckDB will filter client-side: the scan emits rows before DuckDB's FILTER
+	// node, so cutting off here would drop rows that might match the WHERE clause.
+	// This happens when: (a) pushdown was attempted but failed at runtime, or
+	// (b) candidate filters exist but none were pushed (e.g. collection group without indexes).
+	bool has_unpushed_filters =
+	    !bind_data.candidate_pushdown_filters.empty() && !global_state.pushdown_result.has_pushdown();
+	if (bind_data.limit.has_value() && !global_state.pushdown_failed && !has_unpushed_filters) {
 		idx_t total_returned = global_state.current_index;
 		if (total_returned >= static_cast<idx_t>(bind_data.limit.value())) {
 			global_state.finished = true;
