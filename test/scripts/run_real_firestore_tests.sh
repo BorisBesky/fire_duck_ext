@@ -60,6 +60,17 @@ $1
 " 2>&1 | tail -1 | tr -d '[:space:]"'
 }
 
+# Like run_query but dumps debug logs to stderr and full output
+run_query_debug() {
+    echo "  [DEBUG] Full output:" >&2
+    FIRESTORE_LOG_LEVEL=debug $DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+SET firestore_schema_cache_ttl=0;
+CREATE SECRET __fs (TYPE firestore, PROJECT_ID '${PROJECT_ID}', SERVICE_ACCOUNT_JSON '${SA_PATH}');
+$1
+" 2>&1 | tee /dev/stderr | tail -1 | tr -d '[:space:]"'
+}
+
 assert_eq() {
     local actual="$1"
     local expected="$2"
@@ -82,6 +93,47 @@ assert_ge() {
     else
         echo "PASS: $msg"
     fi
+}
+
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local msg="$3"
+    # Strip box-drawing chars and collapse whitespace (EXPLAIN wraps in visual boxes)
+    local flat
+    flat=$(echo "$haystack" | sed 's/[│┌┐└┘├┤┬┴┼─╴╶╵╷═║╔╗╚╝╠╣╦╩╬]//g' | tr '\n' ' ' | sed 's/  */ /g')
+    if echo "$flat" | grep -qF "$needle"; then
+        echo "PASS: $msg"
+    else
+        echo "FAIL: $msg (expected output to contain '$needle')"
+        echo "  Actual output: $haystack"
+        exit 1
+    fi
+}
+
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local msg="$3"
+    local flat
+    flat=$(echo "$haystack" | sed 's/[│┌┐└┘├┤┬┴┼─╴╶╵╷═║╔╗╚╝╠╣╦╩╬]//g' | tr '\n' ' ' | sed 's/  */ /g')
+    if echo "$flat" | grep -qF "$needle"; then
+        echo "FAIL: $msg (expected output NOT to contain '$needle')"
+        echo "  Actual output: $haystack"
+        exit 1
+    else
+        echo "PASS: $msg"
+    fi
+}
+
+# Like run_query but returns full multi-line output (for EXPLAIN)
+run_explain() {
+    $DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+SET firestore_schema_cache_ttl=0;
+CREATE SECRET __fs (TYPE firestore, PROJECT_ID '${PROJECT_ID}', SERVICE_ACCOUNT_JSON '${SA_PATH}');
+$1
+" 2>&1
 }
 
 # --- Index creation (idempotent) ---
@@ -259,6 +311,196 @@ RESULT=$(run_query \
     "SELECT count(*) FROM firestore_scan('fde_ci_test', order_by='score DESC, name DESC');")
 assert_eq "$RESULT" "5" \
     "composite order_by DESC gracefully falls back (no DESC index)"
+
+# =============================================
+# SQL ORDER BY / LIMIT Pushdown Tests
+# These test the optimizer extension that extracts ORDER BY and LIMIT from
+# standard SQL and pushes them to Firestore server-side.
+# =============================================
+
+echo ""
+echo "=== Running SQL ORDER BY / LIMIT pushdown tests ==="
+
+# Test 5: SQL ORDER BY pushdown — single field ascending
+echo "Test 5: SQL ORDER BY single field ascending..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') ORDER BY score LIMIT 1;")
+assert_eq "$RESULT" "Alpha" \
+    "SQL ORDER BY score ASC pushes to Firestore (Alpha has lowest score)"
+
+# Test 6: SQL ORDER BY pushdown — single field descending
+echo "Test 6: SQL ORDER BY single field descending..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') ORDER BY score DESC LIMIT 1;")
+assert_eq "$RESULT" "Echo" \
+    "SQL ORDER BY score DESC pushes to Firestore (Echo has highest score)"
+
+# Test 7: SQL LIMIT pushdown — limits documents fetched from Firestore
+echo "Test 7: SQL LIMIT pushdown..."
+RESULT=$(run_query \
+    "SELECT count(*) FROM (SELECT * FROM firestore_scan('fde_ci_test') LIMIT 3);")
+assert_eq "$RESULT" "3" \
+    "SQL LIMIT 3 returns exactly 3 rows"
+
+# Test 8: SQL ORDER BY + LIMIT combined
+echo "Test 8: SQL ORDER BY + LIMIT combined..."
+RESULT=$(run_query \
+    "SELECT string_agg(name, ',' ORDER BY score DESC) FROM (SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score DESC LIMIT 2) sub;")
+assert_eq "$RESULT" "Echo,Delta" \
+    "SQL ORDER BY score DESC LIMIT 2 returns top 2 scorers"
+
+# Test 9: SQL ORDER BY + LIMIT — ascending top 3
+echo "Test 9: SQL ORDER BY + LIMIT ascending top 3..."
+RESULT=$(run_query \
+    "SELECT string_agg(name, ',' ORDER BY score) FROM (SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score LIMIT 3) sub;")
+assert_eq "$RESULT" "Alpha,Charlie,Bravo" \
+    "SQL ORDER BY score ASC LIMIT 3 returns bottom 3 scorers"
+
+# Test 10: Named param order_by takes precedence over SQL ORDER BY
+# Named param says score ASC, SQL says score DESC — named param should win.
+echo "Test 10: Named param order_by takes precedence over SQL ORDER BY..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test', order_by='score') ORDER BY score DESC LIMIT 1;")
+# DuckDB re-applies ORDER BY DESC on results, so first row after re-sort is Echo.
+# The key behavior: named param order_by='score' (ASC) is sent to Firestore.
+# DuckDB then re-sorts DESC and returns Echo.
+assert_eq "$RESULT" "Echo" \
+    "Named param order_by takes precedence (DuckDB re-sorts client-side)"
+
+# Test 11: Named scan_limit takes precedence over SQL LIMIT
+echo "Test 11: Named scan_limit takes precedence over SQL LIMIT..."
+RESULT=$(run_query \
+    "SELECT count(*) FROM firestore_scan('fde_ci_test', scan_limit=2) LIMIT 10;")
+assert_eq "$RESULT" "2" \
+    "Named scan_limit=2 takes precedence over SQL LIMIT 10"
+
+# Test 12: SQL ORDER BY + LIMIT + WHERE (all three pushed)
+echo "Test 12: SQL ORDER BY + LIMIT + WHERE combined..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') WHERE score > 20 ORDER BY score DESC LIMIT 1;")
+assert_eq "$RESULT" "Echo" \
+    "WHERE score > 20 + ORDER BY DESC + LIMIT 1 returns Echo (score=50)"
+
+# Test 13: SQL ORDER BY on string field
+echo "Test 13: SQL ORDER BY on string field..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') ORDER BY name LIMIT 1;")
+assert_eq "$RESULT" "Alpha" \
+    "SQL ORDER BY name ASC returns Alpha first"
+
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') ORDER BY name DESC LIMIT 1;")
+assert_eq "$RESULT" "Echo" \
+    "SQL ORDER BY name DESC returns Echo first"
+
+# Test 14: SQL LIMIT + OFFSET pushdown
+# Optimizer pushes limit+offset to Firestore, DuckDB handles offset client-side.
+echo "Test 14: SQL LIMIT + OFFSET pushdown..."
+RESULT=$(run_query \
+    "SELECT name FROM firestore_scan('fde_ci_test') ORDER BY score LIMIT 1 OFFSET 1;")
+assert_eq "$RESULT" "Charlie" \
+    "ORDER BY score LIMIT 1 OFFSET 1 returns Charlie (second lowest score=20)"
+
+# Test 15: SQL ORDER BY on collection group
+echo "Test 15: SQL ORDER BY on collection group..."
+RESULT=$(run_query \
+    "SELECT label FROM firestore_scan('~fde_ci_child') ORDER BY val LIMIT 1;")
+# val ASC: A(10), C(10), B(20) — first is A or C depending on __name__ tiebreak
+# c2 (A) comes before c3 (C) in __name__ order.
+assert_eq "$RESULT" "A" \
+    "SQL ORDER BY val on collection group returns lowest val document"
+
+# Test 16: SQL LIMIT without ORDER BY on collection group
+echo "Test 16: SQL LIMIT on collection group..."
+RESULT=$(run_query \
+    "SELECT count(*) FROM (SELECT * FROM firestore_scan('~fde_ci_child') LIMIT 2) sub;")
+assert_eq "$RESULT" "2" \
+    "SQL LIMIT 2 on collection group returns exactly 2 rows"
+
+# Test 17: Composite SQL ORDER BY (multi-field) — requires composite index
+echo "Test 17: SQL composite ORDER BY (multi-field)..."
+RESULT=$(run_query \
+    "SELECT string_agg(name, ',' ORDER BY score, name) FROM (SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score, name) sub;")
+assert_eq "$RESULT" "Alpha,Charlie,Bravo,Delta,Echo" \
+    "SQL ORDER BY score, name uses composite index (same result as named param)"
+
+# =============================================
+# EXPLAIN Plan Validation Tests
+# Verify that EXPLAIN output shows pushdown info for ORDER BY and LIMIT.
+# =============================================
+
+echo ""
+echo "=== Running EXPLAIN plan validation tests ==="
+
+# Test 18: EXPLAIN shows ORDER BY pushdown
+echo "Test 18: EXPLAIN shows ORDER BY pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score DESC LIMIT 5;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Order: score DESC" \
+    "EXPLAIN shows 'Firestore Pushed Order: score DESC'"
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Limit: 5" \
+    "EXPLAIN shows 'Firestore Pushed Limit: 5'"
+
+# Test 19: EXPLAIN shows LIMIT-only pushdown (no ORDER BY)
+echo "Test 19: EXPLAIN shows LIMIT-only pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') LIMIT 3;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Limit: 3" \
+    "EXPLAIN shows 'Firestore Pushed Limit: 3' without ORDER BY"
+
+# Test 20: EXPLAIN shows ORDER BY-only pushdown (no LIMIT)
+echo "Test 20: EXPLAIN shows ORDER BY-only pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') ORDER BY name;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Order: name" \
+    "EXPLAIN shows 'Firestore Pushed Order: name' without LIMIT"
+assert_not_contains "$EXPLAIN_OUT" "Firestore Pushed Limit" \
+    "EXPLAIN does not show Pushed Limit when no LIMIT clause"
+
+# Test 21: EXPLAIN shows multi-field ORDER BY pushdown
+echo "Test 21: EXPLAIN shows multi-field ORDER BY pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score, name LIMIT 2;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Order: score, name" \
+    "EXPLAIN shows 'Firestore Pushed Order: score, name' for multi-field"
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Limit: 2" \
+    "EXPLAIN shows 'Firestore Pushed Limit: 2' alongside multi-field order"
+
+# Test 22: EXPLAIN shows LIMIT+OFFSET pushdown (limit+offset value)
+echo "Test 22: EXPLAIN shows LIMIT+OFFSET pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') ORDER BY score LIMIT 3 OFFSET 2;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Order: score" \
+    "EXPLAIN shows ORDER BY pushdown with OFFSET"
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Limit: 5" \
+    "EXPLAIN shows Pushed Limit: 5 (limit 3 + offset 2)"
+
+# Test 23: EXPLAIN shows all three: filter + ORDER BY + LIMIT
+echo "Test 23: EXPLAIN shows filter + ORDER BY + LIMIT pushdown..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test') WHERE score > 10 ORDER BY score DESC LIMIT 3;")
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Filters:" \
+    "EXPLAIN shows filter pushdown alongside ORDER BY + LIMIT"
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Order: score DESC" \
+    "EXPLAIN shows ORDER BY pushdown alongside filter + LIMIT"
+assert_contains "$EXPLAIN_OUT" "Firestore Pushed Limit: 3" \
+    "EXPLAIN shows LIMIT pushdown alongside filter + ORDER BY"
+
+# Test 24: EXPLAIN does NOT show SQL pushdown when named params are used
+echo "Test 24: EXPLAIN omits SQL pushdown when named params set..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT * FROM firestore_scan('fde_ci_test', order_by='score', scan_limit=5) ORDER BY name DESC LIMIT 2;")
+assert_not_contains "$EXPLAIN_OUT" "Firestore Pushed Order:" \
+    "EXPLAIN does not show SQL ORDER BY pushdown when named order_by is set"
+assert_not_contains "$EXPLAIN_OUT" "Firestore Pushed Limit:" \
+    "EXPLAIN does not show SQL LIMIT pushdown when named scan_limit is set"
+
+# Test 25: EXPLAIN does NOT show ORDER BY pushdown for aggregate query
+echo "Test 25: EXPLAIN omits ORDER BY pushdown for aggregate queries..."
+EXPLAIN_OUT=$(run_explain \
+    "EXPLAIN SELECT name, count(*) as cnt FROM firestore_scan('fde_ci_test') GROUP BY name ORDER BY cnt LIMIT 3;")
+assert_not_contains "$EXPLAIN_OUT" "Firestore Pushed Order:" \
+    "EXPLAIN does not show ORDER BY pushdown when ORDER BY is on aggregate result"
 
 # --- Cleanup ---
 

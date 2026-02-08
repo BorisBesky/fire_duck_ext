@@ -1,0 +1,67 @@
+# name: test/sql/firestore_orderby_limit_pushdown.test
+# description: Test SQL ORDER BY and LIMIT pushdown to Firestore via optimizer extension
+# group: [sql]
+
+require fire_duck_ext
+
+# Set up credentials so queries get past credential resolution
+# (they will still fail at schema inference / API calls, but the optimizer runs before that)
+statement ok
+CREATE SECRET pushdown_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-api-key'
+);
+
+# Test: ORDER BY + LIMIT on firestore_scan - should fail at API call, not at optimizer
+# The optimizer extracts ORDER BY and LIMIT from the SQL and injects them into bind data
+statement error
+SELECT * FROM firestore_scan('users') ORDER BY name LIMIT 10;
+----
+
+# Test: LIMIT without ORDER BY
+statement error
+SELECT * FROM firestore_scan('users') LIMIT 5;
+----
+
+# Test: ORDER BY without LIMIT
+statement error
+SELECT * FROM firestore_scan('users') ORDER BY name DESC;
+----
+
+# Test: ORDER BY + LIMIT + OFFSET (should push limit+offset)
+statement error
+SELECT * FROM firestore_scan('users') ORDER BY name LIMIT 10 OFFSET 5;
+----
+
+# Test: Multi-field ORDER BY
+statement error
+SELECT * FROM firestore_scan('users') ORDER BY name, age DESC LIMIT 10;
+----
+
+# Test: Named params take precedence - this should work (use named param, ignore SQL ORDER BY)
+statement error
+SELECT * FROM firestore_scan('users', order_by='score DESC') ORDER BY name LIMIT 10;
+----
+
+# Test: Named scan_limit takes precedence over SQL LIMIT
+statement error
+SELECT * FROM firestore_scan('users', scan_limit=5) LIMIT 10;
+----
+
+# Test: WHERE + ORDER BY + LIMIT (all three pushed)
+statement error
+SELECT * FROM firestore_scan('users') WHERE status = 'active' ORDER BY score DESC LIMIT 10;
+----
+
+# Test: Aggregate with ORDER BY should NOT push ORDER BY to scan
+# (ORDER BY on COUNT(*) is irrelevant to the scan)
+statement error
+SELECT status, COUNT(*) as cnt FROM firestore_scan('users') GROUP BY status ORDER BY cnt DESC LIMIT 5;
+----
+
+# Test: Subquery with ORDER BY on outer query should still push to inner scan
+# when the ORDER BY references scan columns
+statement error
+SELECT * FROM (SELECT * FROM firestore_scan('users')) sub ORDER BY name LIMIT 10;
+----

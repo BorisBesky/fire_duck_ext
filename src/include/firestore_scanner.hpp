@@ -37,6 +37,12 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// These are stored here so InitGlobal can use them to build the Firestore query.
 	// All original DuckDB expressions are left intact so DuckDB re-verifies results.
 	std::vector<FirestorePushdownFilter> candidate_pushdown_filters;
+
+	// SQL pushdown: ORDER BY / LIMIT extracted from the logical plan by the optimizer extension.
+	// Named parameters (order_by, scan_limit) take precedence over these when both are set.
+	// The original SQL ORDER BY / LIMIT nodes are left in place so DuckDB re-verifies results.
+	std::vector<OrderByField> sql_pushed_order_by;
+	std::optional<int64_t> sql_pushed_limit;
 };
 
 // Global state - shared across threads

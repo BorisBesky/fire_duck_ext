@@ -6,10 +6,12 @@
 #include "firestore_secrets.hpp"
 #include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_optimizer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include <cstdlib>
 
 namespace duckdb {
@@ -186,6 +188,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction disconnect_func("firestore_disconnect", {}, FirestoreDisconnectFunction, FirestoreDisconnectBind,
 	                              FirestoreOneShotInit);
 	loader.RegisterFunction(disconnect_func);
+
+	// Register optimizer extension for SQL ORDER BY / LIMIT pushdown to Firestore.
+	// This walks the logical plan tree to find ORDER BY / LIMIT nodes above firestore_scan
+	// and injects the info into bind data so Firestore can apply them server-side.
+	OptimizerExtension firestore_optimizer;
+	firestore_optimizer.pre_optimize_function = FirestorePreOptimize;
+	config.optimizer_extensions.push_back(std::move(firestore_optimizer));
 }
 
 void FireDuckExtExtension::Load(ExtensionLoader &loader) {

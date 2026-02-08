@@ -94,8 +94,9 @@ static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
 // Single-field ordering uses single-field indexes; multi-field ordering requires composite indexes.
 // When no index exists (e.g. collection group without explicit index), returns false
 // so the caller can skip server-side ordering and let DuckDB sort client-side.
-static bool CanOrderByOnServer(const FirestoreScanBindData &bind_data) {
-	if (bind_data.parsed_order_by.empty()) {
+static bool CanOrderByOnServer(const std::vector<OrderByField> &order_by_fields,
+                                const FirestoreScanBindData &bind_data) {
+	if (order_by_fields.empty()) {
 		return false;
 	}
 	if (!bind_data.index_cache || !bind_data.index_cache->fetch_succeeded) {
@@ -105,13 +106,13 @@ static bool CanOrderByOnServer(const FirestoreScanBindData &bind_data) {
 	auto scope = bind_data.is_collection_group ? FirestoreIndex::QueryScope::COLLECTION_GROUP
 	                                           : FirestoreIndex::QueryScope::COLLECTION;
 
-	if (bind_data.parsed_order_by.size() == 1) {
+	if (order_by_fields.size() == 1) {
 		// Single-field: use single-field index check
-		return HasSingleFieldIndex(bind_data.parsed_order_by[0].field_path, *bind_data.index_cache, scope);
+		return HasSingleFieldIndex(order_by_fields[0].field_path, *bind_data.index_cache, scope);
 	}
 
 	// Multi-field: requires composite index with matching field order and directions
-	return HasCompositeOrderByIndex(bind_data.parsed_order_by, *bind_data.index_cache, scope);
+	return HasCompositeOrderByIndex(order_by_fields, *bind_data.index_cache, scope);
 }
 
 // pushdown_complex_filter callback: extracts filter expressions for Firestore pushdown
@@ -159,7 +160,14 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 				}
 				info += FormatPushdownFilter(f);
 			}
-			get.extra_info.file_filters = "Firestore Pushed Filters: " + info;
+			// Prepend filter info, preserving any ORDER BY/LIMIT pushdown info
+			// already set by the optimizer extension
+			auto &existing = get.extra_info.file_filters;
+			if (!existing.empty()) {
+				existing = "Firestore Pushed Filters: " + info + " | " + existing;
+			} else {
+				existing = "Firestore Pushed Filters: " + info;
+			}
 		}
 	}
 
@@ -396,6 +404,12 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		                                                      *bind_data.index_cache, bind_data.is_collection_group);
 	}
 
+	// Compute effective ORDER BY and LIMIT values.
+	// Named parameters (order_by, scan_limit) take precedence over SQL-pushed values.
+	auto &effective_order_by =
+	    !bind_data.parsed_order_by.empty() ? bind_data.parsed_order_by : bind_data.sql_pushed_order_by;
+	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+
 	// Build query and fetch initial documents
 	FirestoreListResponse response;
 
@@ -412,33 +426,49 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		// Add WHERE clause
 		sq["where"] = BuildWhereClause(global_state->pushdown_result.pushed_filters);
 
+		// Add orderBy - Firestore requires inequality/range filter fields to appear
+		// before __name__ in the orderBy clause
+		bool can_order = CanOrderByOnServer(effective_order_by, bind_data);
+		FS_LOG_DEBUG("InitGlobal: CanOrderByOnServer=" + std::to_string(can_order));
+
+		// If SQL ORDER BY was pushed but can't be sent to the server (no index),
+		// we must also clear the SQL pushed limit. Otherwise Firestore returns a
+		// limited subset in default order, and DuckDB re-sorts only that subset,
+		// producing wrong results.
+		if (!can_order && !bind_data.sql_pushed_order_by.empty() && bind_data.sql_pushed_limit.has_value()) {
+			FS_LOG_DEBUG("InitGlobal: clearing SQL pushed limit because ORDER BY can't be sent to server");
+			bind_data.sql_pushed_limit.reset();
+			effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+		}
+
 		// Add limit
 		int64_t page_size = 1000;
-		if (bind_data.limit.has_value()) {
-			page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
+		if (effective_limit.has_value()) {
+			page_size = std::min(effective_limit.value(), static_cast<int64_t>(1000));
 		}
 		sq["limit"] = page_size;
 
-		// Add orderBy - Firestore requires inequality/range filter fields to appear
-		// before __name__ in the orderBy clause
-		if (CanOrderByOnServer(bind_data)) {
+		if (can_order) {
 			json order_by_arr = json::array();
-			for (auto &ob : bind_data.parsed_order_by) {
+			for (auto &ob : effective_order_by) {
 				order_by_arr.push_back({{"field", {{"fieldPath", ob.field_path}}}, {"direction", ob.direction}});
 			}
-			// Append __name__ for cursor-based pagination if not already present
+			// Append __name__ for cursor-based pagination if not already present.
+			// Use the last field's direction so all orderBy fields are consistent —
+			// Firestore requires matching directions unless a composite index exists.
 			bool has_name = false;
-			for (auto &ob : bind_data.parsed_order_by) {
+			for (auto &ob : effective_order_by) {
 				if (ob.field_path == "__name__") {
 					has_name = true;
 					break;
 				}
 			}
 			if (!has_name) {
-				order_by_arr.push_back({{"field", {{"fieldPath", "__name__"}}}, {"direction", "ASCENDING"}});
+				std::string name_direction = effective_order_by.back().direction;
+				order_by_arr.push_back({{"field", {{"fieldPath", "__name__"}}}, {"direction", name_direction}});
 			}
 			sq["orderBy"] = order_by_arr;
-		} else if (!bind_data.parsed_order_by.empty()) {
+		} else if (!effective_order_by.empty()) {
 			FS_LOG_DEBUG("Skipping server-side order_by in pushdown query (no supporting index)");
 		}
 
@@ -487,6 +517,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		FS_LOG_DEBUG("Filter pushdown active: " + std::to_string(global_state->pushdown_result.pushed_filters.size()) +
 		             " filters pushed to Firestore");
+		FS_LOG_DEBUG("InitGlobal: structured_query=" + sq.dump());
 
 		try {
 			response = global_state->client->RunQuery(bind_data.collection, sq, bind_data.is_collection_group);
@@ -494,6 +525,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			// Check if this page is full (may need pagination) or partial (we're done)
 			global_state->last_page_was_full =
 			    (static_cast<int64_t>(response.documents.size()) >= global_state->query_page_size);
+			FS_LOG_DEBUG("InitGlobal: RunQuery returned " + std::to_string(response.documents.size()) + " documents");
 		} catch (const std::exception &e) {
 			// Fallback: if runQuery fails, disable pushdown and use ListDocuments
 			FS_LOG_WARN("RunQuery with filters failed, falling back to full scan: " + std::string(e.what()));
@@ -508,9 +540,9 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			// supposed to run on Firestore will now run client-side in DuckDB, so we
 			// need to fetch full pages to avoid missing matching documents.
 			// The scan_limit is still enforced in FirestoreScanFunction after DuckDB filtering.
-			if (CanOrderByOnServer(bind_data)) {
-				query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
-			} else if (!bind_data.parsed_order_by.empty()) {
+			if (CanOrderByOnServer(effective_order_by, bind_data)) {
+				query.order_by = FormatOrderByForREST(effective_order_by);
+			} else if (!effective_order_by.empty()) {
 				FS_LOG_DEBUG("Skipping server-side order_by in fallback (no supporting index)");
 			}
 
@@ -527,15 +559,25 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		// No filter pushdown - use existing query paths
 		FirestoreQuery query;
 		query.show_missing = bind_data.show_missing;
+
+		bool can_order_fallback = CanOrderByOnServer(effective_order_by, bind_data);
+
+		// If SQL ORDER BY was pushed but can't be sent to server, clear SQL pushed limit
+		if (!can_order_fallback && !bind_data.sql_pushed_order_by.empty() && bind_data.sql_pushed_limit.has_value()) {
+			FS_LOG_DEBUG("InitGlobal (no-pushdown): clearing SQL pushed limit because ORDER BY can't be sent to server");
+			bind_data.sql_pushed_limit.reset();
+			effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+		}
+
 		// Only apply scan_limit to page_size when there are no unpushed filters.
 		// If DuckDB will filter client-side, we need full pages to avoid missing matches.
 		bool unpushed = !bind_data.candidate_pushdown_filters.empty();
-		if (bind_data.limit.has_value() && !unpushed) {
-			query.page_size = std::min(bind_data.limit.value(), static_cast<int64_t>(1000));
+		if (effective_limit.has_value() && !unpushed) {
+			query.page_size = std::min(effective_limit.value(), static_cast<int64_t>(1000));
 		}
-		if (CanOrderByOnServer(bind_data)) {
-			query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
-		} else if (!bind_data.parsed_order_by.empty()) {
+		if (can_order_fallback) {
+			query.order_by = FormatOrderByForREST(effective_order_by);
+		} else if (!effective_order_by.empty()) {
 			FS_LOG_DEBUG("Skipping server-side order_by (no supporting index); DuckDB will sort client-side");
 		}
 
@@ -573,21 +615,22 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	idx_t count = 0;
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
-	// Apply limit if specified.
+	// Apply effective limit (named param takes precedence over SQL-pushed limit).
 	// Skip when DuckDB will filter client-side: the scan emits rows before DuckDB's FILTER
 	// node, so cutting off here would drop rows that might match the WHERE clause.
 	// This happens when: (a) pushdown was attempted but failed at runtime, or
 	// (b) candidate filters exist but none were pushed (e.g. collection group without indexes).
+	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
 	bool has_unpushed_filters =
 	    !bind_data.candidate_pushdown_filters.empty() && !global_state.pushdown_result.has_pushdown();
-	if (bind_data.limit.has_value() && !global_state.pushdown_failed && !has_unpushed_filters) {
+	if (effective_limit.has_value() && !global_state.pushdown_failed && !has_unpushed_filters) {
 		idx_t total_returned = global_state.current_index;
-		if (total_returned >= static_cast<idx_t>(bind_data.limit.value())) {
+		if (total_returned >= static_cast<idx_t>(effective_limit.value())) {
 			global_state.finished = true;
 			output.SetCardinality(0);
 			return;
 		}
-		max_count = std::min(max_count, static_cast<idx_t>(bind_data.limit.value()) - total_returned);
+		max_count = std::min(max_count, static_cast<idx_t>(effective_limit.value()) - total_returned);
 	}
 
 	while (count < max_count) {
