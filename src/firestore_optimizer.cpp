@@ -46,8 +46,7 @@ static bool IsBarrierOperator(LogicalOperatorType type) {
 //
 // Returns true and sets out_col_idx if resolution succeeds.
 static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colref, LogicalGet &get,
-                                            const std::vector<LogicalProjection *> &projections,
-                                            idx_t &out_col_idx) {
+                                            const std::vector<LogicalProjection *> &projections, idx_t &out_col_idx) {
 	// Direct reference to the scan table
 	if (colref.binding.table_index == get.table_index) {
 		auto &col_ids = get.GetColumnIds();
@@ -99,7 +98,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 // Resolves column references through projection layers since ORDER BY expressions
 // reference the projection's table_index, not the scan's table_index directly.
 static bool TryExtractOrderBy(LogicalGet &get, LogicalOrder &order, FirestoreScanBindData &bind_data,
-                               const std::vector<LogicalProjection *> &projections) {
+                              const std::vector<LogicalProjection *> &projections) {
 	std::vector<OrderByField> fields;
 
 	for (size_t oi = 0; oi < order.orders.size(); oi++) {
@@ -185,7 +184,7 @@ static bool TryExtractLimit(LogicalLimit &limit_op, FirestoreScanBindData &bind_
 // a LogicalGet for firestore_scan, inject the extracted ORDER BY / LIMIT
 // into bind_data.
 static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, LogicalLimit *current_limit,
-                          std::vector<LogicalProjection *> &projections) {
+                         std::vector<LogicalProjection *> &projections) {
 	// If this is a barrier operator, reset tracking - ORDER BY / LIMIT above
 	// a barrier don't apply to scans below it
 	if (IsBarrierOperator(op.type)) {
@@ -237,8 +236,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 			// Also skip when named order_by is set but SQL ORDER BY was not pushed:
 			// the server sorts by the named param's order, so applying the SQL LIMIT
 			// server-side would cut off rows based on a different sort order.
-			bool named_order_blocks_limit = !bind_data.parsed_order_by.empty() &&
-			                                bind_data.sql_pushed_order_by.empty();
+			bool named_order_blocks_limit = !bind_data.parsed_order_by.empty() && bind_data.sql_pushed_order_by.empty();
 			if (!bind_data.limit.has_value() && !named_order_blocks_limit && current_limit) {
 				if (TryExtractLimit(*current_limit, bind_data)) {
 					auto &existing = get.extra_info.file_filters;

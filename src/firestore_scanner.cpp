@@ -95,7 +95,7 @@ static string FormatPushdownFilter(const FirestorePushdownFilter &f) {
 // When no index exists (e.g. collection group without explicit index), returns false
 // so the caller can skip server-side ordering and let DuckDB sort client-side.
 static bool CanOrderByOnServer(const std::vector<OrderByField> &order_by_fields,
-                                const FirestoreScanBindData &bind_data) {
+                               const FirestoreScanBindData &bind_data) {
 	if (order_by_fields.empty()) {
 		return false;
 	}
@@ -564,7 +564,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		// If SQL ORDER BY was pushed but can't be sent to server, clear SQL pushed limit
 		if (!can_order_fallback && !bind_data.sql_pushed_order_by.empty() && bind_data.sql_pushed_limit.has_value()) {
-			FS_LOG_DEBUG("InitGlobal (no-pushdown): clearing SQL pushed limit because ORDER BY can't be sent to server");
+			FS_LOG_DEBUG(
+			    "InitGlobal (no-pushdown): clearing SQL pushed limit because ORDER BY can't be sent to server");
 			bind_data.sql_pushed_limit.reset();
 			effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
 		}
