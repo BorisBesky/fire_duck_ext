@@ -762,7 +762,7 @@ if should_run 30; then
     echo "--- firestore_insert (collection group) ---"
     echo "Test 30: Insert into subcollection..."
     RESULT=$(run_query \
-        "SELECT * FROM firestore_insert('~fde_write_child',
+        "SELECT * FROM firestore_insert('fde_write_parent/p1/fde_write_child',
             (SELECT 'cg_ins1' AS id, 'Inserted' AS label, 99 AS priority),
             document_id := 'id');")
     assert_eq "$RESULT" "1" \
