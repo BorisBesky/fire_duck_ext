@@ -9,11 +9,7 @@ namespace duckdb {
 
 class ExtensionLoader;
 
-enum class DocPathOrderType : uint8_t {
-	NONE = 0,
-	ASCENDING,
-	DESCENDING
-};
+enum class DocPathOrderType : uint8_t { NONE = 0, ASCENDING, DESCENDING };
 
 // Bind data - stores parameters from SQL call
 struct FirestoreScanBindData : public TableFunctionData {
@@ -88,13 +84,13 @@ struct FirestoreScanBindData : public TableFunctionData {
 			return true;
 		};
 
-		return collection == other.collection && column_names == other.column_names && column_types == other.column_types &&
-		       projected_columns == other.projected_columns && limit == other.limit && order_by == other.order_by &&
+		return collection == other.collection && column_names == other.column_names &&
+		       column_types == other.column_types && projected_columns == other.projected_columns &&
+		       limit == other.limit && order_by == other.order_by &&
 		       order_fields_equal(parsed_order_by, other.parsed_order_by) &&
 		       is_collection_group == other.is_collection_group && show_missing == other.show_missing &&
-		       is_document_path == other.is_document_path &&
-		       docpath_named_order == other.docpath_named_order && credentials_equal &&
-		       order_fields_equal(sql_pushed_order_by, other.sql_pushed_order_by) &&
+		       is_document_path == other.is_document_path && docpath_named_order == other.docpath_named_order &&
+		       credentials_equal && order_fields_equal(sql_pushed_order_by, other.sql_pushed_order_by) &&
 		       sql_pushed_limit == other.sql_pushed_limit;
 	}
 };

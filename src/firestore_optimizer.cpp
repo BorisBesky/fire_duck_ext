@@ -264,8 +264,9 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 							idx_t col_idx;
 							if (ResolveColumnThroughProjections(colref, get, projections, col_idx) &&
 							    col_idx < get.names.size() && get.names[col_idx] == "__document_id") {
-								bind_data.docpath_named_order =
-								    ob.type == OrderType::DESCENDING ? DocPathOrderType::DESCENDING : DocPathOrderType::ASCENDING;
+								bind_data.docpath_named_order = ob.type == OrderType::DESCENDING
+								                                    ? DocPathOrderType::DESCENDING
+								                                    : DocPathOrderType::ASCENDING;
 							}
 						}
 					}
@@ -296,7 +297,8 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 			}
 
 			// Only inject ORDER BY if named param was not already set
-			const auto *order_nodes = current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
+			const auto *order_nodes =
+			    current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
 			if (bind_data.parsed_order_by.empty() && order_nodes) {
 				if (TryExtractOrderBy(get, *order_nodes, bind_data, projections)) {
 					// Build EXPLAIN info

@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <chrono>
 
-
 namespace duckdb {
 
 // Cached schema entry with timestamp
@@ -240,8 +239,8 @@ static bool TryGetDocPathOrderType(const std::vector<OrderByField> &order_by_fie
 	if (order_by_fields[0].field_path != "__document_id") {
 		return false;
 	}
-	out_order = order_by_fields[0].direction == "DESCENDING" ? DocPathOrderType::DESCENDING
-	                                                         : DocPathOrderType::ASCENDING;
+	out_order =
+	    order_by_fields[0].direction == "DESCENDING" ? DocPathOrderType::DESCENDING : DocPathOrderType::ASCENDING;
 	return true;
 }
 
@@ -347,9 +346,9 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		// Return subcollection names as virtual __document_id rows.
 		result->is_document_path = true;
 		DocPathOrderType docpath_order = DocPathOrderType::NONE;
-		bool has_supported_docpath_order =
-		    result->order_by.has_value() ? TryGetDocPathOrderType(result->order_by.value(), docpath_order)
-		                                 : TryGetDocPathOrderType(result->parsed_order_by, docpath_order);
+		bool has_supported_docpath_order = result->order_by.has_value()
+		                                       ? TryGetDocPathOrderType(result->order_by.value(), docpath_order)
+		                                       : TryGetDocPathOrderType(result->parsed_order_by, docpath_order);
 		if (result->order_by.has_value() || !result->parsed_order_by.empty()) {
 			if (!has_supported_docpath_order) {
 				throw BinderException(
