@@ -73,7 +73,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 	// Direct reference to the scan table
 	if (colref.binding.table_index == get.table_index) {
 		auto &col_ids = get.GetColumnIds();
-		idx_t binding_idx = colref.binding.column_index.index;
+		idx_t binding_idx = colref.binding.column_index;
 		if (binding_idx >= col_ids.size()) {
 			return false;
 		}
@@ -87,7 +87,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 		if (colref.binding.table_index != proj->table_index) {
 			continue;
 		}
-		idx_t proj_col_idx = colref.binding.column_index.index;
+		idx_t proj_col_idx = colref.binding.column_index;
 		if (proj_col_idx >= proj->expressions.size()) {
 			continue;
 		}
@@ -101,7 +101,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 		auto &inner_colref = proj_expr.Cast<BoundColumnRefExpression>();
 		if (inner_colref.binding.table_index == get.table_index) {
 			auto &col_ids = get.GetColumnIds();
-			idx_t binding_idx = inner_colref.binding.column_index.index;
+			idx_t binding_idx = inner_colref.binding.column_index;
 			if (binding_idx >= col_ids.size()) {
 				return false;
 			}

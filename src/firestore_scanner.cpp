@@ -140,7 +140,7 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 
 	for (auto &filter : filters) {
 		auto converted =
-		    ConvertExpressionToFilters(*filter, get.table_index.index, get.names, get.returned_types, column_id_map);
+		    ConvertExpressionToFilters(*filter, get.table_index, get.names, get.returned_types, column_id_map);
 		bind_data.candidate_pushdown_filters.insert(bind_data.candidate_pushdown_filters.end(),
 		                                            std::make_move_iterator(converted.begin()),
 		                                            std::make_move_iterator(converted.end()));
