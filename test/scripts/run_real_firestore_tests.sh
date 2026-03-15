@@ -103,11 +103,11 @@ DATA_BASE="${ADMIN_BASE}/documents"
 
 # --- DuckDB helpers ---
 
-# Find duckdb binary
-if command -v duckdb &> /dev/null; then
-    DUCKDB="duckdb"
-elif [ -x "./build/release/duckdb" ]; then
+# Find duckdb binary - prefer the locally built binary so it matches the extension.
+if [ -x "./build/release/duckdb" ]; then
     DUCKDB="./build/release/duckdb"
+elif command -v duckdb &> /dev/null; then
+    DUCKDB="duckdb"
 else
     echo "Error: duckdb not found. Install DuckDB or build from source."
     exit 1
@@ -120,13 +120,17 @@ if [ ! -f "$EXT_PATH" ]; then
     exit 1
 fi
 
+clean_query_output() {
+    sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' | tr -d '[:space:]"'
+}
+
 run_query() {
     $DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
 SET firestore_schema_cache_ttl=0;
 CREATE SECRET __fs (TYPE firestore, PROJECT_ID '${PROJECT_ID}', SERVICE_ACCOUNT_JSON '${SA_PATH}');
 $1
-" 2>&1 | tail -1 | tr -d '[:space:]"'
+" 2>&1 | tail -1 | clean_query_output
 }
 
 # Like run_query but dumps debug logs to stderr and full output
@@ -137,7 +141,7 @@ LOAD '${EXT_PATH}';
 SET firestore_schema_cache_ttl=0;
 CREATE SECRET __fs (TYPE firestore, PROJECT_ID '${PROJECT_ID}', SERVICE_ACCOUNT_JSON '${SA_PATH}');
 $1
-" 2>&1 | tee /dev/stderr | tail -1 | tr -d '[:space:]"'
+" 2>&1 | tee /dev/stderr | tail -1 | clean_query_output
 }
 
 assert_eq() {
@@ -1247,6 +1251,70 @@ if should_run 61; then
     assert_eq "$RESULT" "false" "REST: rt2 deleted"
 fi
 
+# --- Conditional setup: document-path scan test data (tests 62-63) ---
+
+if any_in_range 62 63; then
+    echo ""
+    echo "=== Seeding document-path scan test data ==="
+
+    # Existing document with no subcollections should yield 0 rows.
+    seed_doc "fde_docpath_empty/parent_empty" '{"fields":{"label":{"stringValue":"empty-parent"}}}'
+
+    # Existing document with >100 distinct subcollections validates pagination.
+    seed_doc "fde_docpath_cases/paginated_parent" '{"fields":{"label":{"stringValue":"paginated-parent"}}}'
+    for i in $(seq 1 105); do
+        SUBCOLL_ID=$(printf "sub%03d" "$i")
+        seed_doc "fde_docpath_cases/paginated_parent/${SUBCOLL_ID}/doc1" \
+            '{"fields":{"value":{"integerValue":"1"}}}'
+    done
+
+    echo "Document-path test data seeded."
+fi
+
+if should_run 62; then
+    echo ""
+    echo "=== Running document-path scan tests ==="
+    echo "Test 62: Document path scan with no subcollections..."
+    RESULT=$(run_query \
+        "SELECT count(*) FROM firestore_scan('fde_docpath_empty/parent_empty');")
+    assert_eq "$RESULT" "0" \
+        "document path scan on empty parent returns 0 rows"
+fi
+
+if should_run 63; then
+    echo "Test 63: Document path scan paginates subcollection IDs..."
+    RESULT=$(run_query \
+        "SELECT count(*) FROM firestore_scan('fde_docpath_cases/paginated_parent');")
+    assert_eq "$RESULT" "105" \
+        "document path scan returns all paginated subcollections"
+
+    RESULT=$(run_query \
+        "SELECT __document_id FROM firestore_scan('fde_docpath_cases/paginated_parent') ORDER BY __document_id LIMIT 1;")
+    assert_eq "$RESULT" "sub001" \
+        "document path scan includes the first paginated subcollection"
+
+    RESULT=$(run_query \
+        "SELECT __document_id FROM firestore_scan('fde_docpath_cases/paginated_parent') ORDER BY __document_id DESC LIMIT 1;")
+    assert_eq "$RESULT" "sub105" \
+        "document path scan includes the last paginated subcollection"
+
+    RESULT=$(run_query \
+        "SELECT string_agg(__document_id, ',' ORDER BY __document_id DESC) FROM (
+            SELECT __document_id
+            FROM firestore_scan('fde_docpath_cases/paginated_parent')
+            ORDER BY __document_id DESC
+            LIMIT 5
+        );")
+    assert_eq "$RESULT" "sub105,sub104,sub103,sub102,sub101" \
+        "document path scan returns the top 5 descending subcollections"
+
+    RESULT=$(run_query \
+        "SELECT __document_id FROM firestore_scan('fde_docpath_cases/paginated_parent')
+         ORDER BY CAST(substr(__document_id, 4) AS INTEGER) DESC LIMIT 1;")
+    assert_eq "$RESULT" "sub105" \
+        "document path scan falls back to DuckDB for unsupported order expressions"
+fi
+
 # --- Cleanup ---
 
 echo ""
@@ -1303,6 +1371,16 @@ for doc in data.get('documents', []):
     for AUTO_ID in $REMAINING_AUTO; do
         delete_doc "fde_write_test/$AUTO_ID"
     done
+fi
+
+# Cleanup document-path scan test data (tests 62-63)
+if any_in_range 62 63; then
+    delete_doc "fde_docpath_empty/parent_empty"
+    for i in $(seq 1 105); do
+        SUBCOLL_ID=$(printf "sub%03d" "$i")
+        delete_doc "fde_docpath_cases/paginated_parent/${SUBCOLL_ID}/doc1"
+    done
+    delete_doc "fde_docpath_cases/paginated_parent"
 fi
 
 echo "Test data cleaned up. (Indexes left in place for idempotency.)"

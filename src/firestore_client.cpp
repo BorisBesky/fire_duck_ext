@@ -302,6 +302,57 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 	return result;
 }
 
+FirestoreCollectionIdsPage FirestoreClient::ListCollectionIdsPage(const std::string &document_path,
+                                                                  const std::optional<std::string> &page_token,
+                                                                  int64_t page_size) {
+	FS_LOG_DEBUG("Listing collection IDs under document: " + document_path);
+
+	std::string url = BuildUrl(document_path + ":listCollectionIds");
+
+	FirestoreErrorContext ctx;
+	ctx.withOperation("list_collection_ids").withCollection(document_path);
+
+	json body = {{"pageSize", page_size}};
+	if (page_token.has_value()) {
+		body["pageToken"] = page_token.value();
+	}
+
+	json response = MakeRequest("POST", url, body, ctx);
+
+	FirestoreCollectionIdsPage result;
+	if (response.contains("collectionIds")) {
+		for (auto &id : response["collectionIds"]) {
+			result.collection_ids.push_back(id.get<std::string>());
+		}
+	}
+
+	if (response.contains("nextPageToken")) {
+		result.next_page_token = response["nextPageToken"].get<std::string>();
+	}
+
+	FS_LOG_DEBUG("Listed " + std::to_string(result.collection_ids.size()) + " subcollections in page");
+	return result;
+}
+
+std::vector<std::string> FirestoreClient::ListCollectionIds(const std::string &document_path) {
+	std::vector<std::string> collection_ids;
+	std::optional<std::string> page_token;
+
+	do {
+		auto page = ListCollectionIdsPage(document_path, page_token, 100);
+		collection_ids.insert(collection_ids.end(), page.collection_ids.begin(), page.collection_ids.end());
+
+		if (page.next_page_token.empty()) {
+			page_token.reset();
+		} else {
+			page_token = page.next_page_token;
+		}
+	} while (page_token.has_value());
+
+	FS_LOG_DEBUG("Found " + std::to_string(collection_ids.size()) + " subcollections");
+	return collection_ids;
+}
+
 FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, const std::string &document_id) {
 	FS_LOG_DEBUG("Getting document: " + collection + "/" + document_id);
 

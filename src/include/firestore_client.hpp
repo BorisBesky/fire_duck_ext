@@ -40,6 +40,11 @@ struct FirestoreListResponse {
 	std::string next_page_token;
 };
 
+struct FirestoreCollectionIdsPage {
+	std::vector<std::string> collection_ids;
+	std::string next_page_token;
+};
+
 // Resolved document path for collection group-aware write operations
 struct ResolvedDocumentPath {
 	bool is_collection_group;
@@ -94,6 +99,13 @@ public:
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,
 	                               bool is_collection_group = false);
+
+	FirestoreCollectionIdsPage ListCollectionIdsPage(const std::string &document_path,
+	                                                 const std::optional<std::string> &page_token = std::nullopt,
+	                                                 int64_t page_size = 100);
+
+	// List subcollection IDs under a document path
+	std::vector<std::string> ListCollectionIds(const std::string &document_path);
 
 	// Fetch composite indexes for a collection via Admin API
 	std::vector<FirestoreIndex> FetchCompositeIndexes(const std::string &collection_id);

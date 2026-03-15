@@ -4,11 +4,34 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
 
 namespace duckdb {
+
+static int CountPathSegments(const std::string &path) {
+	int count = 0;
+	bool in_segment = false;
+	for (char c : path) {
+		if (c == '/') {
+			in_segment = false;
+		} else if (!in_segment) {
+			in_segment = true;
+			count++;
+		}
+	}
+	return count;
+}
+
+static bool IsDocumentPathCollection(const std::string &collection) {
+	if (!collection.empty() && collection[0] == '~') {
+		return false;
+	}
+	int segments = CountPathSegments(collection);
+	return segments >= 2 && segments % 2 == 0;
+}
 
 // Returns true if this operator type blocks ORDER BY / LIMIT from applying to child scans.
 // These operators transform result cardinality, ordering, or semantics in ways that make
@@ -50,7 +73,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 	// Direct reference to the scan table
 	if (colref.binding.table_index == get.table_index) {
 		auto &col_ids = get.GetColumnIds();
-		idx_t binding_idx = colref.binding.column_index;
+		idx_t binding_idx = colref.binding.column_index.index;
 		if (binding_idx >= col_ids.size()) {
 			return false;
 		}
@@ -64,7 +87,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 		if (colref.binding.table_index != proj->table_index) {
 			continue;
 		}
-		idx_t proj_col_idx = colref.binding.column_index;
+		idx_t proj_col_idx = colref.binding.column_index.index;
 		if (proj_col_idx >= proj->expressions.size()) {
 			continue;
 		}
@@ -78,7 +101,7 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 		auto &inner_colref = proj_expr.Cast<BoundColumnRefExpression>();
 		if (inner_colref.binding.table_index == get.table_index) {
 			auto &col_ids = get.GetColumnIds();
-			idx_t binding_idx = inner_colref.binding.column_index;
+			idx_t binding_idx = inner_colref.binding.column_index.index;
 			if (binding_idx >= col_ids.size()) {
 				return false;
 			}
@@ -97,12 +120,12 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 // Only pushes simple column references that map to the firestore_scan's table.
 // Resolves column references through projection layers since ORDER BY expressions
 // reference the projection's table_index, not the scan's table_index directly.
-static bool TryExtractOrderBy(LogicalGet &get, LogicalOrder &order, FirestoreScanBindData &bind_data,
+static bool TryExtractOrderBy(LogicalGet &get, const vector<BoundOrderByNode> &orders, FirestoreScanBindData &bind_data,
                               const std::vector<LogicalProjection *> &projections) {
 	std::vector<OrderByField> fields;
 
-	for (size_t oi = 0; oi < order.orders.size(); oi++) {
-		auto &ob = order.orders[oi];
+	for (size_t oi = 0; oi < orders.size(); oi++) {
+		auto &ob = orders[oi];
 		// Only handle simple column references - skip expressions like score + 1
 		if (ob.expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
 			FS_LOG_DEBUG("ORDER BY expression is not a simple column ref, skipping pushdown");
@@ -179,26 +202,41 @@ static bool TryExtractLimit(LogicalLimit &limit_op, FirestoreScanBindData &bind_
 	return true;
 }
 
+static bool TryExtractLimit(LogicalTopN &topn_op, FirestoreScanBindData &bind_data) {
+	int64_t limit_value = static_cast<int64_t>(topn_op.limit + topn_op.offset);
+	FS_LOG_DEBUG("SQL TOP_N pushdown: limit=" + std::to_string(limit_value));
+	bind_data.sql_pushed_limit = limit_value;
+	return true;
+}
+
 // Recursively walk the logical plan tree top-down, tracking the nearest
 // LogicalOrder, LogicalLimit, and LogicalProjection ancestors. When we find
 // a LogicalGet for firestore_scan, inject the extracted ORDER BY / LIMIT
 // into bind_data.
 static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, LogicalLimit *current_limit,
-                         std::vector<LogicalProjection *> &projections) {
+                         LogicalTopN *current_topn, std::vector<LogicalProjection *> &projections) {
 	// If this is a barrier operator, reset tracking - ORDER BY / LIMIT above
 	// a barrier don't apply to scans below it
 	if (IsBarrierOperator(op.type)) {
 		current_order = nullptr;
 		current_limit = nullptr;
+		current_topn = nullptr;
 		projections.clear();
 	}
 
 	// Track ORDER BY, LIMIT, and Projection nodes as we descend
 	if (op.type == LogicalOperatorType::LOGICAL_LIMIT) {
 		current_limit = &op.Cast<LogicalLimit>();
+		current_topn = nullptr;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_ORDER_BY) {
 		current_order = &op.Cast<LogicalOrder>();
+		current_topn = nullptr;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_TOP_N) {
+		current_topn = &op.Cast<LogicalTopN>();
+		current_order = nullptr;
+		current_limit = nullptr;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		projections.push_back(&op.Cast<LogicalProjection>());
@@ -209,10 +247,58 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 		auto &get = op.Cast<LogicalGet>();
 		if (get.function.name == "firestore_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->CastNoConst<FirestoreScanBindData>();
+			bind_data.sql_pushed_order_by.clear();
+			bind_data.sql_pushed_limit.reset();
+
+			// Document-path scans return virtual rows derived from listCollectionIds,
+			// not Firestore documents. Extract ORDER BY / LIMIT into docpath-specific fields.
+			if (bind_data.is_document_path || IsDocumentPathCollection(bind_data.collection)) {
+				// Extract ORDER BY __document_id into docpath_named_order if not set by named param
+				if (bind_data.docpath_named_order == DocPathOrderType::NONE) {
+					const auto *order_nodes =
+					    current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
+					if (order_nodes && order_nodes->size() == 1) {
+						auto &ob = (*order_nodes)[0];
+						if (ob.expression->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+							auto &colref = ob.expression->Cast<BoundColumnRefExpression>();
+							idx_t col_idx;
+							if (ResolveColumnThroughProjections(colref, get, projections, col_idx) &&
+							    col_idx < get.names.size() && get.names[col_idx] == "__document_id") {
+								bind_data.docpath_named_order =
+								    ob.type == OrderType::DESCENDING ? DocPathOrderType::DESCENDING : DocPathOrderType::ASCENDING;
+							}
+						}
+					}
+				}
+
+				// Extract LIMIT using existing TryExtractLimit (writes to sql_pushed_limit)
+				if (!bind_data.limit.has_value() && current_limit) {
+					TryExtractLimit(*current_limit, bind_data);
+				}
+				if (!bind_data.limit.has_value() && current_topn) {
+					TryExtractLimit(*current_topn, bind_data);
+				}
+
+				// EXPLAIN info
+				auto &existing = get.extra_info.file_filters;
+				existing.clear();
+				if (bind_data.docpath_named_order != DocPathOrderType::NONE) {
+					existing = "DocPath Order: __document_id";
+					if (bind_data.docpath_named_order == DocPathOrderType::DESCENDING) {
+						existing += " DESC";
+					}
+					auto eff_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+					if (eff_limit.has_value()) {
+						existing += " LIMIT " + std::to_string(eff_limit.value());
+					}
+				}
+				return;
+			}
 
 			// Only inject ORDER BY if named param was not already set
-			if (bind_data.parsed_order_by.empty() && current_order) {
-				if (TryExtractOrderBy(get, *current_order, bind_data, projections)) {
+			const auto *order_nodes = current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
+			if (bind_data.parsed_order_by.empty() && order_nodes) {
+				if (TryExtractOrderBy(get, *order_nodes, bind_data, projections)) {
 					// Build EXPLAIN info
 					std::string info;
 					for (auto &f : bind_data.sql_pushed_order_by) {
@@ -233,12 +319,22 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 			}
 
 			// Only inject LIMIT if named scan_limit was not already set.
-			// Also skip when named order_by is set but SQL ORDER BY was not pushed:
-			// the server sorts by the named param's order, so applying the SQL LIMIT
-			// server-side would cut off rows based on a different sort order.
+			// Skip when an ORDER BY exists but was not pushed, because applying the
+			// LIMIT server-side would cut off rows before DuckDB can perform the
+			// client-side sort.
 			bool named_order_blocks_limit = !bind_data.parsed_order_by.empty() && bind_data.sql_pushed_order_by.empty();
-			if (!bind_data.limit.has_value() && !named_order_blocks_limit && current_limit) {
+			bool sql_order_blocks_limit = order_nodes && bind_data.sql_pushed_order_by.empty();
+			if (!bind_data.limit.has_value() && !named_order_blocks_limit && !sql_order_blocks_limit && current_limit) {
 				if (TryExtractLimit(*current_limit, bind_data)) {
+					auto &existing = get.extra_info.file_filters;
+					if (!existing.empty()) {
+						existing += " | ";
+					}
+					existing += "Firestore Pushed Limit: " + std::to_string(bind_data.sql_pushed_limit.value());
+				}
+			}
+			if (!bind_data.limit.has_value() && !named_order_blocks_limit && !sql_order_blocks_limit && current_topn) {
+				if (TryExtractLimit(*current_topn, bind_data)) {
 					auto &existing = get.extra_info.file_filters;
 					if (!existing.empty()) {
 						existing += " | ";
@@ -251,13 +347,13 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 
 	// Recurse into children
 	for (auto &child : op.children) {
-		WalkPlanTree(*child, current_order, current_limit, projections);
+		WalkPlanTree(*child, current_order, current_limit, current_topn, projections);
 	}
 }
 
 void FirestorePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	std::vector<LogicalProjection *> projections;
-	WalkPlanTree(*plan, nullptr, nullptr, projections);
+	WalkPlanTree(*plan, nullptr, nullptr, nullptr, projections);
 }
 
 } // namespace duckdb

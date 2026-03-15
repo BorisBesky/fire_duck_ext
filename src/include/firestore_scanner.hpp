@@ -9,6 +9,12 @@ namespace duckdb {
 
 class ExtensionLoader;
 
+enum class DocPathOrderType : uint8_t {
+	NONE = 0,
+	ASCENDING,
+	DESCENDING
+};
+
 // Bind data - stores parameters from SQL call
 struct FirestoreScanBindData : public TableFunctionData {
 	std::string collection;
@@ -30,6 +36,13 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Show missing/phantom documents (documents with no fields, only subcollections)
 	bool show_missing = true;
 
+	// Document path mode: when the path has even segments (e.g. "artifacts/default-app-id"),
+	// we list subcollections during execution and return them as virtual __document_id rows.
+	bool is_document_path = false;
+
+	// Document-path ordering direction (from named param or SQL ORDER BY).
+	DocPathOrderType docpath_named_order = DocPathOrderType::NONE;
+
 	// Index cache - populated at bind time for filter pushdown
 	std::shared_ptr<FirestoreIndexCache> index_cache;
 
@@ -43,12 +56,55 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// The original SQL ORDER BY / LIMIT nodes are left in place so DuckDB re-verifies results.
 	std::vector<OrderByField> sql_pushed_order_by;
 	std::optional<int64_t> sql_pushed_limit;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<FirestoreScanBindData>();
+		*copy = *this;
+		return std::move(copy);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<FirestoreScanBindData>();
+
+		bool credentials_equal = credentials == other.credentials;
+		if (!credentials_equal && credentials && other.credentials) {
+			credentials_equal = credentials->type == other.credentials->type &&
+			                    credentials->project_id == other.credentials->project_id &&
+			                    credentials->database_id == other.credentials->database_id &&
+			                    credentials->client_email == other.credentials->client_email &&
+			                    credentials->api_key == other.credentials->api_key;
+		}
+
+		auto order_fields_equal = [](const std::vector<OrderByField> &left,
+		                             const std::vector<OrderByField> &right) -> bool {
+			if (left.size() != right.size()) {
+				return false;
+			}
+			for (idx_t i = 0; i < left.size(); i++) {
+				if (left[i].field_path != right[i].field_path || left[i].direction != right[i].direction) {
+					return false;
+				}
+			}
+			return true;
+		};
+
+		return collection == other.collection && column_names == other.column_names && column_types == other.column_types &&
+		       projected_columns == other.projected_columns && limit == other.limit && order_by == other.order_by &&
+		       order_fields_equal(parsed_order_by, other.parsed_order_by) &&
+		       is_collection_group == other.is_collection_group && show_missing == other.show_missing &&
+		       is_document_path == other.is_document_path &&
+		       docpath_named_order == other.docpath_named_order && credentials_equal &&
+		       order_fields_equal(sql_pushed_order_by, other.sql_pushed_order_by) &&
+		       sql_pushed_limit == other.sql_pushed_limit;
+	}
 };
 
 // Global state - shared across threads
 struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<FirestoreClient> client;
 	std::vector<FirestoreDocument> documents;
+	std::vector<std::string> docpath_ids;
+	bool is_document_path = false;
 	idx_t current_index;
 	bool finished;
 	std::string next_page_token;

@@ -12,15 +12,9 @@ struct FirestoreSettings {
 	static constexpr int64_t kDefaultSchemaCacheTTLSeconds = 3600;
 
 	static int64_t SchemaCacheTTLSeconds(const ClientContext &context) {
-		auto &client_config = ClientConfig::GetConfig(context);
-		auto client_it = client_config.set_variables.find("firestore_schema_cache_ttl");
-		if (client_it != client_config.set_variables.end()) {
-			return NormalizeTTL(client_it->second);
-		}
-		auto &db_config = DBConfig::GetConfig(context);
-		auto db_it = db_config.options.set_variables.find("firestore_schema_cache_ttl");
-		if (db_it != db_config.options.set_variables.end()) {
-			return NormalizeTTL(db_it->second);
+		Value ttl_value;
+		if (context.TryGetCurrentSetting("firestore_schema_cache_ttl", ttl_value)) {
+			return NormalizeTTL(ttl_value);
 		}
 		return kDefaultSchemaCacheTTLSeconds;
 	}

@@ -194,7 +194,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// and injects the info into bind data so Firestore can apply them server-side.
 	OptimizerExtension firestore_optimizer;
 	firestore_optimizer.pre_optimize_function = FirestorePreOptimize;
-	config.optimizer_extensions.push_back(std::move(firestore_optimizer));
+	OptimizerExtension::Register(config, std::move(firestore_optimizer));
 }
 
 void FireDuckExtExtension::Load(ExtensionLoader &loader) {

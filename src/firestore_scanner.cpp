@@ -8,7 +8,9 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include <algorithm>
 #include <chrono>
+
 
 namespace duckdb {
 
@@ -30,7 +32,6 @@ struct CachedSchemaEntry {
 // Cache of inferred schemas and index metadata for collections
 static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
 static std::mutex schema_cache_mutex;
-
 // Function to clear the schema cache (exposed for testing/manual refresh)
 // If collection is empty, clears entire cache. Otherwise clears entries matching the collection.
 void ClearFirestoreSchemaCache(const std::string &collection) {
@@ -140,7 +141,7 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 
 	for (auto &filter : filters) {
 		auto converted =
-		    ConvertExpressionToFilters(*filter, get.table_index, get.names, get.returned_types, column_id_map);
+		    ConvertExpressionToFilters(*filter, get.table_index.index, get.names, get.returned_types, column_id_map);
 		bind_data.candidate_pushdown_filters.insert(bind_data.candidate_pushdown_filters.end(),
 		                                            std::make_move_iterator(converted.begin()),
 		                                            std::make_move_iterator(converted.end()));
@@ -176,6 +177,103 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 	// ensuring correctness regardless of Firestore's filtering semantics.
 }
 
+// Count the number of path segments (split by '/'), ignoring leading/trailing slashes.
+// Odd segments = collection path (e.g. "users" or "users/uid/orders")
+// Even segments = document path (e.g. "users/uid" or "users/uid/orders/oid")
+static int CountPathSegments(const std::string &path) {
+	int count = 0;
+	bool in_segment = false;
+	for (char c : path) {
+		if (c == '/') {
+			in_segment = false;
+		} else if (!in_segment) {
+			in_segment = true;
+			count++;
+		}
+	}
+	return count;
+}
+
+static bool IsDocumentPath(const std::string &path) {
+	int segments = CountPathSegments(path);
+	return segments >= 2 && segments % 2 == 0;
+}
+
+static std::string TrimWhitespace(const std::string &s) {
+	size_t start = s.find_first_not_of(" \t\r\n");
+	if (start == std::string::npos) {
+		return "";
+	}
+	size_t end = s.find_last_not_of(" \t\r\n");
+	return s.substr(start, end - start + 1);
+}
+
+static bool TryGetDocPathOrderType(const std::string &order_by, DocPathOrderType &out_order) {
+	std::string trimmed = TrimWhitespace(order_by);
+	if (trimmed.empty() || trimmed.find(',') != std::string::npos) {
+		return false;
+	}
+
+	size_t space = trimmed.find(' ');
+	std::string field_name = space == std::string::npos ? trimmed : trimmed.substr(0, space);
+	if (field_name != "__document_id") {
+		return false;
+	}
+
+	std::string direction = space == std::string::npos ? "" : TrimWhitespace(trimmed.substr(space + 1));
+	if (direction.empty() || direction == "ASC" || direction == "asc" || direction == "ASCENDING" ||
+	    direction == "ascending") {
+		out_order = DocPathOrderType::ASCENDING;
+		return true;
+	}
+	if (direction == "DESC" || direction == "desc" || direction == "DESCENDING" || direction == "descending") {
+		out_order = DocPathOrderType::DESCENDING;
+		return true;
+	}
+	return false;
+}
+
+static bool TryGetDocPathOrderType(const std::vector<OrderByField> &order_by_fields, DocPathOrderType &out_order) {
+	if (order_by_fields.size() != 1) {
+		return false;
+	}
+	if (order_by_fields[0].field_path != "__document_id") {
+		return false;
+	}
+	out_order = order_by_fields[0].direction == "DESCENDING" ? DocPathOrderType::DESCENDING
+	                                                         : DocPathOrderType::ASCENDING;
+	return true;
+}
+
+static void SortDocPathIds(std::vector<std::string> &ids, DocPathOrderType order) {
+	if (order == DocPathOrderType::NONE) {
+		return;
+	}
+	std::sort(ids.begin(), ids.end());
+	if (order == DocPathOrderType::DESCENDING) {
+		std::reverse(ids.begin(), ids.end());
+	}
+}
+
+static std::vector<std::string> FetchDocPathIds(FirestoreClient &client, const std::string &document_path) {
+	std::vector<std::string> ids;
+	std::optional<std::string> page_token;
+	do {
+		auto page = client.ListCollectionIdsPage(document_path, page_token, 100);
+		for (auto &id : page.collection_ids) {
+			ids.push_back(id);
+		}
+
+		if (page.next_page_token.empty()) {
+			page_token.reset();
+		} else {
+			page_token = page.next_page_token;
+		}
+	} while (page_token.has_value());
+
+	return ids;
+}
+
 void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	TableFunction scan_func("firestore_scan", {LogicalType::VARCHAR}, // collection name (required)
 	                        FirestoreScanFunction, FirestoreScanBind, FirestoreScanInitGlobal, FirestoreScanInitLocal);
@@ -205,6 +303,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Get collection name (required first positional argument)
 	result->collection = input.inputs[0].GetValue<string>();
+	fprintf(stderr, "[DEBUG-BIND] collection='%s'\n", result->collection.c_str());
+	fflush(stderr);
 
 	// Process named parameters
 	std::optional<std::string> project_id;
@@ -238,6 +338,29 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		throw BinderException(
 		    "No Firestore credentials found. Provide credentials parameter, "
 		    "create a secret with CREATE SECRET, or set GOOGLE_APPLICATION_CREDENTIALS environment variable.");
+	}
+
+	// Detect document paths (even number of segments like "users/uid" or "artifacts/default-app-id").
+	// Return a single __document_id column and defer subcollection lookup until execution time.
+	bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
+	if (!is_collection_group && IsDocumentPath(result->collection)) {
+		// Return subcollection names as virtual __document_id rows.
+		result->is_document_path = true;
+		DocPathOrderType docpath_order = DocPathOrderType::NONE;
+		bool has_supported_docpath_order =
+		    result->order_by.has_value() ? TryGetDocPathOrderType(result->order_by.value(), docpath_order)
+		                                 : TryGetDocPathOrderType(result->parsed_order_by, docpath_order);
+		if (result->order_by.has_value() || !result->parsed_order_by.empty()) {
+			if (!has_supported_docpath_order) {
+				throw BinderException(
+				    "Document-path scans only support order_by on __document_id with an optional ASC/DESC direction");
+			}
+			result->docpath_named_order = docpath_order;
+		}
+
+		names.push_back("__document_id");
+		return_types.push_back(LogicalType::VARCHAR);
+		return std::move(result);
 	}
 
 	std::string cache_key =
@@ -390,6 +513,45 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	}
 
 	auto global_state = make_uniq<FirestoreScanGlobalState>();
+
+	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
+	if (bind_data.is_document_path) {
+		global_state->is_document_path = true;
+		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+
+		auto order = bind_data.docpath_named_order;
+		// Only apply limit at scan level when we also control ordering.
+		// If order is NONE, DuckDB may need all rows for a client-side sort+limit.
+		std::optional<int64_t> effective_docpath_limit;
+		if (order != DocPathOrderType::NONE) {
+			effective_docpath_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+		}
+
+		// Clear SQL pushdown fields — docpath scans are not Firestore document queries.
+		bind_data.sql_pushed_order_by.clear();
+		bind_data.sql_pushed_limit.reset();
+
+		try {
+			global_state->docpath_ids = FetchDocPathIds(*global_state->client, bind_data.collection);
+			if (order != DocPathOrderType::NONE) {
+				SortDocPathIds(global_state->docpath_ids, order);
+			}
+			if (effective_docpath_limit.has_value() && effective_docpath_limit.value() >= 0) {
+				auto lim = static_cast<size_t>(effective_docpath_limit.value());
+				if (global_state->docpath_ids.size() > lim) {
+					global_state->docpath_ids.resize(lim);
+				}
+			}
+		} catch (...) {
+			global_state->docpath_ids.clear();
+		}
+		global_state->current_index = 0;
+		global_state->finished = global_state->docpath_ids.empty();
+		FS_LOG_DEBUG("Document path '" + bind_data.collection + "' has " +
+		             std::to_string(global_state->docpath_ids.size()) + " subcollections");
+		return std::move(global_state);
+	}
+
 	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
 
 	// Check if this is a collection group query (starts with ~)
@@ -607,9 +769,38 @@ unique_ptr<LocalTableFunctionState> FirestoreScanInitLocal(ExecutionContext &con
 void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->CastNoConst<FirestoreScanBindData>();
 	auto &global_state = data.global_state->Cast<FirestoreScanGlobalState>();
+	bool is_document_path_mode = global_state.is_document_path;
 
 	if (global_state.finished) {
 		output.SetCardinality(0);
+		return;
+	}
+
+	if (is_document_path_mode) {
+		fprintf(stderr, "[DEBUG-SCAN-DOCPATH] available=%llu current_index=%llu\n",
+		        static_cast<unsigned long long>(global_state.docpath_ids.size()),
+		        static_cast<unsigned long long>(global_state.current_index));
+		fflush(stderr);
+		idx_t available = global_state.docpath_ids.size();
+		if (global_state.current_index >= available) {
+			global_state.finished = true;
+			output.SetCardinality(0);
+			return;
+		}
+
+		idx_t count = 0;
+		idx_t max_count = std::min<idx_t>(STANDARD_VECTOR_SIZE, available - global_state.current_index);
+		auto out_data = FlatVector::GetData<string_t>(output.data[0]);
+
+		while (count < max_count) {
+			const auto &doc_id = global_state.docpath_ids[global_state.current_index++];
+			out_data[count++] = StringVector::AddString(output.data[0], doc_id);
+		}
+
+		if (global_state.current_index >= available) {
+			global_state.finished = true;
+		}
+		output.SetCardinality(count);
 		return;
 	}
 
@@ -621,7 +812,10 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	// node, so cutting off here would drop rows that might match the WHERE clause.
 	// This happens when: (a) pushdown was attempted but failed at runtime, or
 	// (b) candidate filters exist but none were pushed (e.g. collection group without indexes).
-	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+	auto effective_limit = bind_data.limit;
+	if (!effective_limit.has_value() && !is_document_path_mode) {
+		effective_limit = bind_data.sql_pushed_limit;
+	}
 	bool has_unpushed_filters =
 	    !bind_data.candidate_pushdown_filters.empty() && !global_state.pushdown_result.has_pushdown();
 	if (effective_limit.has_value() && !global_state.pushdown_failed && !has_unpushed_filters) {

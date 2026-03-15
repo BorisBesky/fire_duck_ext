@@ -418,10 +418,10 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	// Returns false if the column can't be resolved to a pushable field.
 	auto resolve_column = [&](const BoundColumnRefExpression &col_ref, std::string &out_name,
 	                          LogicalType &out_type) -> bool {
-		if (col_ref.binding.table_index != table_index) {
+		if (col_ref.binding.table_index.index != table_index) {
 			return false;
 		}
-		idx_t binding_idx = col_ref.binding.column_index;
+		idx_t binding_idx = col_ref.binding.column_index.index;
 		if (binding_idx >= column_id_map.size()) {
 			return false;
 		}

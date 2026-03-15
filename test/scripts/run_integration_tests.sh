@@ -4,11 +4,11 @@
 
 set -e
 
-# Find duckdb binary - prefer system installation over local build
-if command -v duckdb &> /dev/null; then
-    DUCKDB="duckdb"
-elif [ -x "./build/release/duckdb" ]; then
+# Find duckdb binary - prefer the locally built binary so it matches the extension.
+if [ -x "./build/release/duckdb" ]; then
     DUCKDB="./build/release/duckdb"
+elif command -v duckdb &> /dev/null; then
+    DUCKDB="duckdb"
 else
     echo "Error: duckdb not found. Install DuckDB or build from source."
     exit 1
@@ -16,13 +16,18 @@ fi
 
 EXT_PATH="build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension"
 
+# Strip ANSI escapes and whitespace so assertions see stable values.
+clean_query_output() {
+    sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' | tr -d '[:space:]"'
+}
+
 # Helper: run a DuckDB query and return the trimmed last line of output
 run_query() {
     $DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
 CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
 $1
-" 2>&1 | tail -1 | tr -d '[:space:]"'
+" 2>&1 | tail -1 | clean_query_output
 }
 
 # Helper: assert equality
@@ -206,6 +211,9 @@ assert_eq "$ORDER_COUNT" "2" "User1 has 2 orders"
 
 ORDER_PRODUCT=$(run_query "SELECT product FROM firestore_scan('users/user1/orders') WHERE __document_id = 'order1';")
 assert_eq "$ORDER_PRODUCT" "Widget" "Order1 product is Widget"
+
+# Document-path scan coverage lives in run_real_firestore_tests.sh because
+# Firestore's listCollectionIds metadata operation requires admin-capable auth.
 
 # Test 7: Collection group query
 echo "Test 7: Collection group query (all orders across all users)..."
@@ -1034,7 +1042,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET conn_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT 'connected';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CONNECT_RESULT" "connected" "firestore_connect succeeds for (default) database"
 
 # Test 52: firestore_disconnect clears session database
@@ -1045,7 +1053,7 @@ CREATE SECRET disc_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fak
 CALL firestore_connect('(default)');
 CALL firestore_disconnect();
 SELECT 'disconnected';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DISCONNECT_RESULT" "disconnected" "firestore_disconnect succeeds"
 
 # Test 53: firestore_connect with wildcard secret
@@ -1055,7 +1063,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET wild_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
 CALL firestore_connect('any-database');
 SELECT 'wildcard_works';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wildcard database secret"
 
 # Test 53b: firestore_connect with DATABASES list secret
@@ -1065,7 +1073,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET list_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('(default)');
 SELECT 'list_default_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DATABASES_LIST_RESULT" "list_default_ok" "firestore_connect works with DATABASES list (matching first entry)"
 
 DATABASES_LIST_OTHER=$($DUCKDB -unsigned -csv -noheader -c "
@@ -1073,7 +1081,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET list_test2 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('other-db');
 SELECT 'list_other_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DATABASES_LIST_OTHER" "list_other_ok" "firestore_connect works with DATABASES list (matching second entry)"
 
 DATABASES_LIST_NOMATCH=$($DUCKDB -unsigned -csv -noheader -c "
@@ -1116,7 +1124,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET cq_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT value FROM firestore_scan('connect_test') WHERE __document_id = 'ct1';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CONNECTED_QUERY" "from_default_db" "Query uses connected database"
 
 # Clean up connect test data
@@ -1133,7 +1141,7 @@ CREATE SECRET ov_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-
 CALL firestore_connect('connected-db');
 -- This should use '(default)' database, not 'connected-db'
 SELECT count(*) FROM firestore_scan('users', database := '(default)');
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 # We just need this to not error - the exact count depends on seeded data
 if [[ "$OVERRIDE_CHECK" =~ ^[0-9]+$ ]]; then
     echo "PASS: Per-query database parameter override works"
@@ -1153,7 +1161,7 @@ CALL firestore_connect('db2');
 CALL firestore_disconnect();
 CALL firestore_connect('(default)');
 SELECT 'cycles_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CYCLE_RESULT" "cycles_ok" "Multiple connect/disconnect cycles work"
 
 # Test 58: Connect to (default) explicitly resets to default
@@ -1164,7 +1172,7 @@ CREATE SECRET reset_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fa
 CALL firestore_connect('custom-db');
 CALL firestore_connect('(default)');
 SELECT 'reset_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DEFAULT_RESET" "reset_ok" "firestore_connect('(default)') works as reset"
 
 # ============================================
@@ -1339,7 +1347,7 @@ PQ_OVERRIDE=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
 CREATE SECRET __pq (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
 SELECT count(*) FROM firestore_scan('np_test', project_id='test-project', api_key='fake-key');
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$PQ_OVERRIDE" "5" "Per-query project_id + api_key override returns 5 rows"
 
 # Test 72: credentials parameter accepted (invalid path should error gracefully)
