@@ -11,6 +11,8 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Array transforms** with `firestore_array_union()`, `firestore_array_remove()`, `firestore_array_append()`
 - **Collection group queries** for querying across nested collections
 - **Filter pushdown** sends supported WHERE clauses to Firestore for faster queries
+- **SQL ORDER BY / LIMIT pushdown** for faster top-N and sorted scans
+- **Collection ID listings** by scanning a Firestore document path
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -166,6 +168,7 @@ CREATE SECRET emulator (
 |----------|-------------|
 | `firestore_scan('collection')` | Read all documents from a collection |
 | `firestore_scan('~collection')` | Collection group query (all subcollections) |
+| `firestore_scan('collection/doc_id')` | List direct subcollection IDs under a document path |
 | `firestore_insert('collection', (SELECT ...), document_id := 'col')` | Insert documents from a subquery |
 | `firestore_update('collection', 'doc_id', 'field1', value1, ...)` | Update fields on a single document |
 | `firestore_delete('collection', 'doc_id')` | Delete a document |
@@ -200,8 +203,8 @@ SELECT * FROM firestore_scan('users', database='my-other-db');
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `scan_limit` | BIGINT | Maximum number of documents to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. Use SQL `LIMIT` when you need exact result-count control. |
-| `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). Multi-field ordering requires a composite index. |
+| `scan_limit` | BIGINT | Maximum number of rows to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. SQL `LIMIT` can also be pushed down automatically, and named `scan_limit` takes precedence when both are present. |
+| `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). SQL `ORDER BY` can also be pushed down automatically, and named `order_by` takes precedence when both are present. Multi-field ordering requires a composite index. |
 | `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
 
 ```sql
@@ -288,6 +291,60 @@ FROM firestore_scan('embeddings') a, firestore_scan('embeddings') b
 WHERE a.label < b.label;
 ```
 
+## SQL ORDER BY / LIMIT Pushdown
+
+`firestore_scan()` can automatically push simple SQL `ORDER BY`, `LIMIT`, and `OFFSET` clauses down to Firestore, reducing the number of documents fetched for sorted and top-N queries.
+
+Supported patterns include:
+
+- `ORDER BY field`
+- `ORDER BY field DESC`
+- `ORDER BY field1, field2`
+- `LIMIT n`
+- `ORDER BY ... LIMIT n`
+- `ORDER BY ... LIMIT n OFFSET m` (pushed as `LIMIT n + m`, with DuckDB applying the final offset)
+
+Named parameters still work and take precedence over SQL pushdown:
+
+- If `order_by=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
+- If `scan_limit=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
+
+```sql
+-- SQL ORDER BY + LIMIT pushed to Firestore
+SELECT name, score
+FROM firestore_scan('leaderboard')
+ORDER BY score DESC
+LIMIT 5;
+
+-- Multi-field SQL ORDER BY pushdown
+SELECT *
+FROM firestore_scan('leaderboard')
+ORDER BY category, score DESC
+LIMIT 10;
+
+-- Named parameters override SQL pushdown
+SELECT name
+FROM firestore_scan('leaderboard', order_by='score', scan_limit=10)
+ORDER BY name DESC
+LIMIT 3;
+```
+
+Use `EXPLAIN` to verify when SQL ordering and limits are being pushed:
+
+```sql
+EXPLAIN
+SELECT *
+FROM firestore_scan('leaderboard')
+WHERE status = 'active'
+ORDER BY score DESC
+LIMIT 5;
+
+-- Shows:
+-- Firestore Pushed Filters: status EQUAL 'active'
+-- Firestore Pushed Order: score DESC
+-- Firestore Pushed Limit: 5
+```
+
 ## Filter Pushdown
 
 The extension pushes supported WHERE clauses to Firestore's query API to reduce data transfer. Supported filters:
@@ -305,6 +362,40 @@ Use `EXPLAIN` to see which filters are pushed down:
 ```sql
 EXPLAIN SELECT * FROM firestore_scan('users') WHERE status = 'active' AND age > 25;
 -- Shows "Firestore Pushed Filters: status EQUAL 'active', age GREATER_THAN 25"
+```
+
+## Collection ID Listings
+
+When `firestore_scan()` is given a document path instead of a collection path, it lists that document's direct subcollection IDs instead of reading documents. This is useful for discovering unknown nested collection names.
+
+The result contains a single `__document_id` column, where each row is a subcollection ID:
+
+```sql
+-- List direct subcollections under users/user1
+SELECT __document_id
+FROM firestore_scan('users/user1');
+
+-- Example results:
+-- orders
+-- notes
+-- settings
+```
+
+Document-path scans support:
+
+- Pagination across large numbers of subcollections
+- SQL `ORDER BY __document_id` pushdown
+- SQL `LIMIT` pushdown
+- Named `order_by='__document_id'` or `order_by='__document_id DESC'`, plus `scan_limit=...`
+
+Other ordering expressions still work, but they are evaluated in DuckDB after fetching the subcollection IDs.
+
+```sql
+-- Server-side sort and limit on subcollection IDs
+SELECT __document_id
+FROM firestore_scan('users/user1')
+ORDER BY __document_id DESC
+LIMIT 5;
 ```
 
 ## Missing Documents
