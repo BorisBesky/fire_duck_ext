@@ -302,8 +302,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Get collection name (required first positional argument)
 	result->collection = input.inputs[0].GetValue<string>();
-	fprintf(stderr, "[DEBUG-BIND] collection='%s'\n", result->collection.c_str());
-	fflush(stderr);
+	FS_LOG_DEBUG("[DEBUG-BIND] collection='%s'", result->collection.c_str());
 
 	// Process named parameters
 	std::optional<std::string> project_id;
