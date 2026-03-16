@@ -436,6 +436,9 @@ export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
 # Build
 make release
 
+# Extension only build:
+cmake --build build/release --config Release --target fire_duck_ext_loadable_extension
+
 # Run tests
 make test
 ```

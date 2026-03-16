@@ -882,7 +882,9 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				FirestoreQuery query;
 				query.show_missing = bind_data.show_missing;
 				query.page_token = global_state.next_page_token;
-				if (!bind_data.parsed_order_by.empty()) {
+				bool can_order_named =
+				    !bind_data.parsed_order_by.empty() && CanOrderByOnServer(bind_data.parsed_order_by, bind_data);
+				if (can_order_named) {
 					query.order_by = FormatOrderByForREST(bind_data.parsed_order_by);
 				}
 
