@@ -271,9 +271,11 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 	// so skip showMissing when an order_by is specified.
 	if (query.show_missing) {
 		if (!GetEmulatorHost().empty()) {
-			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does not support it.");
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does "
+			             "not support it.");
 		} else if (query.order_by.has_value()) {
-			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow showMissing together with orderBy; ordered scans will not include phantom documents.");
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow "
+			             "showMissing together with orderBy; ordered scans will not include phantom documents.");
 		} else {
 			add_param("showMissing", "true");
 		}
