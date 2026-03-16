@@ -14,16 +14,11 @@ CREATE SECRET pushdown_test (
 );
 
 # Test: ORDER BY + LIMIT on firestore_scan - should fail at API call, not at optimizer
-# The optimizer extracts ORDER BY and LIMIT from the SQL and injects them into bind data
-
-# First, verify via EXPLAIN that ORDER BY and LIMIT are pushed down into the Firestore scan.
-query T
-EXPLAIN SELECT * FROM firestore_scan('users') ORDER BY name LIMIT 10;
-----
-Firestore Pushed Order:
-Firestore Pushed Limit:
-
-# Then, ensure the actual execution still fails at API/schema inference time.
+# The optimizer extracts ORDER BY and LIMIT from the SQL and injects them into bind data.
+# Local sqllogictests cannot assert EXPLAIN output reliably because bind still needs
+# live Firestore schema inference to resolve scan columns like `name`.
+# EXPLAIN plan coverage lives in test/scripts/run_real_firestore_tests.sh
+# (tests 18-25) instead.
 statement error
 SELECT * FROM firestore_scan('users') ORDER BY name LIMIT 10;
 ----

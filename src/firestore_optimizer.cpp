@@ -1,4 +1,5 @@
 #include "firestore_optimizer.hpp"
+#include "firestore_path_utils.hpp"
 #include "firestore_scanner.hpp"
 #include "firestore_logger.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -10,28 +11,6 @@
 #include "duckdb/common/enums/logical_operator_type.hpp"
 
 namespace duckdb {
-
-static int CountPathSegments(const std::string &path) {
-	int count = 0;
-	bool in_segment = false;
-	for (char c : path) {
-		if (c == '/') {
-			in_segment = false;
-		} else if (!in_segment) {
-			in_segment = true;
-			count++;
-		}
-	}
-	return count;
-}
-
-static bool IsDocumentPathCollection(const std::string &collection) {
-	if (!collection.empty() && collection[0] == '~') {
-		return false;
-	}
-	int segments = CountPathSegments(collection);
-	return segments >= 2 && segments % 2 == 0;
-}
 
 // Returns true if this operator type blocks ORDER BY / LIMIT from applying to child scans.
 // These operators transform result cardinality, ordering, or semantics in ways that make
@@ -255,7 +234,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 
 			// Document-path scans return virtual rows derived from listCollectionIds,
 			// not Firestore documents. Extract ORDER BY / LIMIT into docpath-specific fields.
-			if (bind_data.is_document_path || IsDocumentPathCollection(bind_data.collection)) {
+			if (bind_data.is_document_path || IsFirestoreDocumentPathCollection(bind_data.collection)) {
 				// Extract ORDER BY __document_id into docpath_named_order if not set by named param
 				if (bind_data.docpath_named_order == DocPathOrderType::NONE) {
 					const auto *order_nodes =

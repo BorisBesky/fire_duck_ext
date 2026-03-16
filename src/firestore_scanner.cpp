@@ -4,8 +4,8 @@
 #include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
 #include "firestore_error.hpp"
+#include "firestore_path_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include <algorithm>
@@ -28,12 +28,21 @@ struct CachedSchemaEntry {
 	}
 };
 
-// Cache of inferred schemas and index metadata for collections
-static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
-static std::mutex schema_cache_mutex;
+static std::unordered_map<std::string, CachedSchemaEntry> &GetSchemaCache() {
+	static std::unordered_map<std::string, CachedSchemaEntry> schema_cache;
+	return schema_cache;
+}
+
+static std::mutex &GetSchemaCacheMutex() {
+	static std::mutex schema_cache_mutex;
+	return schema_cache_mutex;
+}
+
 // Function to clear the schema cache (exposed for testing/manual refresh)
 // If collection is empty, clears entire cache. Otherwise clears entries matching the collection.
 void ClearFirestoreSchemaCache(const std::string &collection) {
+	auto &schema_cache = GetSchemaCache();
+	auto &schema_cache_mutex = GetSchemaCacheMutex();
 	std::lock_guard<std::mutex> lock(schema_cache_mutex);
 	if (collection.empty()) {
 		schema_cache.clear();
@@ -176,28 +185,6 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 	// ensuring correctness regardless of Firestore's filtering semantics.
 }
 
-// Count the number of path segments (split by '/'), ignoring leading/trailing slashes.
-// Odd segments = collection path (e.g. "users" or "users/uid/orders")
-// Even segments = document path (e.g. "users/uid" or "users/uid/orders/oid")
-static int CountPathSegments(const std::string &path) {
-	int count = 0;
-	bool in_segment = false;
-	for (char c : path) {
-		if (c == '/') {
-			in_segment = false;
-		} else if (!in_segment) {
-			in_segment = true;
-			count++;
-		}
-	}
-	return count;
-}
-
-static bool IsDocumentPath(const std::string &path) {
-	int segments = CountPathSegments(path);
-	return segments >= 2 && segments % 2 == 0;
-}
-
 static std::string TrimWhitespace(const std::string &s) {
 	size_t start = s.find_first_not_of(" \t\r\n");
 	if (start == std::string::npos) {
@@ -302,7 +289,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Get collection name (required first positional argument)
 	result->collection = input.inputs[0].GetValue<string>();
-	FS_LOG_DEBUG("[DEBUG-BIND] collection='%s'", result->collection.c_str());
+	FS_LOG_DEBUG("[DEBUG-BIND] collection='" + result->collection + "'");
 
 	// Process named parameters
 	std::optional<std::string> project_id;
@@ -340,8 +327,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Detect document paths (even number of segments like "users/uid" or "artifacts/default-app-id").
 	// Return a single __document_id column and defer subcollection lookup until execution time.
-	bool is_collection_group = !result->collection.empty() && result->collection[0] == '~';
-	if (!is_collection_group && IsDocumentPath(result->collection)) {
+	if (IsFirestoreDocumentPathCollection(result->collection)) {
 		// Return subcollection names as virtual __document_id rows.
 		result->is_document_path = true;
 		DocPathOrderType docpath_order = DocPathOrderType::NONE;
@@ -365,6 +351,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	    result->credentials->project_id + ":" + result->credentials->database_id + ":" + result->collection;
 	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
+		auto &schema_cache = GetSchemaCache();
+		auto &schema_cache_mutex = GetSchemaCacheMutex();
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		auto it = schema_cache.find(cache_key);
 		if (it != schema_cache.end() && !it->second.IsExpired(ttl_seconds)) {
@@ -478,6 +466,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Store schema and index cache for future queries
 	{
+		auto &schema_cache = GetSchemaCache();
+		auto &schema_cache_mutex = GetSchemaCacheMutex();
 		std::lock_guard<std::mutex> lock(schema_cache_mutex);
 		CachedSchemaEntry entry;
 		entry.schema = schema;
@@ -778,9 +768,8 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	}
 
 	if (is_document_path_mode) {
-		FS_LOG_DEBUG("[SCAN-DOCPATH] available=%llu current_index=%llu",
-		             static_cast<unsigned long long>(global_state.docpath_ids.size()),
-		             static_cast<unsigned long long>(global_state.current_index));
+		FS_LOG_DEBUG("[SCAN-DOCPATH] available=" + std::to_string(global_state.docpath_ids.size()) +
+		             " current_index=" + std::to_string(global_state.current_index));
 		idx_t available = global_state.docpath_ids.size();
 		if (global_state.current_index >= available) {
 			global_state.finished = true;
