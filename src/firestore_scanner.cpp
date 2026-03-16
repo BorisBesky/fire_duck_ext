@@ -775,10 +775,9 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	}
 
 	if (is_document_path_mode) {
-		fprintf(stderr, "[DEBUG-SCAN-DOCPATH] available=%llu current_index=%llu\n",
-		        static_cast<unsigned long long>(global_state.docpath_ids.size()),
-		        static_cast<unsigned long long>(global_state.current_index));
-		fflush(stderr);
+		FS_LOG_DEBUG("[SCAN-DOCPATH] available=%llu current_index=%llu",
+		             static_cast<unsigned long long>(global_state.docpath_ids.size()),
+		             static_cast<unsigned long long>(global_state.current_index));
 		idx_t available = global_state.docpath_ids.size();
 		if (global_state.current_index >= available) {
 			global_state.finished = true;
