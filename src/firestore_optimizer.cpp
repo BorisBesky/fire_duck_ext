@@ -215,6 +215,9 @@ static bool TryExtractLimit(LogicalTopN &topn_op, FirestoreScanBindData &bind_da
 // into bind_data.
 static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, LogicalLimit *current_limit,
                          LogicalTopN *current_topn, std::vector<LogicalProjection *> &projections) {
+	// Save the current projection stack size so we can restore it when unwinding
+	auto saved_projection_size = projections.size();
+
 	// If this is a barrier operator, reset tracking - ORDER BY / LIMIT above
 	// a barrier don't apply to scans below it
 	if (IsBarrierOperator(op.type)) {
@@ -351,6 +354,9 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 	for (auto &child : op.children) {
 		WalkPlanTree(*child, current_order, current_limit, current_topn, projections);
 	}
+
+	// Restore the projection stack to its previous size for the caller
+	projections.resize(saved_projection_size);
 }
 
 void FirestorePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
