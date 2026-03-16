@@ -1,0 +1,16 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}/duckdb",
+  "cmake.buildDirectory": "${workspaceFolder}/build/release",
+  "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
+  "cmake.generator": "Unix Makefiles",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/release/compile_commands.json",
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/build/release"
+  ],
+  "cmake.configureSettings": {
+    "CMAKE_BUILD_TYPE": "Release",
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+    "DUCKDB_EXTENSION_CONFIGS": "${workspaceFolder}/extension_config.cmake",
+    "EXTENSION_STATIC_BUILD": "1"
+  }
+}

@@ -20,12 +20,14 @@ set(EXTENSION_SOURCES
     src/firestore_client.cpp
     src/firestore_auth.cpp
     src/firestore_types.cpp
+    src/firestore_path_utils.cpp
     src/firestore_scanner.cpp
     src/firestore_writer.cpp
     src/firestore_secrets.cpp
     src/firestore_error.cpp
     src/firestore_logger.cpp
     src/firestore_index.cpp
+    src/firestore_optimizer.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

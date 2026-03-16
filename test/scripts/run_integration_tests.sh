@@ -4,11 +4,11 @@
 
 set -e
 
-# Find duckdb binary - prefer system installation over local build
-if command -v duckdb &> /dev/null; then
-    DUCKDB="duckdb"
-elif [ -x "./build/release/duckdb" ]; then
+# Find duckdb binary - prefer the locally built binary so it matches the extension.
+if [ -x "./build/release/duckdb" ]; then
     DUCKDB="./build/release/duckdb"
+elif command -v duckdb &> /dev/null; then
+    DUCKDB="duckdb"
 else
     echo "Error: duckdb not found. Install DuckDB or build from source."
     exit 1
@@ -16,13 +16,18 @@ fi
 
 EXT_PATH="build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension"
 
+# Strip ANSI escapes and whitespace so assertions see stable values.
+clean_query_output() {
+    sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' | tr -d '[:space:]"'
+}
+
 # Helper: run a DuckDB query and return the trimmed last line of output
 run_query() {
     $DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
 CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
 $1
-" 2>&1 | tail -1 | tr -d '[:space:]"'
+" 2>&1 | tail -1 | clean_query_output
 }
 
 # Helper: assert equality
@@ -206,6 +211,9 @@ assert_eq "$ORDER_COUNT" "2" "User1 has 2 orders"
 
 ORDER_PRODUCT=$(run_query "SELECT product FROM firestore_scan('users/user1/orders') WHERE __document_id = 'order1';")
 assert_eq "$ORDER_PRODUCT" "Widget" "Order1 product is Widget"
+
+# Document-path scan coverage lives in run_real_firestore_tests.sh because
+# Firestore's listCollectionIds metadata operation requires admin-capable auth.
 
 # Test 7: Collection group query
 echo "Test 7: Collection group query (all orders across all users)..."
@@ -1034,7 +1042,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET conn_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT 'connected';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CONNECT_RESULT" "connected" "firestore_connect succeeds for (default) database"
 
 # Test 52: firestore_disconnect clears session database
@@ -1045,7 +1053,7 @@ CREATE SECRET disc_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fak
 CALL firestore_connect('(default)');
 CALL firestore_disconnect();
 SELECT 'disconnected';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DISCONNECT_RESULT" "disconnected" "firestore_disconnect succeeds"
 
 # Test 53: firestore_connect with wildcard secret
@@ -1055,7 +1063,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET wild_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
 CALL firestore_connect('any-database');
 SELECT 'wildcard_works';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wildcard database secret"
 
 # Test 53b: firestore_connect with DATABASES list secret
@@ -1065,7 +1073,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET list_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('(default)');
 SELECT 'list_default_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DATABASES_LIST_RESULT" "list_default_ok" "firestore_connect works with DATABASES list (matching first entry)"
 
 DATABASES_LIST_OTHER=$($DUCKDB -unsigned -csv -noheader -c "
@@ -1073,7 +1081,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET list_test2 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('other-db');
 SELECT 'list_other_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DATABASES_LIST_OTHER" "list_other_ok" "firestore_connect works with DATABASES list (matching second entry)"
 
 DATABASES_LIST_NOMATCH=$($DUCKDB -unsigned -csv -noheader -c "
@@ -1116,7 +1124,7 @@ LOAD '${EXT_PATH}';
 CREATE SECRET cq_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT value FROM firestore_scan('connect_test') WHERE __document_id = 'ct1';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CONNECTED_QUERY" "from_default_db" "Query uses connected database"
 
 # Clean up connect test data
@@ -1133,7 +1141,7 @@ CREATE SECRET ov_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-
 CALL firestore_connect('connected-db');
 -- This should use '(default)' database, not 'connected-db'
 SELECT count(*) FROM firestore_scan('users', database := '(default)');
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 # We just need this to not error - the exact count depends on seeded data
 if [[ "$OVERRIDE_CHECK" =~ ^[0-9]+$ ]]; then
     echo "PASS: Per-query database parameter override works"
@@ -1153,7 +1161,7 @@ CALL firestore_connect('db2');
 CALL firestore_disconnect();
 CALL firestore_connect('(default)');
 SELECT 'cycles_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$CYCLE_RESULT" "cycles_ok" "Multiple connect/disconnect cycles work"
 
 # Test 58: Connect to (default) explicitly resets to default
@@ -1164,8 +1172,221 @@ CREATE SECRET reset_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fa
 CALL firestore_connect('custom-db');
 CALL firestore_connect('(default)');
 SELECT 'reset_ok';
-" 2>&1 | tail -1 | tr -d '[:space:]"')
+" 2>&1 | tail -1 | clean_query_output)
 assert_eq "$DEFAULT_RESET" "reset_ok" "firestore_connect('(default)') works as reset"
+
+# ============================================
+# Named Parameter Tests for firestore_scan
+# ============================================
+
+echo ""
+echo "=== Named Parameter Tests ==="
+
+# Seed dedicated data for named parameter tests
+echo "Seeding named parameter test data..."
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_test?documentId=np1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Alpha"}, "score": {"integerValue": "10"}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_test?documentId=np2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Bravo"}, "score": {"integerValue": "30"}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_test?documentId=np3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Charlie"}, "score": {"integerValue": "20"}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_test?documentId=np4" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Delta"}, "score": {"integerValue": "40"}}}' > /dev/null
+
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_test?documentId=np5" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"name": {"stringValue": "Echo"}, "score": {"integerValue": "50"}}}' > /dev/null
+
+echo "Named parameter test data seeded."
+
+# --- scan_limit tests ---
+
+# Test 59: scan_limit returns exact number of rows
+echo "Test 59: scan_limit returns exact number of rows..."
+LIMITED=$(run_query "SELECT count(*) FROM firestore_scan('np_test', scan_limit=3);")
+assert_eq "$LIMITED" "3" "scan_limit=3 returns exactly 3 rows"
+
+# Test 60: scan_limit=1 returns single row
+echo "Test 60: scan_limit=1 returns single row..."
+LIMIT_ONE=$(run_query "SELECT count(*) FROM firestore_scan('np_test', scan_limit=1);")
+assert_eq "$LIMIT_ONE" "1" "scan_limit=1 returns exactly 1 row"
+
+# Test 61: scan_limit larger than collection returns all rows
+echo "Test 61: scan_limit larger than collection returns all rows..."
+LIMIT_BIG=$(run_query "SELECT count(*) FROM firestore_scan('np_test', scan_limit=1000);")
+assert_eq "$LIMIT_BIG" "5" "scan_limit=1000 returns all 5 rows"
+
+# Test 62: scan_limit combined with WHERE filter (pushdown succeeds)
+echo "Test 62: scan_limit + WHERE with successful pushdown..."
+# When filter pushdown succeeds, Firestore applies both the filter and the limit
+# server-side, so we get exactly scan_limit rows matching the filter.
+LIMIT_FILTER=$(run_query "SELECT count(*) FROM firestore_scan('np_test', scan_limit=2) WHERE score > 20;")
+assert_eq "$LIMIT_FILTER" "2" "scan_limit=2 + WHERE score > 20 with pushdown returns exactly 2 rows"
+
+# Test 62b: scan_limit is ignored when pushdown fails (fallback to full scan)
+# When pushdown fails, DuckDB filters client-side. scan_limit cannot be enforced
+# because the scan emits rows before DuckDB's FILTER node runs. All matching rows
+# are returned and the user should use SQL LIMIT for result-level limiting.
+echo "Test 62b: scan_limit + WHERE with pushdown fallback returns correct results..."
+# Seed a collection group to test fallback behavior
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_parent/p1/np_child?documentId=c1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"val": {"integerValue": "10"}}}' > /dev/null
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_parent/p2/np_child?documentId=c2" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"val": {"integerValue": "20"}}}' > /dev/null
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_parent/p3/np_child?documentId=c3" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"val": {"integerValue": "30"}}}' > /dev/null
+
+# Collection group + filter: no collection group index exists, so pushdown is skipped.
+# scan_limit must be ignored when DuckDB filters client-side, so all matching rows are returned.
+CG_FILTER=$(run_query "SELECT count(*) FROM firestore_scan('~np_child', scan_limit=1) WHERE val > 10;")
+assert_eq "$CG_FILTER" "2" "scan_limit ignored for collection group with unpushed WHERE, returns all 2 matching rows"
+
+# Test 62c: order_by on collection group silently skips server-side ordering (no index)
+echo "Test 62c: order_by on collection group without index..."
+CG_ORDER=$(run_query "SELECT string_agg(val::VARCHAR, ',' ORDER BY val) FROM firestore_scan('~np_child', order_by='val');")
+assert_eq "$CG_ORDER" "10,20,30" "order_by on collection group returns all rows; DuckDB sorts client-side"
+
+# Test 62d: Multi-field order_by on collection group (silent fallback, no composite index)
+echo "Test 62d: Multi-field order_by on collection group..."
+CG_MULTI=$(run_query "SELECT count(*) FROM firestore_scan('~np_child', order_by='val DESC');")
+assert_ge "$CG_MULTI" "1" "Multi-field order_by on collection group succeeds (falls back to client-side)"
+
+# Cleanup collection group test data
+run_query "
+CALL firestore_delete('np_parent/p1/np_child', 'c1');
+CALL firestore_delete('np_parent/p2/np_child', 'c2');
+CALL firestore_delete('np_parent/p3/np_child', 'c3');
+" > /dev/null
+
+# --- order_by tests ---
+
+# Test 63: order_by ascending (default direction)
+echo "Test 63: order_by ascending..."
+FIRST_ASC=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='score') LIMIT 1;")
+assert_eq "$FIRST_ASC" "Alpha" "order_by='score' ascending returns Alpha (score=10) first"
+
+# Test 64: order_by descending
+echo "Test 64: order_by descending..."
+FIRST_DESC=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='score DESC') LIMIT 1;")
+assert_eq "$FIRST_DESC" "Echo" "order_by='score DESC' returns Echo (score=50) first"
+
+# Test 65: order_by combined with scan_limit
+echo "Test 65: order_by + scan_limit combined..."
+TOP2=$(run_query "SELECT string_agg(name, ',') FROM firestore_scan('np_test', order_by='score DESC', scan_limit=2);")
+assert_eq "$TOP2" "Echo,Delta" "order_by DESC + scan_limit=2 returns top 2 scorers"
+
+# Test 66: order_by on string field
+echo "Test 66: order_by on string field..."
+FIRST_NAME=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='name') LIMIT 1;")
+assert_eq "$FIRST_NAME" "Alpha" "order_by='name' ascending returns Alpha first"
+
+LAST_NAME=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='name DESC') LIMIT 1;")
+assert_eq "$LAST_NAME" "Echo" "order_by='name DESC' returns Echo first"
+
+# Test 66b: Multi-field order_by on collection
+echo "Test 66b: Multi-field order_by..."
+MULTI_ORDER=$(run_query "SELECT string_agg(name, ',' ORDER BY score, name) FROM firestore_scan('np_test', order_by='score, name');")
+assert_eq "$MULTI_ORDER" "Alpha,Charlie,Bravo,Delta,Echo" "order_by='score, name' multi-field ascending"
+
+# Test 66c: Multi-field order_by with mixed directions
+echo "Test 66c: Multi-field order_by with mixed directions..."
+MULTI_MIXED=$(run_query "SELECT string_agg(name, ',' ORDER BY score DESC, name) FROM firestore_scan('np_test', order_by='score DESC, name ASC');")
+assert_eq "$MULTI_MIXED" "Echo,Delta,Bravo,Charlie,Alpha" "order_by='score DESC, name ASC' mixed directions"
+
+# --- show_missing tests ---
+
+# Seed a parent document with only subcollections (phantom/missing document)
+# Create a subcollection doc under np_phantom/ghost1 to make ghost1 a phantom parent
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_phantom/ghost1/children?documentId=child1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"value": {"stringValue": "child_data"}}}' > /dev/null
+
+# Also seed a real document
+curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents/np_phantom?documentId=real1" \
+  -H "Content-Type: application/json" \
+  -d '{"fields": {"value": {"stringValue": "real_data"}}}' > /dev/null
+
+# Test 67: show_missing=true is accepted (default behavior)
+echo "Test 67: show_missing=true is accepted..."
+SM_TRUE=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom', show_missing=true);")
+# Emulator doesn't support showMissing, so this should still return at least the real doc
+assert_ge "$SM_TRUE" "1" "show_missing=true returns at least 1 document"
+
+# Test 68: show_missing=false is accepted
+echo "Test 68: show_missing=false is accepted..."
+SM_FALSE=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom', show_missing=false);")
+assert_ge "$SM_FALSE" "1" "show_missing=false returns at least 1 document"
+
+# Test 69: show_missing=false returns real documents correctly
+echo "Test 69: show_missing=false returns correct data..."
+SM_VALUE=$(run_query "SELECT value FROM firestore_scan('np_phantom', show_missing=false) WHERE __document_id = 'real1';")
+assert_eq "$SM_VALUE" "real_data" "show_missing=false returns correct field values"
+
+# --- database parameter tests ---
+
+# Test 70: database parameter accepted as per-query override
+echo "Test 70: database parameter as per-query override..."
+DB_OVERRIDE=$(run_query "SELECT count(*) FROM firestore_scan('np_test', database='(default)');")
+assert_eq "$DB_OVERRIDE" "5" "database='(default)' per-query override returns all 5 rows"
+
+# Test 71: database parameter with explicit project_id and api_key
+echo "Test 71: per-query project_id and api_key override..."
+# Use the same project/key as the secret; verifies the parameter path doesn't error
+PQ_OVERRIDE=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET __pq (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+SELECT count(*) FROM firestore_scan('np_test', project_id='test-project', api_key='fake-key');
+" 2>&1 | tail -1 | clean_query_output)
+assert_eq "$PQ_OVERRIDE" "5" "Per-query project_id + api_key override returns 5 rows"
+
+# Test 72: credentials parameter accepted (invalid path should error gracefully)
+echo "Test 72: credentials parameter with invalid path errors gracefully..."
+CRED_ERR=$($DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+SELECT count(*) FROM firestore_scan('np_test', credentials='/nonexistent/path.json');
+" 2>&1 | grep -ciE "error|cannot|failed|no such|not found" || true)
+if [ "$CRED_ERR" -ge "1" ] 2>/dev/null; then
+    echo "PASS: Invalid credentials path produces an error"
+else
+    echo "FAIL: Invalid credentials path should produce an error"
+    exit 1
+fi
+
+# --- combined parameter tests ---
+
+# Test 73: Multiple named parameters combined
+echo "Test 73: Multiple named parameters combined..."
+COMBINED=$(run_query "SELECT name FROM firestore_scan('np_test', order_by='score DESC', scan_limit=1, database='(default)');")
+assert_eq "$COMBINED" "Echo" "Combined order_by + scan_limit + database returns Echo"
+
+# Test 74: scan_limit with order_by ascending
+echo "Test 74: scan_limit + order_by ascending..."
+BOTTOM3=$(run_query "SELECT string_agg(name, ',' ORDER BY score) FROM firestore_scan('np_test', order_by='score', scan_limit=3);")
+assert_eq "$BOTTOM3" "Alpha,Charlie,Bravo" "order_by ASC + scan_limit=3 returns bottom 3 scorers"
+
+# Cleanup named parameter test data
+echo ""
+echo "Cleaning up named parameter test data..."
+run_query "
+CALL firestore_delete('np_test', 'np1');
+CALL firestore_delete('np_test', 'np2');
+CALL firestore_delete('np_test', 'np3');
+CALL firestore_delete('np_test', 'np4');
+CALL firestore_delete('np_test', 'np5');
+CALL firestore_delete('np_phantom/ghost1/children', 'child1');
+CALL firestore_delete('np_phantom', 'real1');
+" > /dev/null
 
 echo ""
 echo "=== All integration tests passed! ==="

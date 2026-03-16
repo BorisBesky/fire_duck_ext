@@ -4873,7 +4873,6 @@ public:
 
 	bool parse(const char *buf, size_t n, const ContentReceiver &content_callback,
 	           const MultipartContentHeader &header_callback) {
-
 		buf_append(buf, n);
 
 		while (buf_size() > 0) {
@@ -6882,7 +6881,6 @@ inline bool Server::listen_internal() {
 #endif
 			}
 			{
-
 #ifdef _WIN32
 				auto timeout = static_cast<uint32_t>(write_timeout_sec_ * 1000 + write_timeout_usec_ / 1000);
 				setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout), sizeof(timeout));
@@ -9140,7 +9138,6 @@ inline SSL_CTX *SSLServer::ssl_context() const {
 }
 
 inline void SSLServer::update_certs(X509 *cert, EVP_PKEY *private_key, X509_STORE *client_ca_cert_store) {
-
 	std::lock_guard<std::mutex> guard(ctx_mutex_);
 
 	SSL_CTX_use_certificate(ctx_, cert);

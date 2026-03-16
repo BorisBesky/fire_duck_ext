@@ -22,6 +22,20 @@ struct FirestoreIndexField {
 	enum class Mode { ASCENDING, DESCENDING, ARRAY_CONTAINS } mode;
 };
 
+// Parsed representation of a single order_by field (e.g. "score DESC" → {score, DESCENDING})
+struct OrderByField {
+	std::string field_path;
+	std::string direction; // "ASCENDING" or "DESCENDING"
+};
+
+// Parse a comma-separated order_by string into structured fields
+// E.g., "score DESC, name ASC" -> [{score, DESCENDING}, {name, ASCENDING}]
+std::vector<OrderByField> ParseOrderByString(const std::string &order_by_str);
+
+// Format parsed order_by fields to comma-separated string for ListDocuments REST API
+// E.g., [{score, DESCENDING}, {name, ASCENDING}] -> "score desc,name"
+std::string FormatOrderByForREST(const std::vector<OrderByField> &fields);
+
 // Represents a Firestore index (composite or single-field)
 struct FirestoreIndex {
 	std::string name;
@@ -73,6 +87,11 @@ bool HasSingleFieldIndex(const std::string &field_path, const FirestoreIndexCach
 // Find a composite index matching equality fields + a range field
 bool FindMatchingCompositeIndex(const std::set<std::string> &eq_fields, const std::string &range_field,
                                 const FirestoreIndexCache &cache, FirestoreIndex::QueryScope scope);
+
+// Check if a composite index exists that supports multi-field orderBy.
+// Matches field order and directions exactly (excluding __name__).
+bool HasCompositeOrderByIndex(const std::vector<OrderByField> &order_by_fields, const FirestoreIndexCache &cache,
+                              FirestoreIndex::QueryScope scope);
 
 // Match DuckDB filters against available indexes, return what can be pushed down
 FirestoreFilterResult MatchFiltersToIndexes(const std::vector<FirestorePushdownFilter> &candidate_filters,

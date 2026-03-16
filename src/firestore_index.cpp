@@ -10,6 +10,77 @@
 
 namespace duckdb {
 
+// --- OrderByField utilities ---
+
+static std::string TrimWhitespace(const std::string &s) {
+	size_t start = s.find_first_not_of(" \t\r\n");
+	if (start == std::string::npos) {
+		return "";
+	}
+	size_t end = s.find_last_not_of(" \t\r\n");
+	return s.substr(start, end - start + 1);
+}
+
+std::vector<OrderByField> ParseOrderByString(const std::string &order_by_str) {
+	std::vector<OrderByField> result;
+	if (order_by_str.empty()) {
+		return result;
+	}
+
+	// Split on commas
+	std::string remaining = order_by_str;
+	while (!remaining.empty()) {
+		std::string token;
+		size_t comma = remaining.find(',');
+		if (comma != std::string::npos) {
+			token = remaining.substr(0, comma);
+			remaining = remaining.substr(comma + 1);
+		} else {
+			token = remaining;
+			remaining.clear();
+		}
+
+		token = TrimWhitespace(token);
+		if (token.empty()) {
+			continue;
+		}
+
+		OrderByField field;
+		field.direction = "ASCENDING"; // default
+
+		// Split on space to get field name and optional direction
+		size_t space = token.find(' ');
+		if (space != std::string::npos) {
+			field.field_path = token.substr(0, space);
+			std::string dir_str = TrimWhitespace(token.substr(space + 1));
+			if (dir_str == "DESC" || dir_str == "desc" || dir_str == "DESCENDING" || dir_str == "descending") {
+				field.direction = "DESCENDING";
+			}
+			// ASC/asc/ASCENDING/ascending or anything else -> ASCENDING (default)
+		} else {
+			field.field_path = token;
+		}
+
+		result.push_back(std::move(field));
+	}
+
+	return result;
+}
+
+std::string FormatOrderByForREST(const std::vector<OrderByField> &fields) {
+	std::string result;
+	for (size_t i = 0; i < fields.size(); i++) {
+		if (i > 0) {
+			result += ",";
+		}
+		result += fields[i].field_path;
+		if (fields[i].direction == "DESCENDING") {
+			result += " desc";
+		}
+	}
+	return result;
+}
+
 // Check for InFilter - may or may not be available depending on DuckDB version
 // We handle it via filter_type check at runtime
 
@@ -127,8 +198,9 @@ json BuildWhereClause(const std::vector<FirestorePushdownFilter> &filters) {
 
 bool HasSingleFieldIndex(const std::string &field_path, const FirestoreIndexCache &cache,
                          FirestoreIndex::QueryScope scope) {
-	// If default single-field indexing is enabled, every field has indexes
-	if (cache.default_single_field_enabled) {
+	// Default single-field indexes only cover COLLECTION scope, not COLLECTION_GROUP.
+	// Collection group queries require explicit collection group-scoped indexes.
+	if (cache.default_single_field_enabled && scope == FirestoreIndex::QueryScope::COLLECTION) {
 		return true;
 	}
 
@@ -170,6 +242,47 @@ bool FindMatchingCompositeIndex(const std::set<std::string> &eq_fields, const st
 		bool range_covered = idx_fields.find(range_field) != idx_fields.end();
 
 		if (all_eq_covered && range_covered) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool HasCompositeOrderByIndex(const std::vector<OrderByField> &order_by_fields, const FirestoreIndexCache &cache,
+                              FirestoreIndex::QueryScope scope) {
+	for (auto &idx : cache.composite_indexes) {
+		if (idx.query_scope != scope || idx.state != FirestoreIndex::State::READY) {
+			continue;
+		}
+
+		// Collect non-__name__ fields from the index
+		std::vector<const FirestoreIndexField *> idx_fields;
+		for (auto &f : idx.fields) {
+			if (f.field_path != "__name__") {
+				idx_fields.push_back(&f);
+			}
+		}
+
+		// Must have at least as many fields as order_by_fields
+		if (idx_fields.size() < order_by_fields.size()) {
+			continue;
+		}
+
+		// Check prefix match with exact order and direction
+		bool match = true;
+		for (size_t i = 0; i < order_by_fields.size(); i++) {
+			if (idx_fields[i]->field_path != order_by_fields[i].field_path) {
+				match = false;
+				break;
+			}
+			auto expected_mode = (order_by_fields[i].direction == "DESCENDING") ? FirestoreIndexField::Mode::DESCENDING
+			                                                                    : FirestoreIndexField::Mode::ASCENDING;
+			if (idx_fields[i]->mode != expected_mode) {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
 			return true;
 		}
 	}

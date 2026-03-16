@@ -267,8 +267,18 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
 	// Only send showMissing=true when talking to production Firestore.
-	if (query.show_missing && GetEmulatorHost().empty()) {
-		add_param("showMissing", "true");
+	// Firestore API does not allow showMissing and orderBy together (HTTP 400),
+	// so skip showMissing when an order_by is specified.
+	if (query.show_missing) {
+		if (!GetEmulatorHost().empty()) {
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does "
+			             "not support it.");
+		} else if (query.order_by.has_value()) {
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow "
+			             "showMissing together with orderBy; ordered scans will not include phantom documents.");
+		} else {
+			add_param("showMissing", "true");
+		}
 	}
 
 	if (query.page_token.has_value()) {
@@ -298,6 +308,57 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	FS_LOG_DEBUG("Listed " + std::to_string(result.documents.size()) + " documents");
 	return result;
+}
+
+FirestoreCollectionIdsPage FirestoreClient::ListCollectionIdsPage(const std::string &document_path,
+                                                                  const std::optional<std::string> &page_token,
+                                                                  int64_t page_size) {
+	FS_LOG_DEBUG("Listing collection IDs under document: " + document_path);
+
+	std::string url = BuildUrl(document_path + ":listCollectionIds");
+
+	FirestoreErrorContext ctx;
+	ctx.withOperation("list_collection_ids").withCollection(document_path);
+
+	json body = {{"pageSize", page_size}};
+	if (page_token.has_value()) {
+		body["pageToken"] = page_token.value();
+	}
+
+	json response = MakeRequest("POST", url, body, ctx);
+
+	FirestoreCollectionIdsPage result;
+	if (response.contains("collectionIds")) {
+		for (auto &id : response["collectionIds"]) {
+			result.collection_ids.push_back(id.get<std::string>());
+		}
+	}
+
+	if (response.contains("nextPageToken")) {
+		result.next_page_token = response["nextPageToken"].get<std::string>();
+	}
+
+	FS_LOG_DEBUG("Listed " + std::to_string(result.collection_ids.size()) + " subcollections in page");
+	return result;
+}
+
+std::vector<std::string> FirestoreClient::ListCollectionIds(const std::string &document_path) {
+	std::vector<std::string> collection_ids;
+	std::optional<std::string> page_token;
+
+	do {
+		auto page = ListCollectionIdsPage(document_path, page_token, 100);
+		collection_ids.insert(collection_ids.end(), page.collection_ids.begin(), page.collection_ids.end());
+
+		if (page.next_page_token.empty()) {
+			page_token.reset();
+		} else {
+			page_token = page.next_page_token;
+		}
+	} while (page_token.has_value());
+
+	FS_LOG_DEBUG("Found " + std::to_string(collection_ids.size()) + " subcollections");
+	return collection_ids;
 }
 
 FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, const std::string &document_id) {
@@ -477,21 +538,12 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 	    {"limit", query.page_size}};
 
 	if (query.order_by.has_value()) {
-		// Parse order_by (e.g., "createdAt DESC")
-		std::string order_str = query.order_by.value();
-		std::string field_name = order_str;
-		std::string direction = "ASCENDING";
-
-		size_t space_pos = order_str.find(' ');
-		if (space_pos != std::string::npos) {
-			field_name = order_str.substr(0, space_pos);
-			std::string dir_str = order_str.substr(space_pos + 1);
-			if (dir_str == "DESC" || dir_str == "desc") {
-				direction = "DESCENDING";
-			}
+		auto parsed = ParseOrderByString(query.order_by.value());
+		json order_by_arr = json::array();
+		for (auto &ob : parsed) {
+			order_by_arr.push_back({{"field", {{"fieldPath", ob.field_path}}}, {"direction", ob.direction}});
 		}
-
-		structured_query["orderBy"] = {{{"field", {{"fieldPath", field_name}}}, {"direction", direction}}};
+		structured_query["orderBy"] = order_by_arr;
 	}
 
 	FirestoreErrorContext ctx;
