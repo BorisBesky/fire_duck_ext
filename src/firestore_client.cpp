@@ -269,8 +269,14 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 	// Only send showMissing=true when talking to production Firestore.
 	// Firestore API does not allow showMissing and orderBy together (HTTP 400),
 	// so skip showMissing when an order_by is specified.
-	if (query.show_missing && GetEmulatorHost().empty() && !query.order_by.has_value()) {
-		add_param("showMissing", "true");
+	if (query.show_missing) {
+		if (!GetEmulatorHost().empty()) {
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does not support it.");
+		} else if (query.order_by.has_value()) {
+			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow showMissing together with orderBy; ordered scans will not include phantom documents.");
+		} else {
+			add_param("showMissing", "true");
+		}
 	}
 
 	if (query.page_token.has_value()) {
