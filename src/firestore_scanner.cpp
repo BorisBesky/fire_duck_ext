@@ -541,7 +541,10 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 				}
 			}
 		} catch (...) {
-			global_state->docpath_ids.clear();
+			FS_LOG_ERROR("Failed to list subcollections for document path '" + bind_data.collection +
+			             "': an exception was thrown while fetching document path IDs");
+			throw FirestoreError("Failed to list subcollections for document path '" + bind_data.collection +
+			                     "'. Check Firestore credentials, configuration, and network connectivity.");
 		}
 		global_state->current_index = 0;
 		global_state->finished = global_state->docpath_ids.empty();
