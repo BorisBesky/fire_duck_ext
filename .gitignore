@@ -10,3 +10,5 @@ test/python/__pycache__/
 firestore-debug.log
 test/scripts/firebase-debug.log
 firebase-debug.log
+.cache/
+compile_commands.json
