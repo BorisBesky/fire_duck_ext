@@ -4,6 +4,10 @@
 #include <fstream>
 #include <sstream>
 #include <ctime>
+#ifndef __EMSCRIPTEN__
+// Service-account auth (JWT signing + OAuth token exchange) relies on OpenSSL and
+// raw sockets, neither of which is available on DuckDB-WASM. These paths compile
+// only on native builds; on WASM the corresponding functions throw (see below).
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include <openssl/pem.h>
@@ -12,6 +16,7 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/err.h>
+#endif
 #include <nlohmann/json.hpp>
 
 namespace duckdb {
@@ -114,6 +119,13 @@ std::string FirestoreAuthManager::Base64UrlEncode(const std::string &data) {
 }
 
 std::string FirestoreAuthManager::Base64UrlEncode(const unsigned char *data, size_t len) {
+#ifdef __EMSCRIPTEN__
+	(void)data;
+	(void)len;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	BIO *bio, *b64;
 	BUF_MEM *bufferPtr;
 
@@ -143,9 +155,17 @@ std::string FirestoreAuthManager::Base64UrlEncode(const unsigned char *data, siz
 	}
 
 	return result;
+#endif
 }
 
 std::string FirestoreAuthManager::SignRS256(const std::string &data, const std::string &private_key) {
+#ifdef __EMSCRIPTEN__
+	(void)data;
+	(void)private_key;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	// Create BIO from private key string
 	BIO *bio = BIO_new_mem_buf(private_key.data(), private_key.size());
 	if (!bio) {
@@ -205,6 +225,7 @@ std::string FirestoreAuthManager::SignRS256(const std::string &data, const std::
 	EVP_PKEY_free(pkey);
 
 	return Base64UrlEncode(sig.data(), sig_len);
+#endif
 }
 
 std::string FirestoreAuthManager::CreateJWT(const FirestoreCredentials &creds) {
@@ -234,6 +255,12 @@ std::string FirestoreAuthManager::CreateJWT(const FirestoreCredentials &creds) {
 }
 
 std::string FirestoreAuthManager::ExchangeJWTForToken(const std::string &jwt) {
+#ifdef __EMSCRIPTEN__
+	(void)jwt;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	FS_LOG_DEBUG("Exchanging JWT for access token");
 
 	std::string post_data = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=" + jwt;
@@ -268,6 +295,7 @@ std::string FirestoreAuthManager::ExchangeJWTForToken(const std::string &jwt) {
 		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_PARSE_FAILED,
 		                         "Failed to parse token response: " + std::string(e.what()));
 	}
+#endif
 }
 
 std::string FirestoreAuthManager::GetAccessToken(FirestoreCredentials &creds) {

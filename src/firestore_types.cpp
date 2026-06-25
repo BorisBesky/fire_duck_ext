@@ -2,55 +2,26 @@
 #include "firestore_logger.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/blob.hpp"
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/buffer.h>
+#include "duckdb/common/types/string_type.hpp"
 #include <map>
 #include <set>
 
 namespace duckdb {
 
-// Base64 encoding for bytesValue
+// Base64 encode/decode for bytesValue. DuckDB's Blob helpers produce and consume
+// standard RFC 4648 base64 (with padding) — the format the Firestore REST API uses —
+// and are available on every platform, including WASM where OpenSSL is not linked.
 static std::string Base64Encode(const std::string &data) {
-	BIO *bio, *b64;
-	BUF_MEM *bufferPtr;
-
-	b64 = BIO_new(BIO_f_base64());
-	bio = BIO_new(BIO_s_mem());
-	bio = BIO_push(b64, bio);
-
-	BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-	BIO_write(bio, data.data(), data.size());
-	BIO_flush(bio);
-	BIO_get_mem_ptr(bio, &bufferPtr);
-
-	std::string result(bufferPtr->data, bufferPtr->length);
-	BIO_free_all(bio);
-
-	return result;
+	return Blob::ToBase64(string_t(data.data(), static_cast<uint32_t>(data.size())));
 }
 
 // Base64 decoding for bytesValue
 static std::string Base64Decode(const std::string &encoded) {
-	BIO *bio, *b64;
-
-	// Calculate max decoded length
-	size_t decoded_length = encoded.size() * 3 / 4 + 1;
-	std::vector<char> buffer(decoded_length);
-
-	bio = BIO_new_mem_buf(encoded.data(), encoded.size());
-	b64 = BIO_new(BIO_f_base64());
-	bio = BIO_push(b64, bio);
-
-	BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-	int actual_length = BIO_read(bio, buffer.data(), encoded.size());
-	BIO_free_all(bio);
-
-	if (actual_length < 0) {
-		return encoded; // Return as-is if decoding fails
+	try {
+		return Blob::FromBase64(string_t(encoded.data(), static_cast<uint32_t>(encoded.size())));
+	} catch (...) {
+		return encoded; // Return as-is if decoding fails, preserving prior behavior
 	}
-
-	return std::string(buffer.data(), actual_length);
 }
 
 // Check if a Firestore mapValue represents a vector (embedding)

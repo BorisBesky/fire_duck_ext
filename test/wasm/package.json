@@ -1,0 +1,16 @@
+{
+  "name": "fire-duck-ext-wasm-validation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WASM validation tests for the fire_duck_ext DuckDB extension",
+  "scripts": {
+    "validate:module": "node validate_wasm_module.mjs",
+    "validate:functional": "node validate_wasm_functional.mjs",
+    "validate": "node validate_wasm_module.mjs && node validate_wasm_functional.mjs"
+  },
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "^1.32.0",
+    "web-worker": "^1.5.0"
+  }
+}

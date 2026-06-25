@@ -3,9 +3,11 @@ cmake_minimum_required(VERSION 3.5)
 # Set extension name here
 set(TARGET_NAME fire_duck_ext)
 
-# OpenSSL is required for HTTPS support (via cpp-httplib) and JWT signing.
-# Skip dependency resolution for clang-tidy builds which only need to parse source.
-if (NOT CLANG_TIDY)
+# OpenSSL is required on native builds for HTTPS (via cpp-httplib) and service-account
+# JWT signing. On WASM there are no OS sockets: HTTP is routed through DuckDB's HTTPUtil
+# and OpenSSL is not used (service-account auth is unsupported there), so it is neither
+# resolved nor linked. Skip resolution for clang-tidy builds which only parse source.
+if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
   find_package(OpenSSL REQUIRED)
 endif()
 
@@ -53,9 +55,9 @@ target_include_directories(${LOADABLE_EXTENSION_NAME}
     third_party/nlohmann_json/include
 )
 
-# Link dependencies to both the static library and the loadable extension
-# Skip linking for clang-tidy builds which only perform static analysis
-if (NOT CLANG_TIDY)
+# Link dependencies to both the static library and the loadable extension.
+# Skip linking for clang-tidy (static analysis only) and for WASM (OpenSSL unused there).
+if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
   target_link_libraries(${EXTENSION_NAME}
       OpenSSL::SSL
       OpenSSL::Crypto

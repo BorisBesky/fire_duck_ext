@@ -8,6 +8,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/main/database.hpp"
 #include <algorithm>
 #include <chrono>
 
@@ -395,7 +396,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	}
 
 	// Create client and infer schema from collection
-	FirestoreClient client(result->credentials);
+	FirestoreClient client(result->credentials, DatabaseInstance::GetDatabase(context));
 	auto schema = client.InferSchema(result->collection, 100, result->show_missing);
 
 	// Check if collection exists (has documents)
@@ -505,7 +506,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
 		global_state->is_document_path = true;
-		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		auto order = bind_data.docpath_named_order;
 		// Only apply limit at scan level when we also control ordering.
@@ -543,7 +544,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		return std::move(global_state);
 	}
 
-	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 	// Check if this is a collection group query (starts with ~)
 	if (!bind_data.collection.empty() && bind_data.collection[0] == '~') {
