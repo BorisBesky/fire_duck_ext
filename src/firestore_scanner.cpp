@@ -506,7 +506,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
 		global_state->is_document_path = true;
-		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
+		global_state->client =
+		    make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		auto order = bind_data.docpath_named_order;
 		// Only apply limit at scan level when we also control ordering.
