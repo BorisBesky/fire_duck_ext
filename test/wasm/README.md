@@ -45,15 +45,70 @@ npm --prefix test/wasm install
 node test/wasm/validate_wasm_functional.mjs
 ```
 
-### Version matching
+## 4. Running ad-hoc SQL (`run_sql.mjs`)
+
+Loads the WASM build and runs whatever SQL you give it — on argv, from a `.sql`
+file, or piped on stdin:
+
+```bash
+node test/wasm/run_sql.mjs "SELECT 1 + 1, list_value(1,2,3)"
+node test/wasm/run_sql.mjs queries.sql
+echo "SELECT * FROM firestore_scan('users') LIMIT 5;" | node test/wasm/run_sql.mjs
+```
+
+To query a **real Firestore database**, set the env vars below; when both
+`FIRESTORE_PROJECT_ID` and `FIRESTORE_API_KEY` are present the runner creates an
+API-key `firestore` secret before running your SQL (service-account auth is not
+supported under WASM):
+
+```bash
+FIRESTORE_PROJECT_ID=my-project FIRESTORE_API_KEY=AIza... \
+  node test/wasm/run_sql.mjs "SELECT __document_id, * FROM firestore_scan('users') LIMIT 10"
+```
+
+| Env var | Meaning |
+| --- | --- |
+| `FIRESTORE_PROJECT_ID` | GCP project id (with `FIRESTORE_API_KEY`, creates the secret) |
+| `FIRESTORE_API_KEY` | Firebase API key |
+| `FIRESTORE_DATABASE` | optional database id (default `(default)`) |
+| `EXT_WASM` | path to the `.wasm` artifact (else newest under `build/wasm_*/`) |
+| `WASM_SQL_TIMEOUT_MS` | watchdog before forcing exit (default `120000`) |
+
+Informational lines are printed to stderr (prefixed `#`) so stdout carries only
+the SQL and results. Firestore I/O depends on the DuckDB-WASM runtime's HTTP
+support and a reachable network.
+
+### Version matching (important)
 
 `@duckdb/duckdb-wasm` bundles its own copy of DuckDB. For `LOAD` to accept the
 extension, that bundled DuckDB must share a **minor version** with the DuckDB this
 extension was built against (currently **v1.5.x**; see `duckdb_version` in
 [`.github/workflows/MainDistributionPipeline.yml`](../../.github/workflows/MainDistributionPipeline.yml)).
-The harness sets `allow_extensions_metadata_mismatch=true` to tolerate a patch-level
-skew, but a *minor* mismatch will still be rejected — bump the `@duckdb/duckdb-wasm`
-version in [`package.json`](package.json) to match if needed.
+The harness sets `allow_extensions_metadata_mismatch=true` to absorb a *patch*-level
+skew (e.g. extension v1.5.0 into runtime v1.5.4), but a *minor* mismatch is rejected.
+
+At the time of writing, **stable `@duckdb/duckdb-wasm` releases still bundle DuckDB
+1.4.x**; DuckDB 1.5.x is only in `1.33.1-dev*` builds. [`package.json`](package.json)
+therefore pins a `1.33.1-dev*` version (DuckDB 1.5.4). Bump it to a stable release
+once one ships with 1.5.x. To check what a given version bundles:
+
+```bash
+node -e "const p=require('path'),r=require('module').createRequire(process.cwd()+'/test/wasm/');\
+const d=r('@duckdb/duckdb-wasm/dist/duckdb-node-blocking.cjs');\
+const D=p.dirname(r.resolve('@duckdb/duckdb-wasm'));\
+d.createDuckDB({eh:{mainModule:p.join(D,'duckdb-eh.wasm'),mainWorker:null}},new d.VoidLogger(),d.NODE_RUNTIME)\
+.then(x=>x.instantiate().then(()=>console.log('bundles DuckDB',x.getVersion())))"
+```
+
+### How loading works
+
+The functional harness uses the **async** DuckDB-WASM API (the synchronous
+"blocking" API cannot `INSTALL` an extension — fetching is async). It serves the
+built `.wasm` from a tiny in-process HTTP server and points
+`custom_extension_repository` at it. The Node worker is started with
+`new Worker(path, { type: "module" })` so `web-worker` loads DuckDB's CommonJS
+worker via `import()` rather than `importScripts` (which would throw
+`module is not defined`).
 
 ## CI
 

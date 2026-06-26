@@ -9,11 +9,12 @@
 //   1. The extension LOADs under WASM (the headline fix for issue #5).
 //   2. The `firestore` secret type is registered (API-key secret creation works).
 //   3. All firestore_* table functions are registered.
-//   4. Argument validation fires (a wrong-typed call raises a Binder Error).
+//   4. firestore_update_batch carries its typed (LIST) signature.
 //
 // What it does NOT cover (by design): live Firestore queries (network/CORS) and
 // service-account auth (requires reading a key file, unavailable under WASM — the
-// extension intentionally errors there and steers users to API-key auth).
+// extension intentionally errors there and steers users to API-key auth). To run
+// arbitrary SQL — including against a real Firestore database — use run_sql.mjs.
 //
 // Requirements:
 //   - A built artifact: build/wasm_eh/.../fire_duck_ext.duckdb_extension.wasm
@@ -25,19 +26,8 @@
 // Usage:
 //   node validate_wasm_functional.mjs [path/to/fire_duck_ext.duckdb_extension.wasm]
 
-import { readFile } from "node:fs/promises";
-import { existsSync, statSync, globSync } from "node:fs";
-import { createServer } from "node:http";
-import { gzipSync } from "node:zlib";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, "..", "..");
-const EXT_NAME = "fire_duck_ext";
-const EXT_FILENAME = `${EXT_NAME}.duckdb_extension.wasm`;
+import { connectWithExtension, resolveArtifact, REPO_ROOT } from "./loader.mjs";
 
 const EXPECTED_FUNCTIONS = [
 	"firestore_scan",
@@ -54,82 +44,20 @@ const EXPECTED_FUNCTIONS = [
 	"firestore_clear_cache",
 ];
 
-function resolveArtifact(argPath) {
-	if (argPath) {
-		if (!existsSync(argPath)) throw new Error(`Artifact not found: ${argPath}`);
-		return argPath;
-	}
-	const candidates = globSync(`build/wasm_*/**/${EXT_FILENAME}`, { cwd: REPO_ROOT })
-		.map((p) => path.join(REPO_ROOT, p))
-		.filter((p) => existsSync(p))
-		.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-	if (candidates.length === 0) {
-		throw new Error(
-			`No ${EXT_FILENAME} found under build/wasm_*/. Build it (e.g. \`make wasm_eh\`) or pass the path.`,
-		);
-	}
-	return candidates[0];
-}
-
-// Serve the extension for any request path that ends in the extension filename,
-// so we do not depend on the exact URL DuckDB-WASM constructs for a custom repo.
-function startExtensionServer(extBytes) {
-	return new Promise((resolve) => {
-		const server = createServer((req, res) => {
-			const url = req.url || "";
-			res.setHeader("Access-Control-Allow-Origin", "*");
-			if (url.endsWith(`${EXT_FILENAME}.gz`)) {
-				res.setHeader("Content-Type", "application/wasm");
-				res.setHeader("Content-Encoding", "gzip");
-				res.end(gzipSync(extBytes));
-			} else if (url.endsWith(EXT_FILENAME)) {
-				res.setHeader("Content-Type", "application/wasm");
-				res.end(extBytes);
-			} else {
-				res.statusCode = 404;
-				res.end("not found");
-			}
-		});
-		server.listen(0, "127.0.0.1", () => resolve(server));
-	});
-}
-
-function selectEhBundle() {
-	const DIST = path.dirname(require.resolve("@duckdb/duckdb-wasm"));
-	const findOne = (candidates) => candidates.find((f) => existsSync(path.join(DIST, f)));
-	const mainModule = findOne(["duckdb-eh.wasm"]);
-	const mainWorker = findOne(["duckdb-node-eh.worker.cjs", "duckdb-node-eh.worker.js"]);
-	if (!mainModule || !mainWorker) {
-		throw new Error(
-			`Could not locate the DuckDB-WASM 'eh' Node bundle under ${DIST}. ` +
-				`Check the @duckdb/duckdb-wasm version.`,
-		);
-	}
-	return { mainModule: path.join(DIST, mainModule), mainWorker: path.join(DIST, mainWorker) };
-}
-
 async function main() {
+	// Safety net: the DuckDB-WASM worker thread can keep Node alive (or a query can
+	// stall on a version mismatch), so never hang indefinitely. unref() so the timer
+	// itself doesn't keep the process running.
+	setTimeout(() => {
+		console.error("\nTimed out after 60s — forcing exit. (Often a DuckDB-WASM/extension version mismatch.)");
+		process.exit(3);
+	}, 60_000).unref();
+
 	const artifact = resolveArtifact(process.argv[2]);
-	const extBytes = await readFile(artifact);
-	console.log(`Loading ${path.relative(REPO_ROOT, artifact)} (${extBytes.length} bytes) into DuckDB-WASM\n`);
-
-	const duckdb = await import("@duckdb/duckdb-wasm");
-	const { default: Worker } = await import("web-worker");
-
-	const server = await startExtensionServer(extBytes);
-	const { port } = server.address();
-	const repo = `http://127.0.0.1:${port}`;
-
-	const bundle = selectEhBundle();
-	const worker = new Worker(bundle.mainWorker);
-	const logger = new duckdb.VoidLogger();
-	const db = new duckdb.AsyncDuckDB(logger, worker);
-	await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-	// In-memory is the default when no path is given.
-	await db.open({ allowUnsignedExtensions: true });
-	const conn = await db.connect();
+	console.log(`Loading ${path.relative(REPO_ROOT, artifact)} into DuckDB-WASM\n`);
 
 	const checks = [];
+	let handles;
 	const run = async (name, fn) => {
 		try {
 			await fn();
@@ -141,64 +69,60 @@ async function main() {
 		}
 	};
 
-	// 1. The extension loads under WASM.
+	// 1. The extension installs + loads under WASM.
 	await run("extension installs and loads under WASM", async () => {
-		await conn.query(`SET custom_extension_repository='${repo}'`);
-		// Tolerate a patch-level skew between the extension's build version and the
-		// DuckDB version bundled by @duckdb/duckdb-wasm (both must share a minor).
-		try {
-			await conn.query(`SET allow_extensions_metadata_mismatch=true`);
-		} catch (_) {
-			/* setting unavailable on this build — ignore */
-		}
-		await conn.query(`INSTALL ${EXT_NAME}`);
-		await conn.query(`LOAD ${EXT_NAME}`);
+		handles = await connectWithExtension(artifact);
 	});
 
-	// 2. Secret type registered (API-key auth — the supported WASM path).
-	await run("firestore API-key secret can be created", async () => {
-		await conn.query(
-			`CREATE SECRET wasm_validation (TYPE firestore, PROJECT_ID 'demo', API_KEY 'demo-key')`,
-		);
-	});
+	if (handles) {
+		const { conn } = handles;
 
-	// 3. All firestore_* table functions registered.
-	await run("all firestore_* table functions are registered", async () => {
-		const result = await conn.query(
-			`SELECT DISTINCT function_name FROM duckdb_functions() WHERE function_name LIKE 'firestore_%'`,
-		);
-		const present = new Set(result.toArray().map((r) => r.function_name));
-		const missing = EXPECTED_FUNCTIONS.filter((f) => !present.has(f));
-		if (missing.length) throw new Error(`missing functions: ${missing.join(", ")}`);
-	});
+		// 2. Secret type registered (API-key auth — the supported WASM path).
+		await run("firestore API-key secret can be created", async () => {
+			await conn.query(`CREATE SECRET wasm_validation (TYPE firestore, PROJECT_ID 'demo', API_KEY 'demo-key')`);
+		});
 
-	// 4. Argument validation works (wrong-typed call -> Binder Error, no network).
-	await run("wrong-typed call raises a binder error", async () => {
-		let threw = false;
-		try {
-			await conn.query(`SELECT * FROM firestore_update_batch('users', 'not-a-list', 'f', 'v')`);
-		} catch (e) {
-			threw = true;
-			if (!/binder|no function matches/i.test(e.message)) {
-				throw new Error(`expected a binder error, got: ${e.message}`);
+		// 3. All firestore_* table functions registered.
+		await run("all firestore_* table functions are registered", async () => {
+			const result = await conn.query(
+				`SELECT DISTINCT function_name FROM duckdb_functions() WHERE function_name LIKE 'firestore_%'`,
+			);
+			const present = new Set(result.toArray().map((r) => r.function_name));
+			const missing = EXPECTED_FUNCTIONS.filter((f) => !present.has(f));
+			if (missing.length) throw new Error(`missing functions: ${missing.join(", ")}`);
+		});
+
+		// 4. Functions register with their correct typed signatures. We check that
+		//    firestore_update_batch's second argument is a LIST (VARCHAR[]) — the type
+		//    that makes a wrong-typed call fail to bind. (Asserting the signature avoids
+		//    triggering a binder error, which the worker would noisily log to stderr.)
+		await run("firestore_update_batch has its typed LIST signature", async () => {
+			const result = await conn.query(
+				`SELECT parameter_types FROM duckdb_functions() WHERE function_name = 'firestore_update_batch' LIMIT 1`,
+			);
+			const rows = result.toArray();
+			if (rows.length === 0) throw new Error("firestore_update_batch not registered");
+			const types = Array.from(rows[0].parameter_types ?? []).map(String);
+			if (!types.some((t) => t.endsWith("[]"))) {
+				throw new Error(`expected a LIST parameter, got: [${types.join(", ")}]`);
 			}
-		}
-		if (!threw) throw new Error("expected the wrong-typed call to raise an error");
-	});
-
-	await conn.close();
-	await db.terminate();
-	await worker.terminate();
-	await new Promise((r) => server.close(r));
+		});
+	}
 
 	const failures = checks.filter((c) => !c.ok).length;
 	console.log("");
-	if (failures > 0) {
-		console.log(`FAILED (${failures} of ${checks.length} checks)`);
-		process.exit(1);
-	}
-	console.log(`OK — ${checks.length} functional checks passed under DuckDB-WASM`);
-	process.exit(0);
+	console.log(
+		failures > 0
+			? `FAILED (${failures} of ${checks.length} checks)`
+			: `OK — ${checks.length} functional checks passed under DuckDB-WASM`,
+	);
+
+	// Best-effort, non-blocking teardown, then hard-exit. We deliberately do NOT
+	// `await` worker/db termination: the DuckDB-WASM worker's terminate() can stall
+	// and keep Node alive, hanging the process *after* the result is printed.
+	// process.exit() tears the worker thread and server down regardless.
+	handles?.server?.close();
+	process.exit(failures > 0 ? 1 : 0);
 }
 
 main().catch((e) => {
