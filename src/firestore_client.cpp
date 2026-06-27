@@ -112,8 +112,8 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 	FirestoreErrorContext error_ctx = ctx;
 	error_ctx.withMethod(method).withUrl(url).withProject(credentials_->project_id);
 
-	// Ensure token is valid for service account auth
-	FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_);
+	// Ensure the cached token is valid (service-account OAuth2 or Firebase user ID token)
+	FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_, db_);
 
 	// Serialize request body for methods that carry one
 	std::string body_str;

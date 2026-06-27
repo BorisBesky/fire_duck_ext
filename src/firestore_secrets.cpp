@@ -118,15 +118,42 @@ static unique_ptr<BaseSecret> CreateFirestoreSecretFromConfig(ClientContext &con
 		return std::move(result);
 	}
 
-	// Check for API key
+	// Firebase Auth user sign-in (browser-safe): the public api_key plus either
+	// email/password or anonymous. Checked before the plain api_key branch, since
+	// those modes also carry an api_key (used for the Firebase Auth endpoints).
 	auto api_key = input.options.find("api_key");
+	auto email = input.options.find("email");
+	auto password = input.options.find("password");
+	auto anonymous = input.options.find("anonymous");
+	bool want_anonymous = anonymous != input.options.end() && anonymous->second.GetValue<bool>();
+	bool want_email_password = email != input.options.end() || password != input.options.end();
+	if (want_email_password || want_anonymous) {
+		if (api_key == input.options.end()) {
+			throw InvalidInputException("Firebase user authentication requires 'api_key' (the public Web API key)");
+		}
+		if (want_email_password && (email == input.options.end() || password == input.options.end())) {
+			throw InvalidInputException("Firebase email/password authentication requires both 'email' and 'password'");
+		}
+		result->secret_map["api_key"] = api_key->second.ToString();
+		if (want_email_password) {
+			result->secret_map["email"] = email->second.ToString();
+			result->secret_map["password"] = password->second.ToString();
+		} else {
+			result->secret_map["anonymous"] = Value::BOOLEAN(true);
+		}
+		result->secret_map["auth_type"] = Value("firebase_user");
+		return std::move(result);
+	}
+
+	// Check for API key (unauthenticated access — request.auth is null)
 	if (api_key != input.options.end()) {
 		result->secret_map["api_key"] = api_key->second.ToString();
 		result->secret_map["auth_type"] = Value("api_key");
 		return std::move(result);
 	}
 
-	throw InvalidInputException("firestore secret requires either 'service_account_json' or 'api_key'");
+	throw InvalidInputException("firestore secret requires 'service_account_json', 'api_key', or Firebase user auth "
+	                            "('api_key' with 'email'+'password' or 'anonymous')");
 }
 
 // Deserialize secret from storage
@@ -153,6 +180,9 @@ void RegisterFirestoreSecretType(ExtensionLoader &loader) {
 	config_function.named_parameters["project_id"] = LogicalType::VARCHAR;
 	config_function.named_parameters["service_account_json"] = LogicalType::VARCHAR;
 	config_function.named_parameters["api_key"] = LogicalType::VARCHAR;
+	config_function.named_parameters["email"] = LogicalType::VARCHAR;
+	config_function.named_parameters["password"] = LogicalType::VARCHAR;
+	config_function.named_parameters["anonymous"] = LogicalType::BOOLEAN;
 	config_function.named_parameters["database"] = LogicalType::VARCHAR;
 	config_function.named_parameters["databases"] = LogicalType::LIST(LogicalType::VARCHAR);
 
@@ -285,6 +315,17 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 			throw InvalidInputException("Firestore secret missing api_key");
 		}
 		cache_key = "secret:api_key:" + project_id + ":" + database_id + ":" + api_key_it->second.ToString();
+	} else if (auth_type == "firebase_user") {
+		auto api_key_it = secret.secret_map.find("api_key");
+		if (api_key_it == secret.secret_map.end()) {
+			throw InvalidInputException("Firestore secret missing api_key");
+		}
+		std::string user_key = "anonymous";
+		auto email_it = secret.secret_map.find("email");
+		if (email_it != secret.secret_map.end()) {
+			user_key = email_it->second.ToString();
+		}
+		cache_key = "secret:firebase_user:" + project_id + ":" + database_id + ":" + user_key;
 	}
 
 	if (!cache_key.empty()) {
@@ -320,6 +361,27 @@ GetFirestoreCredentialsFromSecret(ClientContext &context, const std::string &sec
 			throw InvalidInputException("Firestore secret missing api_key");
 		}
 		creds = FirestoreAuthManager::CreateApiKeyCredentials(project_id, api_key_it->second.ToString());
+	} else if (auth_type == "firebase_user") {
+		auto api_key_it = secret.secret_map.find("api_key");
+		if (api_key_it == secret.secret_map.end()) {
+			throw InvalidInputException("Firestore secret missing api_key");
+		}
+		std::string email, password;
+		bool anonymous = false;
+		auto email_it = secret.secret_map.find("email");
+		if (email_it != secret.secret_map.end()) {
+			email = email_it->second.ToString();
+		}
+		auto password_it = secret.secret_map.find("password");
+		if (password_it != secret.secret_map.end()) {
+			password = password_it->second.ToString();
+		}
+		auto anon_it = secret.secret_map.find("anonymous");
+		if (anon_it != secret.secret_map.end()) {
+			anonymous = anon_it->second.GetValue<bool>();
+		}
+		creds = FirestoreAuthManager::CreateFirebaseUserCredentials(project_id, api_key_it->second.ToString(), email,
+		                                                            password, anonymous);
 	} else {
 		throw InvalidInputException("Unknown firestore auth_type: " + auth_type);
 	}
