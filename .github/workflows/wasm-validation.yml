@@ -27,7 +27,7 @@ jobs:
       DUCKDB_PLATFORM: wasm_eh
       WASM_EXTENSIONS: 1
       # Keep the DuckDB version in sync with MainDistributionPipeline.yml.
-      DUCKDB_VERSION: v1.5.2
+      DUCKDB_VERSION: v1.5.4
     steps:
       - uses: actions/checkout@v4
         with:
