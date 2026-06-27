@@ -28,6 +28,65 @@ namespace duckdb {
 
 using json = nlohmann::json;
 
+namespace {
+
+// Decode standard or URL-safe base64 (padding optional). Used to read JWT claims;
+// no crypto involved.
+std::string Base64Decode(std::string in) {
+	static const std::string kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	for (auto &c : in) {
+		if (c == '-') {
+			c = '+';
+		} else if (c == '_') {
+			c = '/';
+		}
+	}
+	std::string out;
+	int buffer = 0;
+	int bits = 0;
+	for (char c : in) {
+		if (c == '=') {
+			break;
+		}
+		auto pos = kAlphabet.find(c);
+		if (pos == std::string::npos) {
+			continue; // skip whitespace/newlines
+		}
+		buffer = (buffer << 6) | static_cast<int>(pos);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+		}
+	}
+	return out;
+}
+
+// Read the `exp` (seconds since the Unix epoch) from a Firebase ID token (a JWT).
+// Returns the epoch (i.e. "already expired") if it cannot be parsed.
+std::chrono::system_clock::time_point ParseIdTokenExpiry(const std::string &id_token) {
+	auto first_dot = id_token.find('.');
+	if (first_dot == std::string::npos) {
+		return {};
+	}
+	auto second_dot = id_token.find('.', first_dot + 1);
+	if (second_dot == std::string::npos) {
+		return {};
+	}
+	std::string payload = Base64Decode(id_token.substr(first_dot + 1, second_dot - first_dot - 1));
+	try {
+		auto j = json::parse(payload);
+		if (j.contains("exp")) {
+			return std::chrono::system_clock::time_point(std::chrono::seconds(j["exp"].get<int64_t>()));
+		}
+	} catch (...) {
+		// fall through
+	}
+	return {};
+}
+
+} // namespace
+
 // Token validity buffer (refresh 5 minutes before expiry)
 static const int TOKEN_REFRESH_BUFFER_SECONDS = 300;
 
@@ -133,6 +192,27 @@ FirestoreAuthManager::CreateFirebaseUserCredentials(const std::string &project_i
 	creds->email = email;
 	creds->password = password;
 	creds->anonymous = anonymous;
+	return creds;
+}
+
+std::unique_ptr<FirestoreCredentials>
+FirestoreAuthManager::CreateFirebaseTokenCredentials(const std::string &project_id, const std::string &api_key,
+                                                     const std::string &id_token, const std::string &refresh_token) {
+	FS_LOG_DEBUG("Creating Firebase credentials from a pre-obtained ID token for project: " + project_id);
+
+	auto creds = std::make_unique<FirestoreCredentials>();
+	creds->type = FirestoreAuthType::FIREBASE_USER;
+	creds->project_id = project_id;
+	creds->api_key = api_key;
+	creds->access_token = id_token;
+	creds->refresh_token = refresh_token;
+
+	auto expiry = ParseIdTokenExpiry(id_token);
+	// If the expiry can't be read, assume a near-full Firebase token lifetime so we
+	// don't refresh/sign-in spuriously (the token is verified by Firestore anyway).
+	creds->token_expiry = (expiry == std::chrono::system_clock::time_point {})
+	                          ? std::chrono::system_clock::now() + std::chrono::minutes(55)
+	                          : expiry;
 	return creds;
 }
 
