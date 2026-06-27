@@ -91,6 +91,8 @@ support and a reachable network.
 > - `listDocuments` reads (colon-free GET),
 > - `:runQuery` — WHERE/ORDER pushdown **and** collection-group scans (`~group`,
 >   `allDescendants=true`), i.e. colon `:customMethod` URLs reach Firestore fine,
+> - Firebase Auth sign-in (`accounts:signInWithPassword`, also a colon `:customMethod`
+>   POST) — email/password sign-in then authenticated `SELECT` is verified in-browser,
 > - request headers including `Authorization`.
 
 Firestore access tiers:
@@ -99,7 +101,8 @@ Firestore access tiers:
 | --- | --- | --- |
 | API key | no (`request.auth == null`) | works; Security Rules apply (rules must allow the read) |
 | Service account | yes (admin; bypasses rules) | **native only** (needs RS256/OpenSSL) |
-| Firebase user — anonymous / email+password | yes | sign-in is a colon `:customMethod`, which the transport handles; full in-browser flow not yet end-to-end verified |
+| Firebase user — email+password | yes | **verified in-browser** (sign-in is `accounts:signInWithPassword`, a colon `:customMethod`) |
+| Firebase user — anonymous | yes | same code path (`accounts:signUp`, colon `:customMethod`); expected to work |
 | Firebase user — pre-obtained ID token | yes | works (see *Token passthrough*) |
 
 ### Two real gotchas (not transport bugs)
