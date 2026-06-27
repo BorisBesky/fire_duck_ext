@@ -414,6 +414,23 @@ When a collection contains only phantom documents (no fields at all), the result
 
 > **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
 
+> **Important — `show_missing=true` requires privileged (service-account) access.** Listing
+> phantom/missing documents (`showMissing=true`, the default) is an Admin-oriented operation.
+> The Admin SDK / a service account bypasses Security Rules and can do it, but over
+> **rules-governed access (API key or Firebase user ID token)** Firestore rejects it with
+> `403 PERMISSION_DENIED: Missing or insufficient permissions` — **even when your rules grant
+> `allow read: if true`** (a plain `list` is permitted; enumerating missing documents is not).
+> If you authenticate with an API key or a Firebase user token, pass `show_missing=false`:
+>
+> ```sql
+> SELECT * FROM firestore_scan('artifacts/default-app-id/users/<uid>/math_whiz_data',
+>                              show_missing=false)
+> WHERE role = 'student';
+> ```
+>
+> The 403 is reported for the scan's schema-inference `listDocuments` request (it carries
+> `showMissing=true&pageSize=100`), not for your documents — your read rules are unaffected.
+
 ## Building from Source
 
 ### Prerequisites

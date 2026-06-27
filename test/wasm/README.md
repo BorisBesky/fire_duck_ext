@@ -78,6 +78,65 @@ Informational lines are printed to stderr (prefixed `#`) so stdout carries only
 the SQL and results. Firestore I/O depends on the DuckDB-WASM runtime's HTTP
 support and a reachable network.
 
+## Authenticated access on WASM
+
+> **The DuckDB-WASM HTTP layer is not the problem.** Earlier notes here claimed two
+> duckdb-wasm transport bugs (`:customMethod` URLs → 404, and `Authorization: Bearer`
+> not honored). Both were **wrong** — they were artifacts of a DuckDB **version/ABI
+> mismatch** (the extension was built against DuckDB v1.5.0 but loaded into a v1.5.4
+> `@duckdb/duckdb-wasm` runtime, force-loaded past the safety check). That mismatch
+> corrupted scan execution and surfaced as a `table index is out of bounds` crash and
+> misleading 404s. With versions matched (see *Version matching* below), browser
+> DuckDB-WASM correctly performs:
+> - `listDocuments` reads (colon-free GET),
+> - `:runQuery` — WHERE/ORDER pushdown **and** collection-group scans (`~group`,
+>   `allDescendants=true`), i.e. colon `:customMethod` URLs reach Firestore fine,
+> - request headers including `Authorization`.
+
+Firestore access tiers:
+
+| Auth mode | Authenticated? | On WASM |
+| --- | --- | --- |
+| API key | no (`request.auth == null`) | works; Security Rules apply (rules must allow the read) |
+| Service account | yes (admin; bypasses rules) | **native only** (needs RS256/OpenSSL) |
+| Firebase user — anonymous / email+password | yes | sign-in is a colon `:customMethod`, which the transport handles; full in-browser flow not yet end-to-end verified |
+| Firebase user — pre-obtained ID token | yes | works (see *Token passthrough*) |
+
+### Two real gotchas (not transport bugs)
+
+1. **`show_missing=true` (the default) needs a service account.** Listing phantom/missing
+   documents is an Admin-oriented operation; over rules-governed access (API key or
+   Firebase user token) Firestore returns `403 PERMISSION_DENIED` **even with
+   `allow read: if true`**. Pass `show_missing=false`:
+
+   ```sql
+   SELECT * FROM firestore_scan('my_collection', show_missing=false) WHERE field = 'x';
+   ```
+
+2. **The Firestore Admin API (index metadata) is IAM-gated, not rules-gated.** API-key /
+   Firebase-user auth can never reach `…/collectionGroups/…/indexes` (it returns 403).
+   The extension now **skips that call entirely** for non-service-account auth and assumes
+   Firestore's default single-field indexes, so it no longer emits a doomed 403 request.
+
+### Token passthrough
+The extension accepts a **pre-obtained Firebase ID token** (mint it host-side — a normal
+browser `fetch` to the Firebase Auth REST API works), so no in-extension sign-in is needed:
+
+```sql
+CREATE SECRET fs (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIza…',           -- optional; enables auto-refresh via securetoken
+    ID_TOKEN 'eyJhbGciOi…',     -- from your host-side sign-in
+    REFRESH_TOKEN 'AMf-…'       -- optional; auto-refreshed on expiry
+);
+SELECT * FROM firestore_scan('my_collection', show_missing=false) LIMIT 10;
+```
+
+The extension sends `Authorization: Bearer <id_token>` for reads and refreshes via
+`securetoken` (colon-free) on expiry. **Verified on native** (it authenticates and
+respects Security Rules); the WASM transport forwards the same request unchanged.
+
 ### Version matching (important)
 
 `@duckdb/duckdb-wasm` bundles its own copy of DuckDB. For `LOAD` to accept the

@@ -1,6 +1,7 @@
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
 #include "firestore_types.hpp"
+#include "firestore_path_utils.hpp"
 #ifdef __EMSCRIPTEN__
 // DuckDB-WASM has no OS sockets: route HTTP through DuckDB's HTTPUtil, which
 // dispatches to the browser's fetch() (and the native HTTP stack under Node).
@@ -655,10 +656,22 @@ std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
 
 FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, const json &structured_query,
                                                 bool is_collection_group) {
-	FS_LOG_DEBUG("Executing runQuery for collection: " + collection +
-	             " (collection_group=" + (is_collection_group ? "true" : "false") + ")");
+	// Nested subcollections must run the query against their parent document path
+	// (".../documents/<parent>:runQuery"); the final segment is in from.collectionId.
+	// Top-level collections and collection groups query from the database root.
+	std::string parent_path;
+	std::string collection_id;
+	SplitFirestoreCollectionPath(collection, is_collection_group, parent_path, collection_id);
 
-	std::string url = BuildBaseUrl() + ":runQuery" + credentials_->GetUrlSuffix();
+	FS_LOG_DEBUG("Executing runQuery for collection: " + collection +
+	             " (collection_group=" + (is_collection_group ? "true" : "false") + ", parent='" + parent_path +
+	             "', collectionId='" + collection_id + "')");
+
+	std::string url = BuildBaseUrl();
+	if (!parent_path.empty()) {
+		url += "/" + parent_path;
+	}
+	url += ":runQuery" + credentials_->GetUrlSuffix();
 
 	FirestoreErrorContext ctx;
 	ctx.withOperation("run_query").withCollection(collection);

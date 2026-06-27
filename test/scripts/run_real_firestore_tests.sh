@@ -1271,6 +1271,25 @@ if any_in_range 62 63; then
     echo "Document-path test data seeded."
 fi
 
+# --- Conditional setup: nested-subcollection runQuery data (tests 64-65) ---
+# Regression coverage for the runQuery parent/collectionId split. A filtered scan
+# of a nested subcollection ("a/b/items") must POST to ".../documents/a/b:runQuery"
+# with from.collectionId="items" (the final segment only). The previous bug sent the
+# whole slash path as collectionId, which Firestore rejects with
+# "400 INVALID_ARGUMENT: Collection id ... is invalid because it contains '/'".
+# Items live under TWO parents so the assertions also prove the query is scoped to the
+# requested parent and does not leak the sibling parent's documents.
+if any_in_range 64 65; then
+    echo ""
+    echo "=== Seeding nested-subcollection runQuery test data ==="
+    seed_doc "fde_ci_subq/parent1/items/i1" '{"fields":{"status":{"stringValue":"active"},"qty":{"integerValue":"5"}}}'
+    seed_doc "fde_ci_subq/parent1/items/i2" '{"fields":{"status":{"stringValue":"active"},"qty":{"integerValue":"15"}}}'
+    seed_doc "fde_ci_subq/parent1/items/i3" '{"fields":{"status":{"stringValue":"inactive"},"qty":{"integerValue":"20"}}}'
+    # Sibling parent — must NOT appear in parent1's results.
+    seed_doc "fde_ci_subq/parent2/items/x1" '{"fields":{"status":{"stringValue":"active"},"qty":{"integerValue":"99"}}}'
+    echo "Nested-subcollection test data seeded."
+fi
+
 if should_run 62; then
     echo ""
     echo "=== Running document-path scan tests ==="
@@ -1313,6 +1332,32 @@ if should_run 63; then
          ORDER BY CAST(substr(__document_id, 4) AS INTEGER) DESC LIMIT 1;")
     assert_eq "$RESULT" "sub105" \
         "document path scan falls back to DuckDB for unsupported order expressions"
+fi
+
+if any_in_range 64 65; then
+    echo ""
+    echo "=== Running nested-subcollection runQuery tests ==="
+fi
+
+if should_run 64; then
+    # Test 64: equality filter on a nested subcollection — exercises runQuery with the
+    # parent/collectionId split. Must return only parent1's matching docs, not parent2's.
+    echo "Test 64: WHERE equality on nested subcollection path (runQuery)..."
+    RESULT=$(run_query \
+        "SELECT string_agg(__document_id, ',' ORDER BY __document_id)
+         FROM firestore_scan('fde_ci_subq/parent1/items') WHERE status = 'active';")
+    assert_eq "$RESULT" "i1,i2" \
+        "filtered scan of nested subcollection runs runQuery scoped to the parent document"
+fi
+
+if should_run 65; then
+    # Test 65: range filter on the same nested path — range ops add an orderBy on the
+    # field; still must be parent-scoped (parent2's qty=99 doc excluded).
+    echo "Test 65: WHERE range on nested subcollection path (runQuery)..."
+    RESULT=$(run_query \
+        "SELECT count(*) FROM firestore_scan('fde_ci_subq/parent1/items') WHERE qty > 10;")
+    assert_eq "$RESULT" "2" \
+        "range-filtered scan of nested subcollection is scoped to the parent document"
 fi
 
 # --- Cleanup ---
@@ -1381,6 +1426,14 @@ if any_in_range 62 63; then
         delete_doc "fde_docpath_cases/paginated_parent/${SUBCOLL_ID}/doc1"
     done
     delete_doc "fde_docpath_cases/paginated_parent"
+fi
+
+# Cleanup nested-subcollection runQuery test data (tests 64-65)
+if any_in_range 64 65; then
+    delete_doc "fde_ci_subq/parent1/items/i1"
+    delete_doc "fde_ci_subq/parent1/items/i2"
+    delete_doc "fde_ci_subq/parent1/items/i3"
+    delete_doc "fde_ci_subq/parent2/items/x1"
 fi
 
 echo "Test data cleaned up. (Indexes left in place for idempotency.)"
