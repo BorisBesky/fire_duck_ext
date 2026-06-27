@@ -57,11 +57,9 @@ public:
 
 	// Create credentials for Firebase Auth user sign-in (anonymous or email/password).
 	// The api_key is the public Web API key, used for the Firebase Auth endpoints.
-	static std::unique_ptr<FirestoreCredentials> CreateFirebaseUserCredentials(const std::string &project_id,
-	                                                                           const std::string &api_key,
-	                                                                           const std::string &email,
-	                                                                           const std::string &password,
-	                                                                           bool anonymous);
+	static std::unique_ptr<FirestoreCredentials>
+	CreateFirebaseUserCredentials(const std::string &project_id, const std::string &api_key, const std::string &email,
+	                              const std::string &password, bool anonymous);
 
 	// Create credentials from a pre-obtained Firebase ID token (and optional refresh
 	// token), e.g. minted by the host app. Expiry is read from the token's JWT claims.

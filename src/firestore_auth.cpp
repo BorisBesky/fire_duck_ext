@@ -178,10 +178,11 @@ std::unique_ptr<FirestoreCredentials> FirestoreAuthManager::CreateApiKeyCredenti
 	return creds;
 }
 
-std::unique_ptr<FirestoreCredentials>
-FirestoreAuthManager::CreateFirebaseUserCredentials(const std::string &project_id, const std::string &api_key,
-                                                    const std::string &email, const std::string &password,
-                                                    bool anonymous) {
+std::unique_ptr<FirestoreCredentials> FirestoreAuthManager::CreateFirebaseUserCredentials(const std::string &project_id,
+                                                                                          const std::string &api_key,
+                                                                                          const std::string &email,
+                                                                                          const std::string &password,
+                                                                                          bool anonymous) {
 	FS_LOG_DEBUG("Creating Firebase user credentials for project: " + project_id +
 	             (anonymous ? " (anonymous)" : " (email/password)"));
 
