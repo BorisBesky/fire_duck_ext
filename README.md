@@ -157,6 +157,18 @@ Both pass the API key, but only anonymous sign-in actually authenticates a user 
 
 Use a **plain API key** for public collections whose rules allow unauthenticated reads. Use **`ANONYMOUS true`** when your rules require a signed-in user (`request.auth != null`) but you don't need a specific identity — e.g. per-session/per-device data. Each anonymous sign-in gets a fresh `uid`, so it suits "authenticated but identity-agnostic" rules; for a specific known user, use email/password or a pre-obtained `ID_TOKEN`.
 
+### Admin-only features (index metadata)
+
+Some features rely on Firestore's **index metadata** (composite indexes and single-field index configuration), which lives on the Firestore **Admin API**. That API is gated by Google Cloud IAM, **not** by Security Rules — so only **service-account** auth can read it. **API key** and **Firebase user** auth are non-admin: the extension cannot query this metadata for them, skips the Admin API, and assumes Firestore's default single-field indexes.
+
+As a result, features that depend on admin metadata are unavailable to non-admin auth — most notably **composite-index detection for multi-field `ORDER BY`**. With a service account, the extension detects an existing composite index and pushes multi-field ordering to Firestore; without one, such a query falls back to a single-field server-side sort (re-sorted in DuckDB) or surfaces Firestore's *"query requires an index"* error at runtime. Single-field filter and order pushdown are unaffected, since Firestore's default single-field indexes are assumed to exist.
+
+| Feature | Service account | API key / Firebase user |
+| --- | --- | --- |
+| Single-field filter / `ORDER BY` pushdown | ✅ | ✅ |
+| Composite-index detection (multi-field `ORDER BY`) | ✅ | ❌ (assumes defaults) |
+| `show_missing=true` (phantom-document listing) | ✅ | ❌ (403; use `show_missing=false`) |
+
 ### Environment Variable
 ```bash
 # Set the path to your service account JSON file
@@ -361,6 +373,8 @@ Named parameters still work and take precedence over SQL pushdown:
 
 - If `order_by=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
 - If `scan_limit=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
+
+> **Multi-field ordering needs a composite index, which the extension can only detect with service-account auth.** See [Admin-only features](#admin-only-features-index-metadata) — with API-key or Firebase-user auth, multi-field `ORDER BY` can't be confirmed against a composite index and may fall back to a client-side sort or hit Firestore's "requires an index" error.
 
 ```sql
 -- SQL ORDER BY + LIMIT pushed to Firestore

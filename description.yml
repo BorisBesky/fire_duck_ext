@@ -185,6 +185,16 @@ docs:
     `ANONYMOUS true` when rules require a signed-in user (`request.auth != null`) but
     no specific identity is needed. Each anonymous sign-in gets a fresh `uid`.
 
+    **Admin-only features.** Firestore's index metadata (composite indexes and
+    single-field index configuration) is served by the Firestore Admin API, which is
+    gated by Google Cloud IAM and readable only with a **service account**. With API
+    key or Firebase user auth the extension cannot query it, skips it, and assumes
+    Firestore's default single-field indexes. Features that depend on this metadata
+    are therefore unavailable to non-admin auth — most notably composite-index
+    detection for multi-field `ORDER BY`, which falls back to a single-field
+    server-side sort (re-sorted in DuckDB) or surfaces Firestore's "query requires an
+    index" error. Single-field filter and order pushdown are unaffected.
+
     If the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set,
     the extension automatically creates an internal secret on startup that
     matches all databases (`DATABASE '*'`), so no `CREATE SECRET` is needed.
