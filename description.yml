@@ -40,11 +40,38 @@ docs:
         }'
     );
 
-    -- Or authenticate with an API key (for dev/testing)
+    -- Or authenticate with an API key (unauthenticated; request.auth is null)
     CREATE SECRET my_firestore (
         TYPE firestore,
         PROJECT_ID 'my-gcp-project',
         API_KEY 'AIzaSyYourApiKeyHere'
+    );
+
+    -- Or authenticate as a Firebase Auth user (browser-safe; respects Security Rules)
+    -- Email/password sign-in:
+    CREATE SECRET my_firestore (
+        TYPE firestore,
+        PROJECT_ID 'my-gcp-project',
+        API_KEY 'AIzaSyYourWebApiKey',
+        EMAIL 'user@example.com',
+        PASSWORD 'hunter2'
+    );
+
+    -- Anonymous sign-in:
+    CREATE SECRET my_firestore (
+        TYPE firestore,
+        PROJECT_ID 'my-gcp-project',
+        API_KEY 'AIzaSyYourWebApiKey',
+        ANONYMOUS true
+    );
+
+    -- Or pass a pre-obtained Firebase ID token (e.g. minted by your host app)
+    CREATE SECRET my_firestore (
+        TYPE firestore,
+        PROJECT_ID 'my-gcp-project',
+        API_KEY 'AIzaSyYourWebApiKey',  -- optional; enables auto-refresh
+        ID_TOKEN 'eyJhbGciOi...',
+        REFRESH_TOKEN 'AMf-...'         -- optional; auto-refreshed on expiry
     );
 
     -- Read documents
@@ -125,20 +152,55 @@ docs:
     Push down filters to Firestore with firestore_scan().
 
     ## Authentication
-    Secrets require `PROJECT_ID` and one of `SERVICE_ACCOUNT_JSON` or
-    `API_KEY`.
+    Secrets require `PROJECT_ID` and one of three auth modes:
 
-    `SERVICE_ACCOUNT_JSON` accepts either a file path or the full inline
-    JSON text of a Google Cloud service account key. The JSON must contain
-    at least `type`, `project_id`, `private_key`, and `client_email`.
+    1. **Service account** (`SERVICE_ACCOUNT_JSON`) — admin access that bypasses
+       Security Rules. Accepts either a file path or the full inline JSON text of a
+       Google Cloud service account key (must contain at least `type`, `project_id`,
+       `private_key`, and `client_email`). Requires OpenSSL for RS256 signing, so it
+       is **native-only** (not available in the WebAssembly build).
 
-    `API_KEY` provides unauthenticated access suitable for development,
-    testing, or public databases. API key auth does not support
-    `batchWrite`, so batch operations fall back to individual requests.
+    2. **API key** (`API_KEY`) — unauthenticated access (`request.auth == null`),
+       suitable for development, testing, or public databases. Reads are still
+       subject to Security Rules. API key auth does not support `batchWrite`, so
+       batch operations fall back to individual requests.
+
+    3. **Firebase Auth user** — authenticated access that respects Security Rules and
+       is browser-safe (works in the WebAssembly build). Provide the public Web
+       `API_KEY` plus one of:
+       - `EMAIL` + `PASSWORD` — email/password sign-in,
+       - `ANONYMOUS true` — anonymous sign-in,
+       - `ID_TOKEN` (+ optional `REFRESH_TOKEN`) — a pre-obtained Firebase ID token
+         minted by your host app. `API_KEY` is optional in this mode but enables
+         automatic token refresh.
+
+       The extension sends `Authorization: Bearer <id_token>` and refreshes the token
+       automatically on expiry.
 
     If the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set,
     the extension automatically creates an internal secret on startup that
     matches all databases (`DATABASE '*'`), so no `CREATE SECRET` is needed.
+
+    ## WebAssembly (DuckDB-WASM)
+    The extension builds and runs in DuckDB-WASM (e.g. in the browser). HTTP is
+    routed through DuckDB's HTTPUtil instead of raw sockets, so reads, filtered
+    `:runQuery` scans (including collection groups), and writes all work in the
+    browser. Authentication in WASM uses **API key** or **Firebase Auth user**
+    credentials (email/password, anonymous, or a pre-obtained ID token);
+    **service-account** auth is native-only because it needs OpenSSL.
+
+    Two things to know for rules-governed (API key / Firebase user) access:
+    - `show_missing := true` (the default) lists phantom/missing documents, which is
+      an Admin-only operation; over rules-governed access Firestore returns
+      `403 PERMISSION_DENIED` even when rules allow the read. Pass
+      `show_missing := false`.
+    - The Firestore Admin API (index metadata) is reachable only with a service
+      account; for API-key / Firebase-user auth the extension skips it and assumes
+      default single-field indexes.
+
+    The WASM build of the extension must match the DuckDB version bundled by the
+    `@duckdb/duckdb-wasm` runtime it is loaded into (the C++ extension ABI is not
+    stable across versions).
 
     ## Type Mapping
     - `string` → VARCHAR
@@ -259,3 +321,8 @@ docs:
     by `show_missing` (default: `true`). Set `show_missing := false` to
     only return documents with fields. When a collection contains only
     phantom documents, the result includes just the `__document_id` column.
+
+    Listing phantom documents is an Admin-only operation, so with rules-governed
+    access (API key or Firebase user) Firestore returns `403 PERMISSION_DENIED`
+    even when Security Rules allow the read. Use `show_missing := false` with those
+    auth modes, or authenticate with a service account.
