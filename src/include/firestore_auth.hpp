@@ -7,7 +7,13 @@
 
 namespace duckdb {
 
-enum class FirestoreAuthType { SERVICE_ACCOUNT, API_KEY };
+class DatabaseInstance;
+
+enum class FirestoreAuthType {
+	SERVICE_ACCOUNT, // OAuth2 via signed JWT (admin; bypasses Security Rules; native only)
+	API_KEY,         // unauthenticated; only the project is identified (request.auth == null)
+	FIREBASE_USER    // Firebase Auth user ID token (browser-safe; respects Security Rules)
+};
 
 struct FirestoreCredentials {
 	FirestoreAuthType type;
@@ -19,10 +25,16 @@ struct FirestoreCredentials {
 	std::string private_key;
 	std::string private_key_id;
 
-	// For API_KEY
+	// For API_KEY (also used by FIREBASE_USER for the Firebase Auth endpoints)
 	std::string api_key;
 
-	// Cached access token (for SERVICE_ACCOUNT)
+	// For FIREBASE_USER (Firebase Auth user sign-in)
+	std::string email;
+	std::string password;
+	bool anonymous = false;
+	std::string refresh_token;
+
+	// Cached access token: OAuth2 token for SERVICE_ACCOUNT, ID token for FIREBASE_USER
 	std::string access_token;
 	std::chrono::system_clock::time_point token_expiry;
 
@@ -43,11 +55,27 @@ public:
 	static std::unique_ptr<FirestoreCredentials> CreateApiKeyCredentials(const std::string &project_id,
 	                                                                     const std::string &api_key);
 
-	// Get/refresh OAuth2 access token for service account
-	static std::string GetAccessToken(FirestoreCredentials &creds);
+	// Create credentials for Firebase Auth user sign-in (anonymous or email/password).
+	// The api_key is the public Web API key, used for the Firebase Auth endpoints.
+	static std::unique_ptr<FirestoreCredentials>
+	CreateFirebaseUserCredentials(const std::string &project_id, const std::string &api_key, const std::string &email,
+	                              const std::string &password, bool anonymous);
 
-	// Refresh token if needed
-	static void RefreshTokenIfNeeded(FirestoreCredentials &creds);
+	// Create credentials from a pre-obtained Firebase ID token (and optional refresh
+	// token), e.g. minted by the host app. Expiry is read from the token's JWT claims.
+	// This avoids the `:customMethod` sign-in endpoints that DuckDB-WASM cannot reach.
+	static std::unique_ptr<FirestoreCredentials> CreateFirebaseTokenCredentials(const std::string &project_id,
+	                                                                            const std::string &api_key,
+	                                                                            const std::string &id_token,
+	                                                                            const std::string &refresh_token);
+
+	// Get/refresh OAuth2 access token for service account.
+	// `db` is used to reach DuckDB's HTTPUtil for the token HTTP calls under WASM.
+	static std::string GetAccessToken(FirestoreCredentials &creds, DatabaseInstance &db);
+
+	// Refresh/acquire the cached token if needed (service account OAuth2, or Firebase
+	// user ID token). `db` is used for the HTTP calls (HTTPUtil on WASM).
+	static void RefreshTokenIfNeeded(FirestoreCredentials &creds, DatabaseInstance &db);
 
 private:
 	// Create JWT for service account authentication

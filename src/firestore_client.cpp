@@ -1,8 +1,16 @@
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
 #include "firestore_types.hpp"
+#include "firestore_path_utils.hpp"
+#ifdef __EMSCRIPTEN__
+// DuckDB-WASM has no OS sockets: route HTTP through DuckDB's HTTPUtil, which
+// dispatches to the browser's fetch() (and the native HTTP stack under Node).
+#include "duckdb/common/http_util.hpp"
+#else
+// Native builds talk to Firestore directly over httplib + OpenSSL.
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
+#endif
 #include <sstream>
 #include <cstdlib>
 #include <chrono>
@@ -19,7 +27,8 @@ static std::string GetEmulatorHost() {
 	return emulator_host ? std::string(emulator_host) : "";
 }
 
-// Parse a URL into scheme+host and path components
+#ifndef __EMSCRIPTEN__
+// Parse a URL into scheme+host and path components (native httplib transport only).
 static bool ParseUrl(const std::string &url, std::string &scheme_host, std::string &path) {
 	// Find scheme
 	auto scheme_end = url.find("://");
@@ -38,6 +47,7 @@ static bool ParseUrl(const std::string &url, std::string &scheme_host, std::stri
 	}
 	return true;
 }
+#endif
 
 ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const std::string &document_id) {
 	ResolvedDocumentPath result;
@@ -56,8 +66,8 @@ ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const st
 	return result;
 }
 
-FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials)
-    : credentials_(std::move(credentials)) {
+FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db)
+    : credentials_(std::move(credentials)), db_(db) {
 	if (!credentials_) {
 		throw FirestoreError(FirestoreErrorCode::AUTH_CREDENTIALS_NULL, "Credentials cannot be null");
 	}
@@ -103,10 +113,71 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 	FirestoreErrorContext error_ctx = ctx;
 	error_ctx.withMethod(method).withUrl(url).withProject(credentials_->project_id);
 
-	// Ensure token is valid for service account auth
-	FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_);
+	// Ensure the cached token is valid (service-account OAuth2 or Firebase user ID token)
+	FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_, db_);
 
-	// Parse the URL into scheme+host and path
+	// Serialize request body for methods that carry one
+	std::string body_str;
+	if (!body.empty() && (method == "POST" || method == "PATCH")) {
+		body_str = body.dump();
+	}
+
+	std::string auth_header = credentials_->GetAuthHeader();
+
+	int http_code = 0;
+	std::string response_data;
+
+#ifdef __EMSCRIPTEN__
+	// WASM transport: route through DuckDB's HTTPUtil (browser fetch / Node).
+	auto &http = HTTPUtil::Get(db_);
+	auto params = http.InitializeParameters(db_, url);
+
+	HTTPHeaders headers(db_);
+	headers.Insert("Content-Type", "application/json");
+	if (!auth_header.empty()) {
+		headers.Insert("Authorization", auth_header);
+	}
+
+	unique_ptr<HTTPResponse> res;
+	if (method == "GET") {
+		// Accumulate the response body via the content handler.
+		std::string body_accum;
+		GetRequestInfo req(
+		    url, headers, *params, [](const HTTPResponse &) { return true; },
+		    [&](const_data_ptr_t data, idx_t len) {
+			    body_accum.append(const_char_ptr_cast(data), len);
+			    return true;
+		    });
+		req.try_request = true;
+		res = http.Request(req);
+		response_data = body_accum.empty() ? res->body : body_accum;
+	} else if (method == "DELETE") {
+		DeleteRequestInfo req(url, headers, *params);
+		req.try_request = true;
+		res = http.Request(req);
+		response_data = res->body;
+	} else {
+		// POST and PATCH share the POST transport. HTTPUtil has no PATCH verb, so
+		// updates go out as POST with X-HTTP-Method-Override (accepted by Firestore).
+		if (method == "PATCH") {
+			headers.Insert("X-HTTP-Method-Override", "PATCH");
+		}
+		PostRequestInfo req(url, headers, *params, const_data_ptr_cast(body_str.c_str()), body_str.size());
+		req.try_request = true;
+		res = http.Request(req);
+		response_data = !req.buffer_out.empty() ? req.buffer_out : res->body;
+	}
+
+	if (res->HasRequestError()) {
+		std::string error_msg = "HTTP request failed: " + res->GetRequestError();
+		FS_LOG_ERROR(error_msg + " " + error_ctx.ToString());
+		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
+	}
+	http_code = static_cast<int>(res->status);
+#else
+	(void)db_; // db_ is only consulted by the WASM transport above.
+
+	// Native transport: direct httplib client over real OS sockets.
 	std::string scheme_host, path;
 	if (!ParseUrl(url, scheme_host, path)) {
 		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_INIT, "Failed to parse URL: " + url, error_ctx);
@@ -116,21 +187,12 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 	cli.set_connection_timeout(30);
 	cli.set_read_timeout(30);
 
-	// Build headers
 	httplib::Headers headers = {{"Content-Type", "application/json"}};
-
-	std::string auth_header = credentials_->GetAuthHeader();
 	if (!auth_header.empty()) {
 		headers.emplace("Authorization", auth_header);
 	}
 
-	// Execute request based on method
 	httplib::Result res;
-	std::string body_str;
-	if (!body.empty() && (method == "POST" || method == "PATCH")) {
-		body_str = body.dump();
-	}
-
 	if (method == "GET") {
 		res = cli.Get(path, headers);
 	} else if (method == "POST") {
@@ -143,9 +205,6 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 		res = cli.Get(path, headers);
 	}
 
-	auto end_time = std::chrono::high_resolution_clock::now();
-	auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
 	if (!res) {
 		auto err = res.error();
 		std::string error_msg = "HTTP request failed: " + httplib::to_string(err);
@@ -153,8 +212,12 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
 	}
 
-	int http_code = res->status;
-	const std::string &response_data = res->body;
+	http_code = res->status;
+	response_data = res->body;
+#endif
+
+	auto end_time = std::chrono::high_resolution_clock::now();
+	auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
 	FS_LOG_DEBUG("Request completed in " + std::to_string(duration_ms) + "ms, status: " + std::to_string(http_code));
 
@@ -593,10 +656,22 @@ std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
 
 FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, const json &structured_query,
                                                 bool is_collection_group) {
-	FS_LOG_DEBUG("Executing runQuery for collection: " + collection +
-	             " (collection_group=" + (is_collection_group ? "true" : "false") + ")");
+	// Nested subcollections must run the query against their parent document path
+	// (".../documents/<parent>:runQuery"); the final segment is in from.collectionId.
+	// Top-level collections and collection groups query from the database root.
+	std::string parent_path;
+	std::string collection_id;
+	SplitFirestoreCollectionPath(collection, is_collection_group, parent_path, collection_id);
 
-	std::string url = BuildBaseUrl() + ":runQuery" + credentials_->GetUrlSuffix();
+	FS_LOG_DEBUG("Executing runQuery for collection: " + collection +
+	             " (collection_group=" + (is_collection_group ? "true" : "false") + ", parent='" + parent_path +
+	             "', collectionId='" + collection_id + "')");
+
+	std::string url = BuildBaseUrl();
+	if (!parent_path.empty()) {
+		url += "/" + parent_path;
+	}
+	url += ":runQuery" + credentials_->GetUrlSuffix();
 
 	FirestoreErrorContext ctx;
 	ctx.withOperation("run_query").withCollection(collection);

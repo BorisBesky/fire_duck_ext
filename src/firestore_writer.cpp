@@ -7,6 +7,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
@@ -114,7 +115,7 @@ static unique_ptr<GlobalTableFunctionState> FirestoreInsertInitGlobal(ClientCont
                                                                       TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<FirestoreInsertBindData>();
 	auto global_state = make_uniq<FirestoreInsertGlobalState>();
-	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 	return std::move(global_state);
 }
 
@@ -352,7 +353,7 @@ static void FirestoreUpdateFunction(ClientContext &context, TableFunctionInput &
 
 	try {
 		// Create Firestore client
-		FirestoreClient client(bind_data.credentials);
+		FirestoreClient client(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		// Build fields JSON for update
 		json fields;
@@ -455,7 +456,7 @@ static void FirestoreDeleteFunction(ClientContext &context, TableFunctionInput &
 
 	try {
 		// Create Firestore client
-		FirestoreClient client(bind_data.credentials);
+		FirestoreClient client(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		// Perform delete
 		client.DeleteDocument(bind_data.collection, bind_data.document_id);
@@ -581,7 +582,7 @@ static void FirestoreUpdateBatchFunction(ClientContext &context, TableFunctionIn
 	int64_t count = 0;
 
 	try {
-		FirestoreClient client(bind_data.credentials);
+		FirestoreClient client(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		// Build fields JSON for update (same for all documents)
 		json fields;
@@ -744,7 +745,7 @@ static void FirestoreDeleteBatchFunction(ClientContext &context, TableFunctionIn
 	int64_t count = 0;
 
 	try {
-		FirestoreClient client(bind_data.credentials);
+		FirestoreClient client(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		// Try batch write first, fall back to individual operations if it fails
 		// (e.g., when running against emulator with API key auth)
@@ -924,7 +925,7 @@ static void FirestoreArrayTransformFunction(ClientContext &context, TableFunctio
 	int64_t count = 0;
 
 	try {
-		FirestoreClient client(bind_data.credentials);
+		FirestoreClient client(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		// Convert DuckDB values to Firestore format
 		json elements = json::array();

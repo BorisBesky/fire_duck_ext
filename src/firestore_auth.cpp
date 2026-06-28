@@ -4,6 +4,10 @@
 #include <fstream>
 #include <sstream>
 #include <ctime>
+#ifndef __EMSCRIPTEN__
+// Service-account auth (JWT signing + OAuth token exchange) relies on OpenSSL and
+// raw sockets, neither of which is available on DuckDB-WASM. These paths compile
+// only on native builds; on WASM the corresponding functions throw (see below).
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include <openssl/pem.h>
@@ -12,11 +16,76 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/err.h>
+#else
+// On WASM, Firebase user auth (sign-in + token refresh) goes through DuckDB's
+// HTTPUtil — pure HTTP, no OpenSSL. (Service-account signing is still unsupported.)
+#include "duckdb/common/http_util.hpp"
+#include "duckdb/common/helper.hpp"
+#endif
 #include <nlohmann/json.hpp>
 
 namespace duckdb {
 
 using json = nlohmann::json;
+
+namespace {
+
+// Decode standard or URL-safe base64 (padding optional). Used to read JWT claims;
+// no crypto involved.
+std::string Base64Decode(std::string in) {
+	static const std::string kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	for (auto &c : in) {
+		if (c == '-') {
+			c = '+';
+		} else if (c == '_') {
+			c = '/';
+		}
+	}
+	std::string out;
+	int buffer = 0;
+	int bits = 0;
+	for (char c : in) {
+		if (c == '=') {
+			break;
+		}
+		auto pos = kAlphabet.find(c);
+		if (pos == std::string::npos) {
+			continue; // skip whitespace/newlines
+		}
+		buffer = (buffer << 6) | static_cast<int>(pos);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+		}
+	}
+	return out;
+}
+
+// Read the `exp` (seconds since the Unix epoch) from a Firebase ID token (a JWT).
+// Returns the epoch (i.e. "already expired") if it cannot be parsed.
+std::chrono::system_clock::time_point ParseIdTokenExpiry(const std::string &id_token) {
+	auto first_dot = id_token.find('.');
+	if (first_dot == std::string::npos) {
+		return {};
+	}
+	auto second_dot = id_token.find('.', first_dot + 1);
+	if (second_dot == std::string::npos) {
+		return {};
+	}
+	std::string payload = Base64Decode(id_token.substr(first_dot + 1, second_dot - first_dot - 1));
+	try {
+		auto j = json::parse(payload);
+		if (j.contains("exp")) {
+			return std::chrono::system_clock::time_point(std::chrono::seconds(j["exp"].get<int64_t>()));
+		}
+	} catch (...) {
+		// fall through
+	}
+	return {};
+}
+
+} // namespace
 
 // Token validity buffer (refresh 5 minutes before expiry)
 static const int TOKEN_REFRESH_BUFFER_SECONDS = 300;
@@ -109,11 +178,57 @@ std::unique_ptr<FirestoreCredentials> FirestoreAuthManager::CreateApiKeyCredenti
 	return creds;
 }
 
+std::unique_ptr<FirestoreCredentials> FirestoreAuthManager::CreateFirebaseUserCredentials(const std::string &project_id,
+                                                                                          const std::string &api_key,
+                                                                                          const std::string &email,
+                                                                                          const std::string &password,
+                                                                                          bool anonymous) {
+	FS_LOG_DEBUG("Creating Firebase user credentials for project: " + project_id +
+	             (anonymous ? " (anonymous)" : " (email/password)"));
+
+	auto creds = std::make_unique<FirestoreCredentials>();
+	creds->type = FirestoreAuthType::FIREBASE_USER;
+	creds->project_id = project_id;
+	creds->api_key = api_key;
+	creds->email = email;
+	creds->password = password;
+	creds->anonymous = anonymous;
+	return creds;
+}
+
+std::unique_ptr<FirestoreCredentials>
+FirestoreAuthManager::CreateFirebaseTokenCredentials(const std::string &project_id, const std::string &api_key,
+                                                     const std::string &id_token, const std::string &refresh_token) {
+	FS_LOG_DEBUG("Creating Firebase credentials from a pre-obtained ID token for project: " + project_id);
+
+	auto creds = std::make_unique<FirestoreCredentials>();
+	creds->type = FirestoreAuthType::FIREBASE_USER;
+	creds->project_id = project_id;
+	creds->api_key = api_key;
+	creds->access_token = id_token;
+	creds->refresh_token = refresh_token;
+
+	auto expiry = ParseIdTokenExpiry(id_token);
+	// If the expiry can't be read, assume a near-full Firebase token lifetime so we
+	// don't refresh/sign-in spuriously (the token is verified by Firestore anyway).
+	creds->token_expiry = (expiry == std::chrono::system_clock::time_point {})
+	                          ? std::chrono::system_clock::now() + std::chrono::minutes(55)
+	                          : expiry;
+	return creds;
+}
+
 std::string FirestoreAuthManager::Base64UrlEncode(const std::string &data) {
 	return Base64UrlEncode(reinterpret_cast<const unsigned char *>(data.data()), data.size());
 }
 
 std::string FirestoreAuthManager::Base64UrlEncode(const unsigned char *data, size_t len) {
+#ifdef __EMSCRIPTEN__
+	(void)data;
+	(void)len;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	BIO *bio, *b64;
 	BUF_MEM *bufferPtr;
 
@@ -143,9 +258,17 @@ std::string FirestoreAuthManager::Base64UrlEncode(const unsigned char *data, siz
 	}
 
 	return result;
+#endif
 }
 
 std::string FirestoreAuthManager::SignRS256(const std::string &data, const std::string &private_key) {
+#ifdef __EMSCRIPTEN__
+	(void)data;
+	(void)private_key;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	// Create BIO from private key string
 	BIO *bio = BIO_new_mem_buf(private_key.data(), private_key.size());
 	if (!bio) {
@@ -205,6 +328,7 @@ std::string FirestoreAuthManager::SignRS256(const std::string &data, const std::
 	EVP_PKEY_free(pkey);
 
 	return Base64UrlEncode(sig.data(), sig_len);
+#endif
 }
 
 std::string FirestoreAuthManager::CreateJWT(const FirestoreCredentials &creds) {
@@ -234,6 +358,12 @@ std::string FirestoreAuthManager::CreateJWT(const FirestoreCredentials &creds) {
 }
 
 std::string FirestoreAuthManager::ExchangeJWTForToken(const std::string &jwt) {
+#ifdef __EMSCRIPTEN__
+	(void)jwt;
+	throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+	                         "Service account authentication is not supported on DuckDB-WASM. "
+	                         "Use API key authentication instead.");
+#else
 	FS_LOG_DEBUG("Exchanging JWT for access token");
 
 	std::string post_data = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=" + jwt;
@@ -268,35 +398,183 @@ std::string FirestoreAuthManager::ExchangeJWTForToken(const std::string &jwt) {
 		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_PARSE_FAILED,
 		                         "Failed to parse token response: " + std::string(e.what()));
 	}
+#endif
 }
 
-std::string FirestoreAuthManager::GetAccessToken(FirestoreCredentials &creds) {
+namespace {
+
+// Extract a human-readable message from a Firebase Auth error response body.
+std::string ExtractFirebaseAuthError(const std::string &body) {
+	try {
+		auto j = json::parse(body);
+		if (j.contains("error") && j["error"].is_object() && j["error"].contains("message")) {
+			return j["error"]["message"].get<std::string>();
+		}
+	} catch (...) {
+		// fall through to raw body
+	}
+	return body.substr(0, 200);
+}
+
+struct AuthHttpResponse {
+	int status;
+	std::string body;
+};
+
+// Single HTTP POST used by the Firebase Auth endpoints. Dual-path: HTTPUtil on WASM
+// (browser fetch / Node), httplib on native. No OpenSSL on either path.
+AuthHttpResponse FirebaseAuthPost(DatabaseInstance &db, const std::string &url, const std::string &body,
+                                  const std::string &content_type) {
+#ifdef __EMSCRIPTEN__
+	auto &http = HTTPUtil::Get(db);
+	auto params = http.InitializeParameters(db, url);
+	HTTPHeaders headers(db);
+	headers.Insert("Content-Type", content_type);
+	PostRequestInfo req(url, headers, *params, const_data_ptr_cast(body.c_str()), body.size());
+	req.try_request = true;
+	auto res = http.Request(req);
+	if (res->HasRequestError()) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
+		                         "Firebase Auth HTTP request failed: " + res->GetRequestError());
+	}
+	std::string out = req.buffer_out.empty() ? res->body : req.buffer_out;
+	return {static_cast<int>(res->status), out};
+#else
+	(void)db;
+	// Split "scheme://host[:port]/path?query" into the httplib base + path.
+	auto scheme_end = url.find("://");
+	auto host_start = (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
+	auto path_start = url.find('/', host_start);
+	std::string scheme_host = url.substr(0, path_start);
+	std::string path = url.substr(path_start);
+
+	httplib::Client cli(scheme_host);
+	cli.set_connection_timeout(30);
+	cli.set_read_timeout(30);
+	auto res = cli.Post(path, body, content_type);
+	if (!res) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
+		                         "Firebase Auth HTTP request failed: " + httplib::to_string(res.error()));
+	}
+	return {res->status, res->body};
+#endif
+}
+
+// Sign in (anonymous or email/password) via the Firebase Auth REST API and store the
+// resulting ID + refresh tokens on the credentials.
+void FirebaseSignIn(FirestoreCredentials &creds, DatabaseInstance &db) {
+	std::string url;
+	json req_body;
+	if (creds.anonymous) {
+		FS_LOG_DEBUG("Firebase anonymous sign-in");
+		url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" + creds.api_key;
+		req_body["returnSecureToken"] = true;
+	} else if (!creds.email.empty()) {
+		FS_LOG_DEBUG("Firebase email/password sign-in for: " + creds.email);
+		url = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + creds.api_key;
+		req_body["email"] = creds.email;
+		req_body["password"] = creds.password;
+		req_body["returnSecureToken"] = true;
+	} else {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
+		                         "Firebase user credentials require email/password or the anonymous flag");
+	}
+
+	auto resp = FirebaseAuthPost(db, url, req_body.dump(), "application/json");
+	if (resp.status != 200) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
+		                         "Firebase sign-in failed (HTTP " + std::to_string(resp.status) +
+		                             "): " + ExtractFirebaseAuthError(resp.body));
+	}
+
+	try {
+		auto j = json::parse(resp.body);
+		creds.access_token = j.at("idToken").get<std::string>();
+		creds.refresh_token = j.value("refreshToken", std::string());
+		int expires_in = std::stoi(j.value("expiresIn", std::string("3600")));
+		creds.token_expiry = std::chrono::system_clock::now() + std::chrono::seconds(expires_in);
+	} catch (const std::exception &e) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_PARSE_FAILED,
+		                         "Failed to parse Firebase sign-in response: " + std::string(e.what()));
+	}
+	FS_LOG_DEBUG("Firebase sign-in succeeded");
+}
+
+// Exchange a refresh token for a fresh ID token via securetoken.googleapis.com.
+void FirebaseRefresh(FirestoreCredentials &creds, DatabaseInstance &db) {
+	FS_LOG_DEBUG("Refreshing Firebase ID token");
+	std::string url = "https://securetoken.googleapis.com/v1/token?key=" + creds.api_key;
+	std::string body = "grant_type=refresh_token&refresh_token=" + creds.refresh_token;
+
+	auto resp = FirebaseAuthPost(db, url, body, "application/x-www-form-urlencoded");
+	if (resp.status != 200) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_EXCHANGE_FAILED,
+		                         "Firebase token refresh failed (HTTP " + std::to_string(resp.status) +
+		                             "): " + ExtractFirebaseAuthError(resp.body));
+	}
+
+	try {
+		// The securetoken endpoint returns snake_case fields.
+		auto j = json::parse(resp.body);
+		creds.access_token = j.at("id_token").get<std::string>();
+		creds.refresh_token = j.value("refresh_token", creds.refresh_token);
+		int expires_in = std::stoi(j.value("expires_in", std::string("3600")));
+		creds.token_expiry = std::chrono::system_clock::now() + std::chrono::seconds(expires_in);
+	} catch (const std::exception &e) {
+		throw FirestoreAuthError(FirestoreErrorCode::AUTH_TOKEN_PARSE_FAILED,
+		                         "Failed to parse Firebase refresh response: " + std::string(e.what()));
+	}
+	FS_LOG_DEBUG("Firebase ID token refreshed");
+}
+
+} // namespace
+
+std::string FirestoreAuthManager::GetAccessToken(FirestoreCredentials &creds, DatabaseInstance &db) {
 	if (creds.type != FirestoreAuthType::SERVICE_ACCOUNT) {
 		throw FirestoreAuthError(FirestoreErrorCode::AUTH_INVALID_TYPE,
 		                         "GetAccessToken only works with service account credentials");
 	}
 
-	RefreshTokenIfNeeded(creds);
+	RefreshTokenIfNeeded(creds, db);
 	return creds.access_token;
 }
 
-void FirestoreAuthManager::RefreshTokenIfNeeded(FirestoreCredentials &creds) {
-	if (creds.type != FirestoreAuthType::SERVICE_ACCOUNT) {
-		return; // API keys don't need refresh
+void FirestoreAuthManager::RefreshTokenIfNeeded(FirestoreCredentials &creds, DatabaseInstance &db) {
+	if (creds.type == FirestoreAuthType::API_KEY) {
+		return; // API keys don't expire and carry no token
 	}
 
 	if (creds.IsTokenValid()) {
 		return; // Token still valid
 	}
 
-	FS_LOG_DEBUG("Refreshing access token");
+	if (creds.type == FirestoreAuthType::SERVICE_ACCOUNT) {
+		FS_LOG_DEBUG("Refreshing access token");
 
-	// Create JWT and exchange for access token
-	std::string jwt = CreateJWT(creds);
-	creds.access_token = ExchangeJWTForToken(jwt);
-	creds.token_expiry = std::chrono::system_clock::now() + std::chrono::hours(1);
+		// Create JWT and exchange for access token
+		std::string jwt = CreateJWT(creds);
+		creds.access_token = ExchangeJWTForToken(jwt);
+		creds.token_expiry = std::chrono::system_clock::now() + std::chrono::hours(1);
 
-	FS_LOG_DEBUG("Access token refreshed successfully");
+		FS_LOG_DEBUG("Access token refreshed successfully");
+		return;
+	}
+
+	if (creds.type == FirestoreAuthType::FIREBASE_USER) {
+		// Refresh with the stored refresh token when we have one; otherwise sign in.
+		// If the refresh fails (e.g. revoked token), fall back to a fresh sign-in.
+		if (!creds.refresh_token.empty()) {
+			try {
+				FirebaseRefresh(creds, db);
+				return;
+			} catch (const std::exception &e) {
+				FS_LOG_DEBUG("Firebase token refresh failed, re-signing in: " + std::string(e.what()));
+				creds.refresh_token.clear();
+			}
+		}
+		FirebaseSignIn(creds, db);
+		return;
+	}
 }
 
 } // namespace duckdb

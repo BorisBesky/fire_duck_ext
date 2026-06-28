@@ -58,7 +58,9 @@ ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const st
 
 class FirestoreClient {
 public:
-	explicit FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials);
+	// `db` is used to reach DuckDB's HTTPUtil for HTTP transport on WASM builds,
+	// where raw sockets are unavailable.
+	FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db);
 
 	// Read operations
 	FirestoreListResponse ListDocuments(const std::string &collection, const FirestoreQuery &query = {});
@@ -120,6 +122,8 @@ public:
 
 private:
 	std::shared_ptr<FirestoreCredentials> credentials_;
+	// DuckDB instance handle; only consulted by the WASM HTTP transport.
+	DatabaseInstance &db_;
 
 	// Build base URL for Firestore REST API (documents endpoint)
 	std::string BuildBaseUrl() const;

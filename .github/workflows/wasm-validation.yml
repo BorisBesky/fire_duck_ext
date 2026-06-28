@@ -1,0 +1,61 @@
+#
+# Builds the DuckDB-WASM (wasm_eh) build of fire_duck_ext and runs the WASM
+# validation tests in test/wasm/. The main distribution pipeline builds the WASM
+# artifact but runs no tests against it; this workflow closes that gap
+# ("compiling isn't running").
+#
+# Because OpenSSL is excluded on the emscripten triplet (see vcpkg.json /
+# CMakeLists.txt), the WASM build needs no vcpkg dependencies, so emsdk alone is
+# enough — no vcpkg bootstrap required.
+#
+name: WASM validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm-validate:
+    name: Build wasm_eh and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DUCKDB_PLATFORM: wasm_eh
+      WASM_EXTENSIONS: 1
+      # Keep the DuckDB version in sync with MainDistributionPipeline.yml.
+      DUCKDB_VERSION: v1.5.4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Pin DuckDB to the distribution version
+        run: DUCKDB_GIT_VERSION="$DUCKDB_VERSION" make set_duckdb_version
+
+      # Emscripten version must match the one DuckDB v1.5.x is built with upstream.
+      - uses: mymindstorm/setup-emsdk@v13
+        with:
+          version: 3.1.71
+
+      - name: Build wasm_eh extension
+        run: make wasm_eh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Layer 1: structural checks (no npm dependencies). Directly validates that
+      # the module loads cleanly — no OpenSSL/socket imports left behind.
+      - name: Structural validation
+        run: node test/wasm/validate_wasm_module.mjs
+
+      # Layer 2: load the extension into DuckDB-WASM and run queries.
+      - name: Functional validation
+        run: |
+          npm --prefix test/wasm install
+          node test/wasm/validate_wasm_functional.mjs

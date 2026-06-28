@@ -1,0 +1,18 @@
+{
+  "name": "fire-duck-ext-wasm-validation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WASM validation tests for the fire_duck_ext DuckDB extension",
+  "scripts": {
+    "validate:module": "node validate_wasm_module.mjs",
+    "validate:functional": "node validate_wasm_functional.mjs",
+    "validate": "node validate_wasm_module.mjs && node validate_wasm_functional.mjs",
+    "sql": "node run_sql.mjs"
+  },
+  "comment": "@duckdb/duckdb-wasm must bundle the same DuckDB MINOR as the extension build (currently 1.5.x). Stable releases still bundle 1.4.x, so a 1.33.1-dev* build (DuckDB 1.5.4) is pinned here. Bump to a stable 1.5.x when one ships. Check with: node -e \"...createDuckDB...getVersion()\".",
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
+    "web-worker": "^1.5.0"
+  }
+}

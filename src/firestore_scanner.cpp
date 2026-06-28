@@ -8,6 +8,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/main/database.hpp"
 #include <algorithm>
 #include <chrono>
 
@@ -395,7 +396,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	}
 
 	// Create client and infer schema from collection
-	FirestoreClient client(result->credentials);
+	FirestoreClient client(result->credentials, DatabaseInstance::GetDatabase(context));
 	auto schema = client.InferSchema(result->collection, 100, result->show_missing);
 
 	// Check if collection exists (has documents)
@@ -435,33 +436,44 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Fetch index metadata for filter pushdown
 	result->index_cache = std::make_shared<FirestoreIndexCache>();
-	try {
-		// Determine collection ID for index lookup
-		std::string collection_id = result->collection;
-		if (!collection_id.empty() && collection_id[0] == '~') {
-			collection_id = collection_id.substr(1);
-		}
-		// For nested paths like "users/user1/orders", use the last segment
-		size_t last_slash = collection_id.rfind('/');
-		if (last_slash != std::string::npos) {
-			collection_id = collection_id.substr(last_slash + 1);
-		}
-
-		result->index_cache->composite_indexes = client.FetchCompositeIndexes(collection_id);
-		result->index_cache->default_single_field_enabled = client.CheckDefaultSingleFieldIndexes();
-		result->index_cache->fetch_succeeded = true;
-		FS_LOG_DEBUG("Index cache populated: " + std::to_string(result->index_cache->composite_indexes.size()) +
-		             " composite indexes, default_single_field=" +
-		             (result->index_cache->default_single_field_enabled ? "true" : "false"));
-	} catch (const std::exception &e) {
-		// Admin API unavailable (e.g. emulator, insufficient permissions).
-		// Assume Firestore's default single-field indexes exist for every field.
-		// Composite index queries may fail at RunQuery time, but the existing
-		// fallback (catch in InitGlobal) handles that gracefully.
-		FS_LOG_WARN("Failed to fetch indexes (Admin API unavailable): " + std::string(e.what()) +
-		            ". Assuming default single-field indexes.");
+	// The index-metadata endpoints live on the Firestore Admin API, which is gated by
+	// Google Cloud IAM (not Security Rules). Only a service account can authenticate to
+	// it; an API key or Firebase user ID token always gets 403. Skip the doomed request
+	// for those auth types and assume Firestore's default single-field indexes.
+	if (result->credentials->type != FirestoreAuthType::SERVICE_ACCOUNT) {
+		FS_LOG_DEBUG("Skipping Admin API index fetch for non-service-account auth; "
+		             "assuming default single-field indexes.");
 		result->index_cache->fetch_succeeded = true;
 		result->index_cache->default_single_field_enabled = true;
+	} else {
+		try {
+			// Determine collection ID for index lookup
+			std::string collection_id = result->collection;
+			if (!collection_id.empty() && collection_id[0] == '~') {
+				collection_id = collection_id.substr(1);
+			}
+			// For nested paths like "users/user1/orders", use the last segment
+			size_t last_slash = collection_id.rfind('/');
+			if (last_slash != std::string::npos) {
+				collection_id = collection_id.substr(last_slash + 1);
+			}
+
+			result->index_cache->composite_indexes = client.FetchCompositeIndexes(collection_id);
+			result->index_cache->default_single_field_enabled = client.CheckDefaultSingleFieldIndexes();
+			result->index_cache->fetch_succeeded = true;
+			FS_LOG_DEBUG("Index cache populated: " + std::to_string(result->index_cache->composite_indexes.size()) +
+			             " composite indexes, default_single_field=" +
+			             (result->index_cache->default_single_field_enabled ? "true" : "false"));
+		} catch (const std::exception &e) {
+			// Admin API unavailable (e.g. emulator, insufficient permissions).
+			// Assume Firestore's default single-field indexes exist for every field.
+			// Composite index queries may fail at RunQuery time, but the existing
+			// fallback (catch in InitGlobal) handles that gracefully.
+			FS_LOG_WARN("Failed to fetch indexes (Admin API unavailable): " + std::string(e.what()) +
+			            ". Assuming default single-field indexes.");
+			result->index_cache->fetch_succeeded = true;
+			result->index_cache->default_single_field_enabled = true;
+		}
 	}
 
 	// Store schema and index cache for future queries
@@ -505,7 +517,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
 		global_state->is_document_path = true;
-		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+		global_state->client =
+		    make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 		auto order = bind_data.docpath_named_order;
 		// Only apply limit at scan level when we also control ordering.
@@ -543,7 +556,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		return std::move(global_state);
 	}
 
-	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials);
+	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
 
 	// Check if this is a collection group query (starts with ~)
 	if (!bind_data.collection.empty() && bind_data.collection[0] == '~') {
@@ -567,11 +580,13 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	FirestoreListResponse response;
 
 	if (global_state->pushdown_result.has_pushdown()) {
-		// Build StructuredQuery with WHERE clause
-		std::string collection_id = bind_data.collection;
-		if (bind_data.is_collection_group && !collection_id.empty() && collection_id[0] == '~') {
-			collection_id = collection_id.substr(1);
-		}
+		// Build StructuredQuery with WHERE clause. runQuery's from.collectionId must be a
+		// single segment; for nested subcollections the parent document path is carried in
+		// the request URL (see RunQuery), not in collectionId.
+		std::string parent_path;
+		std::string collection_id;
+		SplitFirestoreCollectionPath(bind_data.collection, bind_data.is_collection_group, parent_path, collection_id);
+		FS_LOG_DEBUG("InitGlobal: runQuery parent='" + parent_path + "' collectionId='" + collection_id + "'");
 
 		json sq;
 		sq["from"] = {{{"collectionId", collection_id}, {"allDescendants", bind_data.is_collection_group}}};

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>fire_duck_ext — DuckDB-WASM browser validator</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    fieldset { border: 1px solid #8884; border-radius: 8px; margin: 1rem 0; padding: 1rem; }
+    label { display: block; margin: .4rem 0 .15rem; font-weight: 600; }
+    input, select, textarea { width: 100%; padding: .4rem; box-sizing: border-box; font: inherit; }
+    textarea { min-height: 4rem; font-family: ui-monospace, monospace; }
+    .row { display: flex; gap: 1rem; } .row > * { flex: 1; }
+    button { padding: .5rem 1rem; font: inherit; cursor: pointer; border-radius: 6px; }
+    #status { padding: .5rem .75rem; border-radius: 6px; background: #8881; }
+    pre { background: #8881; padding: .75rem; border-radius: 8px; overflow: auto; white-space: pre-wrap; }
+    .hide { display: none; }
+    .err { color: #c0392b; } .ok { color: #2e7d32; }
+  </style>
+</head>
+<body>
+  <h1>fire_duck_ext — DuckDB-WASM browser validator</h1>
+  <p>Loads the locally-built extension into DuckDB-WASM in your browser and runs a query.
+     Open DevTools → Network to watch the real Firestore / Firebase Auth requests and their
+     status codes (this is how you confirm <code>:runQuery</code> / <code>:signUp</code> URLs
+     behave in a browser vs. Node).</p>
+
+  <div id="status">Booting…</div>
+
+  <fieldset id="form" class="hide">
+    <div class="row">
+      <div><label>Project ID</label><input id="project" placeholder="my-project" /></div>
+      <div><label>Web API key</label><input id="apikey" type="password" placeholder="AIza…" /></div>
+    </div>
+    <label>Auth mode</label>
+    <select id="mode">
+      <option value="anonymous">Firebase user — anonymous</option>
+      <option value="password">Firebase user — email / password</option>
+      <option value="apikey">API key only (unauthenticated)</option>
+    </select>
+    <div class="row" id="emailRow">
+      <div><label>Email</label><input id="email" placeholder="user@example.com" /></div>
+      <div><label>Password</label><input id="password" type="password" /></div>
+    </div>
+    <label>SQL</label>
+    <textarea id="sql">SELECT * FROM firestore_scan('your_collection') LIMIT 10;</textarea>
+    <p><button id="run">Run</button></p>
+  </fieldset>
+
+  <h3>Output</h3>
+  <pre id="out">(nothing yet)</pre>
+
+  <script type="module">
+    // Pin the DuckDB-WASM version whose bundled DuckDB matches the extension build (1.5.x).
+    import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
+
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+    const out = $("out");
+    const setStatus = (msg, cls = "") => { status.className = cls; status.textContent = msg; };
+    const log = (msg) => { out.textContent += (out.textContent === "(nothing yet)" ? "" : "\n") + msg; };
+    const reset = () => { out.textContent = ""; };
+
+    let conn;
+    try {
+      setStatus("Loading DuckDB-WASM from jsDelivr…");
+      const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+      // Cross-origin worker shim (standard DuckDB-WASM browser pattern).
+      const workerUrl = URL.createObjectURL(
+        new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" }),
+      );
+      const worker = new Worker(workerUrl);
+      const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      URL.revokeObjectURL(workerUrl);
+
+      setStatus("Loading fire_duck_ext…");
+      await db.open({ allowUnsignedExtensions: true });
+      conn = await db.connect();
+      const version = await db.getVersion();
+      try { await conn.query("SET allow_extensions_metadata_mismatch=true"); } catch {}
+      // The local server (serve_browser.mjs) returns the artifact for any repo path.
+      await conn.query(`SET custom_extension_repository='${location.origin}'`);
+      await conn.query("INSTALL fire_duck_ext");
+      await conn.query("LOAD fire_duck_ext");
+
+      setStatus(`Ready — DuckDB-WASM ${version}, fire_duck_ext loaded.`, "ok");
+      $("form").classList.remove("hide");
+    } catch (e) {
+      setStatus("Failed to load: " + (e?.message ?? e), "err");
+      throw e;
+    }
+
+    const sqlLiteral = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+    $("mode").addEventListener("change", () => {
+      $("emailRow").style.display = $("mode").value === "password" ? "flex" : "none";
+    });
+    $("emailRow").style.display = "none";
+
+    $("run").addEventListener("click", async () => {
+      reset();
+      const project = $("project").value.trim();
+      const apiKey = $("apikey").value.trim();
+      const mode = $("mode").value;
+      if (!project || !apiKey) { log("⚠ Project ID and Web API key are required."); return; }
+
+      try {
+        const opts = ["TYPE firestore", `PROJECT_ID ${sqlLiteral(project)}`, `API_KEY ${sqlLiteral(apiKey)}`];
+        if (mode === "anonymous") opts.push("ANONYMOUS true");
+        else if (mode === "password") {
+          opts.push(`EMAIL ${sqlLiteral($("email").value.trim())}`, `PASSWORD ${sqlLiteral($("password").value)}`);
+        }
+        log("→ CREATE OR REPLACE SECRET (" + mode + ")");
+        await conn.query(`CREATE OR REPLACE SECRET browser_validator (${opts.join(", ")})`);
+
+        for (const stmt of $("sql").value.split(";").map((s) => s.trim()).filter(Boolean)) {
+          log("\nSQL> " + stmt);
+          const rows = (await conn.query(stmt)).toArray().map((r) =>
+            JSON.parse(JSON.stringify(r, (_, v) => (typeof v === "bigint" ? Number(v) : v))),
+          );
+          if (rows.length === 0) log("(no rows)");
+          else { rows.forEach((r) => log(JSON.stringify(r))); log(`(${rows.length} row${rows.length === 1 ? "" : "s"})`); }
+        }
+        setStatus("Query finished.", "ok");
+      } catch (e) {
+        log("ERROR: " + (e?.message ?? e));
+        setStatus("Query failed (see Output / Network tab).", "err");
+      }
+    });
+  </script>
+</body>
+</html>
