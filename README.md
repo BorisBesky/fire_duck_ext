@@ -104,6 +104,71 @@ CREATE SECRET dev_firestore (
 );
 ```
 
+### Firebase Auth User (authenticated; browser-safe)
+
+Firebase user authentication gives **authenticated** access that respects Security Rules (`request.auth != null`), unlike a bare API key. It needs no OpenSSL, so it also works in the WebAssembly/browser build. Provide the public Web `API_KEY` plus a sign-in method.
+
+**Email / password:**
+```sql
+CREATE SECRET user_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',
+    EMAIL 'user@example.com',
+    PASSWORD 'hunter2'
+);
+```
+
+**Anonymous:**
+```sql
+CREATE SECRET anon_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',
+    ANONYMOUS true
+);
+```
+
+**Pre-obtained ID token** (e.g. minted by your host app):
+```sql
+CREATE SECRET token_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',  -- optional; enables auto-refresh
+    ID_TOKEN 'eyJhbGciOi...',
+    REFRESH_TOKEN 'AMf-...'         -- optional; auto-refreshed on expiry
+);
+```
+
+The extension signs in via the Firebase Auth REST API, sends `Authorization: Bearer <id_token>` on requests, and refreshes the token automatically on expiry.
+
+#### Anonymous sign-in vs. plain API key
+
+Both pass the API key, but only anonymous sign-in actually authenticates a user — the API key alone leaves the request **unauthenticated**:
+
+| | API key only | `ANONYMOUS true` |
+| --- | --- | --- |
+| Signs in / obtains an ID token | No | Yes (`accounts:signUp`) |
+| `request.auth` in Security Rules | `null` | non-null, with a `uid` |
+| Creates a Firebase Auth user | No | Yes (anonymous; counts toward Auth quota) |
+| Sends `Authorization: Bearer` | No | Yes |
+| Passes `allow read: if true` | ✅ | ✅ |
+| Passes `allow read: if request.auth != null` | ❌ | ✅ |
+
+Use a **plain API key** for public collections whose rules allow unauthenticated reads. Use **`ANONYMOUS true`** when your rules require a signed-in user (`request.auth != null`) but you don't need a specific identity — e.g. per-session/per-device data. Each anonymous sign-in gets a fresh `uid`, so it suits "authenticated but identity-agnostic" rules; for a specific known user, use email/password or a pre-obtained `ID_TOKEN`.
+
+### Admin-only features (index metadata)
+
+Some features rely on Firestore's **index metadata** (composite indexes and single-field index configuration), which lives on the Firestore **Admin API**. That API is gated by Google Cloud IAM, **not** by Security Rules — so only **service-account** auth can read it. **API key** and **Firebase user** auth are non-admin: the extension cannot query this metadata for them, skips the Admin API, and assumes Firestore's default single-field indexes.
+
+As a result, features that depend on admin metadata are unavailable to non-admin auth — most notably **composite-index detection for multi-field `ORDER BY`**. With a service account, the extension detects an existing composite index and pushes multi-field ordering to Firestore; without one, such a query falls back to a single-field server-side sort (re-sorted in DuckDB) or surfaces Firestore's *"query requires an index"* error at runtime. Single-field filter and order pushdown are unaffected, since Firestore's default single-field indexes are assumed to exist.
+
+| Feature | Service account | API key / Firebase user |
+| --- | --- | --- |
+| Single-field filter / `ORDER BY` pushdown | ✅ | ✅ |
+| Composite-index detection (multi-field `ORDER BY`) | ✅ | ❌ (assumes defaults) |
+| `show_missing:=true` (phantom-document listing) | ✅ | ❌ (403; use `show_missing:=false`) |
+
 ### Environment Variable
 ```bash
 # Set the path to your service account JSON file
@@ -191,10 +256,10 @@ All functions accept these credential override parameters, allowing per-call con
 
 ```sql
 -- Write to a specific database
-CALL firestore_update('users', 'user1', 'status', 'active', database='my-other-db');
+CALL firestore_update('users', 'user1', 'status', 'active', database:='my-other-db');
 
 -- Read from a specific database
-SELECT * FROM firestore_scan('users', database='my-other-db');
+SELECT * FROM firestore_scan('users', database:='my-other-db');
 ```
 
 ### Scan Parameters
@@ -209,13 +274,13 @@ SELECT * FROM firestore_scan('users', database='my-other-db');
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
-SELECT * FROM firestore_scan('leaderboard', order_by='score DESC', scan_limit=10);
+SELECT * FROM firestore_scan('leaderboard', order_by:='score DESC', scan_limit:=10);
 
 -- Multi-field ordering
-SELECT * FROM firestore_scan('leaderboard', order_by='category, score DESC');
+SELECT * FROM firestore_scan('leaderboard', order_by:='category, score DESC');
 
 -- Exclude phantom/missing documents
-SELECT * FROM firestore_scan('users', show_missing=false);
+SELECT * FROM firestore_scan('users', show_missing:=false);
 ```
 
 ### Insert Parameters
@@ -306,8 +371,10 @@ Supported patterns include:
 
 Named parameters still work and take precedence over SQL pushdown:
 
-- If `order_by=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
-- If `scan_limit=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
+- If `order_by:=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
+- If `scan_limit:=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
+
+> **Multi-field ordering needs a composite index, which the extension can only detect with service-account auth.** See [Admin-only features](#admin-only-features-index-metadata) — with API-key or Firebase-user auth, multi-field `ORDER BY` can't be confirmed against a composite index and may fall back to a client-side sort or hit Firestore's "requires an index" error.
 
 ```sql
 -- SQL ORDER BY + LIMIT pushed to Firestore
@@ -324,7 +391,7 @@ LIMIT 10;
 
 -- Named parameters override SQL pushdown
 SELECT name
-FROM firestore_scan('leaderboard', order_by='score', scan_limit=10)
+FROM firestore_scan('leaderboard', order_by:='score', scan_limit:=10)
 ORDER BY name DESC
 LIMIT 3;
 ```
@@ -386,7 +453,7 @@ Document-path scans support:
 - Pagination across large numbers of subcollections
 - SQL `ORDER BY __document_id` pushdown
 - SQL `LIMIT` pushdown
-- Named `order_by='__document_id'` or `order_by='__document_id DESC'`, plus `scan_limit=...`
+- Named `order_by:='__document_id'` or `order_by:='__document_id DESC'`, plus `scan_limit:=...`
 
 Other ordering expressions still work, but they are evaluated in DuckDB after fetching the subcollection IDs.
 
@@ -407,24 +474,24 @@ By default, `firestore_scan()` includes "phantom" documents — documents that h
 SELECT * FROM firestore_scan('artifacts/default-app-id/users');
 
 -- Opt out to only return documents with fields
-SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing=false);
+SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing:=false);
 ```
 
 When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.
 
 > **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
 
-> **Important — `show_missing=true` requires privileged (service-account) access.** Listing
+> **Important — `show_missing:=true` requires privileged (service-account) access.** Listing
 > phantom/missing documents (`showMissing=true`, the default) is an Admin-oriented operation.
 > The Admin SDK / a service account bypasses Security Rules and can do it, but over
 > **rules-governed access (API key or Firebase user ID token)** Firestore rejects it with
 > `403 PERMISSION_DENIED: Missing or insufficient permissions` — **even when your rules grant
 > `allow read: if true`** (a plain `list` is permitted; enumerating missing documents is not).
-> If you authenticate with an API key or a Firebase user token, pass `show_missing=false`:
+> If you authenticate with an API key or a Firebase user token, pass `show_missing:=false`:
 >
 > ```sql
 > SELECT * FROM firestore_scan('artifacts/default-app-id/users/<uid>/math_whiz_data',
->                              show_missing=false)
+>                              show_missing:=false)
 > WHERE role = 'student';
 > ```
 >

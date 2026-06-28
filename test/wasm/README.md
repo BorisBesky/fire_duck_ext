@@ -107,13 +107,13 @@ Firestore access tiers:
 
 ### Two real gotchas (not transport bugs)
 
-1. **`show_missing=true` (the default) needs a service account.** Listing phantom/missing
+1. **`show_missing:=true` (the default) needs a service account.** Listing phantom/missing
    documents is an Admin-oriented operation; over rules-governed access (API key or
    Firebase user token) Firestore returns `403 PERMISSION_DENIED` **even with
-   `allow read: if true`**. Pass `show_missing=false`:
+   `allow read: if true`**. Pass `show_missing:=false`:
 
    ```sql
-   SELECT * FROM firestore_scan('my_collection', show_missing=false) WHERE field = 'x';
+   SELECT * FROM firestore_scan('my_collection', show_missing:=false) WHERE field = 'x';
    ```
 
 2. **The Firestore Admin API (index metadata) is IAM-gated, not rules-gated.** API-key /
@@ -133,7 +133,7 @@ CREATE SECRET fs (
     ID_TOKEN 'eyJhbGciOi…',     -- from your host-side sign-in
     REFRESH_TOKEN 'AMf-…'       -- optional; auto-refreshed on expiry
 );
-SELECT * FROM firestore_scan('my_collection', show_missing=false) LIMIT 10;
+SELECT * FROM firestore_scan('my_collection', show_missing:=false) LIMIT 10;
 ```
 
 The extension sends `Authorization: Bearer <id_token>` for reads and refreshes via

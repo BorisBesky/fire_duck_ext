@@ -17,6 +17,12 @@
 #   - python3 available
 #   - Service account needs roles/datastore.user + roles/datastore.indexAdmin
 #   - Extension built: make release
+#
+# Optional env vars:
+#   FIRESTORE_API_KEY  — public Web API key for Firebase Auth tests (66-72).
+#                        If not set, the script looks it up from the project using
+#                        the service account (requires apikeys.keys.list permission).
+#                        Security Rules must allow authenticated reads on fde_auth_test.
 
 set -e
 
@@ -1360,6 +1366,274 @@ if should_run 65; then
         "range-filtered scan of nested subcollection is scoped to the parent document"
 fi
 
+# --- Firebase Auth tests (tests 66-72) ---
+# These tests exercise the three non-service-account auth modes:
+#   - Email/password Firebase user
+#   - Anonymous Firebase user
+#   - Pre-obtained ID token passthrough
+#
+# Requires: FIRESTORE_API_KEY env var (the project's public Web API key).
+# The tests create a temporary Firebase Auth user via the REST API,
+# seed a test collection readable by authenticated users, and clean up.
+#
+# Security Rules must allow authenticated reads on the test collection, e.g.:
+#   match /fde_auth_test/{doc} { allow read: if request.auth != null; }
+# or the catch-all:
+#   match /{document=**} { allow read: if true; }
+
+FIREBASE_API_KEY="${FIRESTORE_API_KEY:-}"
+FIREBASE_AUTH_SKIPPED=false
+
+# If no API key provided, look it up from the project via the service account
+if [ -z "$FIREBASE_API_KEY" ] && any_in_range 66 72; then
+    echo ""
+    echo "=== Looking up Browser API key from project ==="
+
+    # Get the project number from the project ID
+    PROJECT_NUMBER=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+        "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('projectNumber',''))" 2>/dev/null)
+
+    if [ -n "$PROJECT_NUMBER" ]; then
+        # List API keys and find the Browser key
+        FIREBASE_API_KEY=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://apikeys.googleapis.com/v2/projects/${PROJECT_NUMBER}/locations/global/keys" \
+            | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for key in data.get('keys', []):
+    restrictions = key.get('restrictions', {})
+    # Prefer a key with browserKeyRestrictions, fall back to any key
+    if 'browserKeyRestrictions' in restrictions:
+        print(key.get('keyString', ''))
+        sys.exit(0)
+# No browser-specific key found; use the first key that has a keyString
+for key in data.get('keys', []):
+    ks = key.get('keyString', '')
+    if ks:
+        print(ks)
+        sys.exit(0)
+" 2>/dev/null)
+    fi
+
+    if [ -n "$FIREBASE_API_KEY" ]; then
+        echo "  Found API key from project (${FIREBASE_API_KEY:0:10}...)"
+    else
+        echo "  Could not look up API key. Skipping Firebase Auth tests."
+        echo "  Set FIRESTORE_API_KEY or grant the service account apikeys.keys.list permission."
+        FIREBASE_AUTH_SKIPPED=true
+    fi
+fi
+
+if [ -n "$FIREBASE_API_KEY" ] && any_in_range 66 72; then
+    echo ""
+    echo "=== Setting up Firebase Auth tests ==="
+
+    FB_TEST_EMAIL="fde_ci_test_$(date +%s)@example.com"
+    FB_TEST_PASSWORD="hunter2testCI"
+
+    # Create a temporary Firebase Auth user via the Identity Toolkit REST API
+    FB_SIGNUP_RESP=$(curl -s -X POST \
+        "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{\"email\":\"${FB_TEST_EMAIL}\",\"password\":\"${FB_TEST_PASSWORD}\",\"returnSecureToken\":true}" 2>&1)
+
+    # If sign-in fails (user doesn't exist yet), create the user
+    if echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'idToken' in d else 1)" 2>/dev/null; then
+        FB_ID_TOKEN=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['idToken'])")
+        FB_REFRESH_TOKEN=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['refreshToken'])")
+        FB_LOCAL_ID=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['localId'])")
+    else
+        FB_SIGNUP_RESP=$(curl -s -X POST \
+            "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"${FB_TEST_EMAIL}\",\"password\":\"${FB_TEST_PASSWORD}\",\"returnSecureToken\":true}" 2>&1)
+
+        FB_ID_TOKEN=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['idToken'])" 2>/dev/null)
+        FB_REFRESH_TOKEN=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['refreshToken'])" 2>/dev/null)
+        FB_LOCAL_ID=$(echo "$FB_SIGNUP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['localId'])" 2>/dev/null)
+
+        if [ -z "$FB_ID_TOKEN" ]; then
+            echo "ERROR: Could not create Firebase test user. Response:"
+            echo "$FB_SIGNUP_RESP"
+            exit 1
+        fi
+    fi
+
+    echo "  Created Firebase user: $FB_TEST_EMAIL (uid: $FB_LOCAL_ID)"
+
+    # Save current Security Rules and deploy rules that allow reads on fde_auth_test.
+    # The Firestore REST API requires rules that permit the test user to read the
+    # test collection; the project's production rules may not include it.
+    RULES_API="https://firebaserules.googleapis.com/v1"
+    FB_RULES_RESTORED=false
+
+    # Get the current active ruleset name
+    FB_CURRENT_RELEASE=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+        "${RULES_API}/projects/${PROJECT_ID}/releases/cloud.firestore" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('rulesetName',''))" 2>/dev/null)
+
+    # Fetch current rules source
+    FB_ORIGINAL_RULES=""
+    if [ -n "$FB_CURRENT_RELEASE" ]; then
+        FB_ORIGINAL_RULES=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "${RULES_API}/${FB_CURRENT_RELEASE}" \
+            | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+for f in d.get('source',{}).get('files',[]):
+    print(f.get('content',''))
+" 2>/dev/null)
+    fi
+
+    # Inject a rule for fde_auth_test if not already present
+    if echo "$FB_ORIGINAL_RULES" | grep -q "fde_auth_test"; then
+        echo "  Security Rules already allow fde_auth_test — no change needed."
+    else
+        echo "  Deploying temporary Security Rules with fde_auth_test access..."
+        FB_TEST_RULES=$(echo "$FB_ORIGINAL_RULES" | python3 -c "
+import sys, json
+rules = sys.stdin.read()
+# Insert a match block for fde_auth_test right after the documents match line
+marker = 'match /databases/{database}/documents {'
+inject = '''
+    match /fde_auth_test/{doc} {
+      allow read, write: if true;
+    }
+'''
+if marker in rules:
+    rules = rules.replace(marker, marker + inject, 1)
+else:
+    print('ERROR: could not find insertion point in rules', file=sys.stderr)
+    sys.exit(1)
+print(rules)
+")
+
+        # Create a new ruleset with the test rules
+        FB_NEW_RULESET=$(python3 -c "
+import json
+rules = open('/dev/stdin').read()
+print(json.dumps({
+    'source': {
+        'files': [{'name': 'firestore.rules', 'content': rules}]
+    }
+}))
+" <<< "$FB_TEST_RULES" | curl -s -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @- \
+            "${RULES_API}/projects/${PROJECT_ID}/rulesets" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))" 2>/dev/null)
+
+        if [ -z "$FB_NEW_RULESET" ]; then
+            echo "  ERROR: Could not create temporary ruleset. Skipping Firebase Auth tests."
+            FIREBASE_AUTH_SKIPPED=true
+        else
+            # Release the new ruleset
+            curl -s -X PATCH \
+                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"release\":{\"name\":\"projects/${PROJECT_ID}/releases/cloud.firestore\",\"rulesetName\":\"${FB_NEW_RULESET}\"}}" \
+                "${RULES_API}/projects/${PROJECT_ID}/releases/cloud.firestore" > /dev/null
+
+            echo "  Deployed temporary rules (ruleset: ${FB_NEW_RULESET##*/})"
+            echo "  Waiting for rules to propagate..."
+            sleep 15
+        fi
+    fi
+
+    # Seed a test collection for auth tests (using service account)
+    seed_doc "fde_auth_test/a1" '{"fields":{"color":{"stringValue":"red"},"val":{"integerValue":"10"}}}'
+    seed_doc "fde_auth_test/a2" '{"fields":{"color":{"stringValue":"blue"},"val":{"integerValue":"20"}}}'
+    seed_doc "fde_auth_test/a3" '{"fields":{"color":{"stringValue":"red"},"val":{"integerValue":"30"}}}'
+    echo "  Seeded fde_auth_test collection."
+
+    # Helper: run a query with a specific secret definition (not service account)
+    run_auth_query() {
+        local SECRET_SQL="$1"
+        local QUERY_SQL="$2"
+        $DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+SET firestore_schema_cache_ttl=0;
+${SECRET_SQL}
+${QUERY_SQL}
+" 2>&1 | tail -1 | clean_query_output
+    }
+
+    echo ""
+    echo "=== Running Firebase Auth tests ==="
+fi
+
+# --- Test 66: Email/password auth — basic scan ---
+if should_run 66 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 66: email/password auth — scan with show_missing:=false..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_email (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', EMAIL '${FB_TEST_EMAIL}', PASSWORD '${FB_TEST_PASSWORD}');" \
+        "SELECT count(*) FROM firestore_scan('fde_auth_test', show_missing:=false);")
+    assert_eq "$RESULT" "3" \
+        "email/password auth reads all 3 documents"
+fi
+
+# --- Test 67: Email/password auth — WHERE filter (runQuery) ---
+if should_run 67 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 67: email/password auth — WHERE filter pushdown..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_email (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', EMAIL '${FB_TEST_EMAIL}', PASSWORD '${FB_TEST_PASSWORD}');" \
+        "SELECT string_agg(__document_id, ',' ORDER BY __document_id) FROM firestore_scan('fde_auth_test', show_missing:=false) WHERE color = 'red';")
+    assert_eq "$RESULT" "a1,a3" \
+        "email/password auth pushes WHERE filter to Firestore"
+fi
+
+# --- Test 68: Anonymous auth — basic scan ---
+if should_run 68 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 68: anonymous auth — scan with show_missing:=false..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_anon (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', ANONYMOUS true);" \
+        "SELECT count(*) FROM firestore_scan('fde_auth_test', show_missing:=false);")
+    assert_eq "$RESULT" "3" \
+        "anonymous auth reads all 3 documents"
+fi
+
+# --- Test 69: Anonymous auth — WHERE filter (runQuery) ---
+if should_run 69 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 69: anonymous auth — WHERE filter pushdown..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_anon (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', ANONYMOUS true);" \
+        "SELECT string_agg(__document_id, ',' ORDER BY __document_id) FROM firestore_scan('fde_auth_test', show_missing:=false) WHERE color = 'blue';")
+    assert_eq "$RESULT" "a2" \
+        "anonymous auth pushes WHERE filter to Firestore"
+fi
+
+# --- Test 70: ID token passthrough — basic scan ---
+if should_run 70 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 70: ID token passthrough — scan with show_missing:=false..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_token (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', ID_TOKEN '${FB_ID_TOKEN}', REFRESH_TOKEN '${FB_REFRESH_TOKEN}');" \
+        "SELECT count(*) FROM firestore_scan('fde_auth_test', show_missing:=false);")
+    assert_eq "$RESULT" "3" \
+        "ID token passthrough reads all 3 documents"
+fi
+
+# --- Test 71: ID token passthrough — WHERE filter (runQuery) ---
+if should_run 71 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 71: ID token passthrough — WHERE filter pushdown..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_token (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}', ID_TOKEN '${FB_ID_TOKEN}', REFRESH_TOKEN '${FB_REFRESH_TOKEN}');" \
+        "SELECT string_agg(__document_id, ',' ORDER BY __document_id) FROM firestore_scan('fde_auth_test', show_missing:=false) WHERE val > 15;")
+    assert_eq "$RESULT" "a2,a3" \
+        "ID token passthrough pushes range filter to Firestore"
+fi
+
+# --- Test 72: Plain API key auth (unauthenticated) — basic scan ---
+if should_run 72 && [ -n "$FIREBASE_API_KEY" ]; then
+    echo "Test 72: plain API key auth — scan with show_missing:=false..."
+    RESULT=$(run_auth_query \
+        "CREATE SECRET __fs_apikey (TYPE firestore, PROJECT_ID '${PROJECT_ID}', API_KEY '${FIREBASE_API_KEY}');" \
+        "SELECT count(*) FROM firestore_scan('fde_auth_test', show_missing:=false);")
+    assert_eq "$RESULT" "3" \
+        "plain API key auth reads all 3 documents"
+fi
+
 # --- Cleanup ---
 
 echo ""
@@ -1434,6 +1708,34 @@ if any_in_range 64 65; then
     delete_doc "fde_ci_subq/parent1/items/i2"
     delete_doc "fde_ci_subq/parent1/items/i3"
     delete_doc "fde_ci_subq/parent2/items/x1"
+fi
+
+# Cleanup Firebase Auth test data (tests 66-72)
+if any_in_range 66 72 && [ -n "$FIREBASE_API_KEY" ] && [ "$FIREBASE_AUTH_SKIPPED" != "true" ]; then
+    delete_doc "fde_auth_test/a1"
+    delete_doc "fde_auth_test/a2"
+    delete_doc "fde_auth_test/a3"
+
+    # Delete the temporary Firebase Auth user via the Identity Toolkit REST API
+    if [ -n "${FB_ID_TOKEN:-}" ]; then
+        curl -s -X POST \
+            "https://identitytoolkit.googleapis.com/v1/accounts:delete?key=${FIREBASE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"idToken\":\"${FB_ID_TOKEN}\"}" > /dev/null 2>&1
+        echo "  Deleted Firebase test user: ${FB_TEST_EMAIL:-}"
+    fi
+
+    # Restore original Security Rules if we modified them
+    if [ -n "${FB_CURRENT_RELEASE:-}" ] && [ "${FB_RULES_RESTORED:-false}" != "true" ] && [ -n "${FB_NEW_RULESET:-}" ]; then
+        echo "  Restoring original Security Rules..."
+        curl -s -X PATCH \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"release\":{\"name\":\"projects/${PROJECT_ID}/releases/cloud.firestore\",\"rulesetName\":\"${FB_CURRENT_RELEASE}\"}}" \
+            "${RULES_API}/projects/${PROJECT_ID}/releases/cloud.firestore" > /dev/null
+        echo "  Restored original rules (${FB_CURRENT_RELEASE##*/})"
+        FB_RULES_RESTORED=true
+    fi
 fi
 
 echo "Test data cleaned up. (Indexes left in place for idempotency.)"
