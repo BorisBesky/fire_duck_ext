@@ -167,7 +167,7 @@ As a result, features that depend on admin metadata are unavailable to non-admin
 | --- | --- | --- |
 | Single-field filter / `ORDER BY` pushdown | ✅ | ✅ |
 | Composite-index detection (multi-field `ORDER BY`) | ✅ | ❌ (assumes defaults) |
-| `show_missing=true` (phantom-document listing) | ✅ | ❌ (403; use `show_missing=false`) |
+| `show_missing:=true` (phantom-document listing) | ✅ | ❌ (403; use `show_missing:=false`) |
 
 ### Environment Variable
 ```bash
@@ -256,10 +256,10 @@ All functions accept these credential override parameters, allowing per-call con
 
 ```sql
 -- Write to a specific database
-CALL firestore_update('users', 'user1', 'status', 'active', database='my-other-db');
+CALL firestore_update('users', 'user1', 'status', 'active', database:='my-other-db');
 
 -- Read from a specific database
-SELECT * FROM firestore_scan('users', database='my-other-db');
+SELECT * FROM firestore_scan('users', database:='my-other-db');
 ```
 
 ### Scan Parameters
@@ -274,13 +274,13 @@ SELECT * FROM firestore_scan('users', database='my-other-db');
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
-SELECT * FROM firestore_scan('leaderboard', order_by='score DESC', scan_limit=10);
+SELECT * FROM firestore_scan('leaderboard', order_by:='score DESC', scan_limit:=10);
 
 -- Multi-field ordering
-SELECT * FROM firestore_scan('leaderboard', order_by='category, score DESC');
+SELECT * FROM firestore_scan('leaderboard', order_by:='category, score DESC');
 
 -- Exclude phantom/missing documents
-SELECT * FROM firestore_scan('users', show_missing=false);
+SELECT * FROM firestore_scan('users', show_missing:=false);
 ```
 
 ### Insert Parameters
@@ -371,8 +371,8 @@ Supported patterns include:
 
 Named parameters still work and take precedence over SQL pushdown:
 
-- If `order_by=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
-- If `scan_limit=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
+- If `order_by:=` is provided, that server-side ordering is used and DuckDB applies any SQL `ORDER BY` afterward.
+- If `scan_limit:=` is provided, that fetch limit is used and DuckDB applies any SQL `LIMIT` afterward.
 
 > **Multi-field ordering needs a composite index, which the extension can only detect with service-account auth.** See [Admin-only features](#admin-only-features-index-metadata) — with API-key or Firebase-user auth, multi-field `ORDER BY` can't be confirmed against a composite index and may fall back to a client-side sort or hit Firestore's "requires an index" error.
 
@@ -391,7 +391,7 @@ LIMIT 10;
 
 -- Named parameters override SQL pushdown
 SELECT name
-FROM firestore_scan('leaderboard', order_by='score', scan_limit=10)
+FROM firestore_scan('leaderboard', order_by:='score', scan_limit:=10)
 ORDER BY name DESC
 LIMIT 3;
 ```
@@ -453,7 +453,7 @@ Document-path scans support:
 - Pagination across large numbers of subcollections
 - SQL `ORDER BY __document_id` pushdown
 - SQL `LIMIT` pushdown
-- Named `order_by='__document_id'` or `order_by='__document_id DESC'`, plus `scan_limit=...`
+- Named `order_by:='__document_id'` or `order_by:='__document_id DESC'`, plus `scan_limit:=...`
 
 Other ordering expressions still work, but they are evaluated in DuckDB after fetching the subcollection IDs.
 
@@ -474,24 +474,24 @@ By default, `firestore_scan()` includes "phantom" documents — documents that h
 SELECT * FROM firestore_scan('artifacts/default-app-id/users');
 
 -- Opt out to only return documents with fields
-SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing=false);
+SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing:=false);
 ```
 
 When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.
 
 > **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
 
-> **Important — `show_missing=true` requires privileged (service-account) access.** Listing
+> **Important — `show_missing:=true` requires privileged (service-account) access.** Listing
 > phantom/missing documents (`showMissing=true`, the default) is an Admin-oriented operation.
 > The Admin SDK / a service account bypasses Security Rules and can do it, but over
 > **rules-governed access (API key or Firebase user ID token)** Firestore rejects it with
 > `403 PERMISSION_DENIED: Missing or insufficient permissions` — **even when your rules grant
 > `allow read: if true`** (a plain `list` is permitted; enumerating missing documents is not).
-> If you authenticate with an API key or a Firebase user token, pass `show_missing=false`:
+> If you authenticate with an API key or a Firebase user token, pass `show_missing:=false`:
 >
 > ```sql
 > SELECT * FROM firestore_scan('artifacts/default-app-id/users/<uid>/math_whiz_data',
->                              show_missing=false)
+>                              show_missing:=false)
 > WHERE role = 'student';
 > ```
 >

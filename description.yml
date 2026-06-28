@@ -304,9 +304,9 @@ docs:
       DuckDB applying the final offset)
 
     Named parameters still work and take precedence over SQL pushdown:
-    - If `order_by=` is provided, that server-side ordering is used and
+    - If `order_by:=` is provided, that server-side ordering is used and
       DuckDB applies any SQL `ORDER BY` afterward.
-    - If `scan_limit=` is provided, that fetch limit is used and DuckDB
+    - If `scan_limit:=` is provided, that fetch limit is used and DuckDB
       applies any SQL `LIMIT` afterward.
 
     Use `EXPLAIN` to verify when SQL ordering and limits are being pushed.
@@ -326,8 +326,8 @@ docs:
     - Pagination across large numbers of subcollections
     - SQL `ORDER BY __document_id` pushdown
     - SQL `LIMIT` pushdown
-    - Named `order_by='__document_id'` or `order_by='__document_id DESC'`,
-      plus `scan_limit=...`
+    - Named `order_by:='__document_id'` or `order_by:='__document_id DESC'`,
+      plus `scan_limit:=...`
 
     Other ordering expressions still work, but they are evaluated in DuckDB
     after fetching the subcollection IDs.
