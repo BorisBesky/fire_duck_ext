@@ -177,6 +177,14 @@ docs:
        The extension sends `Authorization: Bearer <id_token>` and refreshes the token
        automatically on expiry.
 
+    `ANONYMOUS true` is not the same as a plain `API_KEY`. Both pass the API key, but
+    the API key alone is unauthenticated (`request.auth == null`), while anonymous
+    sign-in obtains an ID token for a real (anonymous) Firebase user, so
+    `request.auth != null` and a `uid` is available in Security Rules. Use a plain
+    API key for public collections whose rules allow unauthenticated reads; use
+    `ANONYMOUS true` when rules require a signed-in user (`request.auth != null`) but
+    no specific identity is needed. Each anonymous sign-in gets a fresh `uid`.
+
     If the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set,
     the extension automatically creates an internal secret on startup that
     matches all databases (`DATABASE '*'`), so no `CREATE SECRET` is needed.

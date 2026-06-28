@@ -104,6 +104,59 @@ CREATE SECRET dev_firestore (
 );
 ```
 
+### Firebase Auth User (authenticated; browser-safe)
+
+Firebase user authentication gives **authenticated** access that respects Security Rules (`request.auth != null`), unlike a bare API key. It needs no OpenSSL, so it also works in the WebAssembly/browser build. Provide the public Web `API_KEY` plus a sign-in method.
+
+**Email / password:**
+```sql
+CREATE SECRET user_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',
+    EMAIL 'user@example.com',
+    PASSWORD 'hunter2'
+);
+```
+
+**Anonymous:**
+```sql
+CREATE SECRET anon_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',
+    ANONYMOUS true
+);
+```
+
+**Pre-obtained ID token** (e.g. minted by your host app):
+```sql
+CREATE SECRET token_firestore (
+    TYPE firestore,
+    PROJECT_ID 'my-project',
+    API_KEY 'AIzaSyYourWebApiKey',  -- optional; enables auto-refresh
+    ID_TOKEN 'eyJhbGciOi...',
+    REFRESH_TOKEN 'AMf-...'         -- optional; auto-refreshed on expiry
+);
+```
+
+The extension signs in via the Firebase Auth REST API, sends `Authorization: Bearer <id_token>` on requests, and refreshes the token automatically on expiry.
+
+#### Anonymous sign-in vs. plain API key
+
+Both pass the API key, but only anonymous sign-in actually authenticates a user — the API key alone leaves the request **unauthenticated**:
+
+| | API key only | `ANONYMOUS true` |
+| --- | --- | --- |
+| Signs in / obtains an ID token | No | Yes (`accounts:signUp`) |
+| `request.auth` in Security Rules | `null` | non-null, with a `uid` |
+| Creates a Firebase Auth user | No | Yes (anonymous; counts toward Auth quota) |
+| Sends `Authorization: Bearer` | No | Yes |
+| Passes `allow read: if true` | ✅ | ✅ |
+| Passes `allow read: if request.auth != null` | ❌ | ✅ |
+
+Use a **plain API key** for public collections whose rules allow unauthenticated reads. Use **`ANONYMOUS true`** when your rules require a signed-in user (`request.auth != null`) but you don't need a specific identity — e.g. per-session/per-device data. Each anonymous sign-in gets a fresh `uid`, so it suits "authenticated but identity-agnostic" rules; for a specific known user, use email/password or a pre-obtained `ID_TOKEN`.
+
 ### Environment Variable
 ```bash
 # Set the path to your service account JSON file
