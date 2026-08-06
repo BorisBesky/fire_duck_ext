@@ -105,6 +105,12 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	bool finished;
 	std::string next_page_token;
 
+	// Running count of rows handed to DuckDB across the whole scan.
+	// `current_index` cannot serve this purpose: it indexes into the *current
+	// page* and is reset to 0 every time a new page is fetched, so any
+	// scan_limit larger than one page would never be reached.
+	idx_t rows_emitted = 0;
+
 	// Filter pushdown state
 	FirestoreFilterResult pushdown_result;
 	json structured_query;       // Cached StructuredQuery for pagination

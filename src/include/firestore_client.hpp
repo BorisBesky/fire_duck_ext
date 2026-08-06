@@ -9,6 +9,15 @@
 #include <optional>
 #include <memory>
 
+#ifndef __EMSCRIPTEN__
+// Forward declaration only: httplib.h is ~320k lines and must not be pulled
+// into every translation unit that includes this header. FirestoreClient holds
+// it behind a unique_ptr, so an incomplete type is sufficient here.
+namespace httplib {
+class Client;
+} // namespace httplib
+#endif
+
 namespace duckdb {
 
 using json = nlohmann::json;
@@ -61,6 +70,10 @@ public:
 	// `db` is used to reach DuckDB's HTTPUtil for HTTP transport on WASM builds,
 	// where raw sockets are unavailable.
 	FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db);
+
+	// Defined out of line: destroying the unique_ptr<httplib::Client> member
+	// requires httplib::Client to be complete, which it only is in the .cpp.
+	~FirestoreClient();
 
 	// Read operations
 	FirestoreListResponse ListDocuments(const std::string &collection, const FirestoreQuery &query = {});
@@ -124,6 +137,22 @@ private:
 	std::shared_ptr<FirestoreCredentials> credentials_;
 	// DuckDB instance handle; only consulted by the WASM HTTP transport.
 	DatabaseInstance &db_;
+
+#ifndef __EMSCRIPTEN__
+	// Persistent HTTP client, reused across every request this FirestoreClient
+	// makes. Constructing a client per request forces a fresh TCP (and TLS)
+	// handshake for every page of a scan; keeping one alive lets the connection
+	// be reused. Scans are single-threaded (FirestoreScanGlobalState::MaxThreads
+	// returns 1) and each operator owns its own FirestoreClient, so no locking
+	// is needed here -- httplib::Client is itself internally synchronised.
+	std::unique_ptr<httplib::Client> http_client_;
+	std::string http_client_host_;
+
+	// Returns a keep-alive client bound to `scheme_host`, rebuilding it only if
+	// the host changes. In practice the documents and Admin API endpoints share
+	// a host, so this is built once per FirestoreClient.
+	httplib::Client &GetHttpClient(const std::string &scheme_host);
+#endif
 
 	// Build base URL for Firestore REST API (documents endpoint)
 	std::string BuildBaseUrl() const;

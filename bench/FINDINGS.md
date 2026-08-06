@@ -1,0 +1,301 @@
+# fire_duck_ext — nested datatypes & large collections: measured assessment
+
+Measured on `main` @ `62e9d80`, DuckDB v1.5.4 release build, Apple M-series (16 core),
+against `bench/mock_firestore.py` over loopback.
+
+Reproduce:
+
+```bash
+nohup python3 bench/mock_firestore.py 8099 &
+python3 bench/run_bench.py                    # all groups
+python3 bench/run_bench.py nested map-depth   # one group
+```
+
+**Caveat on absolute numbers.** The mock serves pre-serialised pages over
+loopback, so throughput here is an upper bound: it excludes TLS, WAN latency,
+and Firestore's own service time. That biases *against* the network findings —
+on real Firestore every network-side result below gets larger, not smaller.
+The WAN section re-introduces latency explicitly.
+
+---
+
+## 1. How nested datatypes are handled
+
+| Firestore type | DuckDB type produced | Verdict |
+|---|---|---|
+| `arrayValue` | `LIST(T)`, element type inferred by majority vote | native |
+| `geoPointValue` | `STRUCT(latitude DOUBLE, longitude DOUBLE)` | native |
+| vector (`__type__: __vector__`) | `ARRAY(DOUBLE, N)`, N from first sample | native |
+| **`mapValue`** | **`VARCHAR` holding raw Firestore wire JSON** | **leaky** |
+
+Arrays and vectors are converted properly. Maps are the outlier
+([firestore_types.cpp:344-350](../src/firestore_types.cpp#L344)): the value is
+`fv["mapValue"]["fields"].dump()` — the *undecoded* wire format, type wrappers
+and all.
+
+Actual output for a 3-level map:
+
+```
+{"child":{"mapValue":{"fields":{"child":{"mapValue":{"fields":{
+  "leaf0":{"stringValue":"alpha-0000000-0"},"leaf1":{"integerValue":"1"}}}},
+  "label":{"stringValue":"level-2"}}}},"label":{"stringValue":"level-3"}}
+```
+
+Two consequences:
+
+1. **Every nesting level costs two extra JSON path segments.** Reaching a leaf
+   three levels down requires
+   `json_extract_string(payload,'$.child.mapValue.fields.child.mapValue.fields.leaf0.stringValue')`
+   instead of `$.child.child.leaf0`. Integers arrive as strings and need a cast.
+   The workaround also requires the `json` extension.
+2. **The stored string is ~2.1x larger than equivalent natural JSON**
+   (measured: depth 1 → 2.00x, depth 4 → 2.07x, depth 8 → 2.10x).
+
+The same raw dump is used for maps nested inside arrays
+([firestore_types.cpp:273-279](../src/firestore_types.cpp#L273)), so a
+`LIST` of maps is a list of wire-format strings.
+
+### Conversion cost by shape — 20,000 documents
+
+`count(<col>)` forces materialisation; `count(*)` does not (projection pushdown
+asks the scan for zero columns, so `SetDuckDBValue` never runs). The difference
+isolates conversion.
+
+| shape | materialised | `count(*)` | conversion | conversion share | MiB |
+|---|---|---|---|---|---|
+| 8 scalar fields | 0.103 s | 0.084 s | 0.019 s | 18% | 8.45 |
+| map, 8 leaves | 0.129 s | 0.105 s | 0.024 s | 19% | 10.30 |
+| array, 8 strings | 0.123 s | 0.091 s | 0.032 s | 26% | 8.98 |
+| array, 8 ints | 0.116 s | 0.090 s | 0.026 s | 22% | 8.78 |
+| vector, 8 dims | 0.125 s | 0.102 s | 0.023 s | 18% | 9.85 |
+
+**No shape is pathologically slow.** Cost tracks payload size at a near-constant
+~10 ms/MiB. The nested-type problem is not CPU per value — it is that nesting
+*inflates bytes*, and bytes are the currency.
+
+### Depth and width scale linearly, not quadratically
+
+Map depth (materialised, 20k docs):
+
+| depth | time | MiB | ms/MiB |
+|---|---|---|---|
+| 1 | 0.092 s | 7.61 | 12.1 |
+| 2 | 0.112 s | 8.91 | 12.6 |
+| 4 | 0.152 s | 11.52 | 13.2 |
+| 8 | 0.233 s | 16.73 | 13.9 |
+| 16 | 0.389 s | 27.31 | 14.2 |
+
+Per-byte cost rises only 17% from depth 1 to 16 — deep nesting is not a
+blow-up. Time grows 4.2x because *bytes* grow 3.6x.
+
+Array width (20k docs):
+
+| elements | materialised | `count(*)` | conversion | conversion share |
+|---|---|---|---|---|
+| 1 | 0.060 s | 0.050 s | 0.010 s | 17% |
+| 4 | 0.088 s | 0.069 s | 0.019 s | 22% |
+| 16 | 0.191 s | 0.134 s | 0.057 s | 30% |
+| 64 | 0.589 s | 0.389 s | 0.200 s | 34% |
+
+Linear in element count (~156 ns/element at width 64), but conversion's *share*
+grows to a third of runtime. This is the one place worth micro-optimising:
+`FirestoreValueToDuckDB` builds a throwaway `vector<Value>` (one heap `Value`
+per element) which `SetDuckDBValue` then copies element-by-element into the
+`ListVector` ([firestore_types.cpp:214-308](../src/firestore_types.cpp#L214),
+[:618-663](../src/firestore_types.cpp#L618)) — two passes and N temporaries per
+list per row. Writing straight into the child vector would remove both.
+
+*(An earlier hypothesis that per-row `ListVector::Reserve` causes O(n²) copying
+is wrong: `VectorListBuffer::Reserve` grows via `NextPowerOfTwo`, so appends
+amortise. Discarded.)*
+
+---
+
+## 2. How large collections are handled
+
+Full scan, 8 scalar fields, materialised:
+
+| documents | time | docs/s | requests | connections | MiB |
+|---|---|---|---|---|---|
+| 1,000 | 0.005 s | ~200k | 2 | 3 | 0.46 |
+| 10,000 | 0.052 s | 192k | 11 | 12 | 4.24 |
+| 50,000 | 0.258 s | 194k | 51 | 52 | 21.05 |
+| 200,000 | 1.040 s | 192k | 201 | 202 | 84.28 |
+
+**Scaling is clean and linear** — no quadratic behaviour, stable ~192k docs/s
+and ~81 MiB/s. Memory stays bounded (one 1000-document page at a time).
+
+The problems are all in what goes over the wire.
+
+### 2a. Zero connection reuse — every page opens a new TCP connection
+
+`max_requests_on_one_conn = 1` for all 51 requests of a 50k scan. The mock
+speaks HTTP/1.1 with `Content-Length`, and a control run with `curl` reused one
+connection for 5 requests (`max_on_one_conn=5`), so this is the client's
+behaviour, not a server limitation.
+
+Cause: `httplib::Client cli(scheme_host)` is constructed **inside**
+`MakeRequest` ([firestore_client.cpp:186](../src/firestore_client.cpp#L186)) and
+destroyed when it returns — one connect + TLS handshake per page.
+
+A/B under simulated WAN (50,000 docs, 51 requests):
+
+| condition | time |
+|---|---|
+| loopback, no latency | 0.228 s |
+| 15 ms/request, connections free *(= what keep-alive gives)* | 1.577 s |
+| 15 ms/request + 40 ms/new connection *(actual behaviour)* | **4.255 s** |
+
+**Reusing the connection is a 2.7x speedup** on this workload, and the gap grows
+linearly with collection size. Against production Firestore over TLS, the
+per-connection cost is real.
+
+### 2b. No compression negotiated
+
+`requests_advertising_gzip = 0` on every request. Firestore's wire format is
+extremely repetitive (`{"stringValue":…}` per field), so it compresses hard:
+
+| one 1000-document page | size |
+|---|---|
+| as transferred today | 430.3 KiB |
+| same bytes, gzip | 31.9 KiB |
+
+**13.5x more bytes than necessary.** The 200k scan moves 84.28 MiB where ~6.2 MiB
+would do.
+
+### 2c. Projection is not pushed to Firestore
+
+`projection_pushdown = true` is set, but `mask.fieldPaths` is never sent
+(`requests_with_field_mask = 0` in every run).
+
+| 20k docs, 40 columns | time | transferred |
+|---|---|---|
+| all 40 columns | 0.450 s | 28.24 MiB |
+| 1 of 40 columns | 0.341 s | **28.24 MiB** |
+
+Projection saves 24% CPU by skipping conversion, and **zero network**. The REST
+API supports `mask.fieldPaths` on `documents.list` and `select.fields` on
+`runQuery`.
+
+### 2d. `scan_limit` is silently ignored above one page — and downloads everything
+
+| `scan_limit` | rows returned | documents fetched | transferred |
+|---|---|---|---|
+| 500 | 500 | 600 | 0.25 MiB |
+| 1000 | 1000 | 1100 | 0.46 MiB |
+| **1001** | **200,000** | **200,100** | **84.28 MiB** |
+| **5000** | **200,000** | **200,100** | **84.28 MiB** |
+
+The threshold is exactly the 1000-document page size. Root cause
+([firestore_scanner.cpp:826](../src/firestore_scanner.cpp#L826)):
+
+```cpp
+idx_t total_returned = global_state.current_index;
+```
+
+`current_index` is an index *within the current page* and is reset to `0` on
+every page fetch ([:880](../src/firestore_scanner.cpp#L880),
+[:904](../src/firestore_scanner.cpp#L904)). It therefore never reaches a limit
+larger than one page, and the scan runs to the end of the collection. There is
+no running-total field in `FirestoreScanGlobalState`.
+
+SQL `LIMIT` is unaffected — it goes through the optimizer extension and works
+correctly (`LIMIT 5000` fetched 7,100 documents).
+
+### 2e. Schema inference samples 100 documents, silently dropping later fields
+
+`InferSchema(collection, 100, …)`
+([firestore_scanner.cpp:400](../src/firestore_scanner.cpp#L400)). A field first
+appearing at document 500 of 2,000 — present on **75% of the collection** — does
+not appear in `DESCRIBE` and is absent from every result. No warning is emitted.
+
+This is realistic for Firestore, where documents are returned in `__name__`
+order and schemas drift over time.
+
+### 2f. Secondary (identified by inspection, not individually measured)
+
+- Every field access does two lookups: `doc.fields.contains(col_name)` then
+  `doc.fields[col_name]` ([firestore_scanner.cpp:940-941](../src/firestore_scanner.cpp#L940)).
+  One `find()` would halve it — 2 × columns × rows ordered-map probes.
+- `ParseDocument` deep-copies each document's fields
+  (`doc.fields = doc_json["fields"]`,
+  [firestore_client.cpp:303](../src/firestore_client.cpp#L303)) while the parsed
+  response is still alive, roughly doubling peak memory per page. A `std::move`
+  from a non-const parameter would avoid it.
+- `MaxThreads()` returns 1 and pages are fetched inline on the execution thread,
+  so fetch and conversion never overlap.
+- Every bind that misses the schema cache costs one extra 100-document request
+  (visible as `docs_served = N + 100` throughout).
+
+---
+
+## 3. Recommendations, ranked by measured impact
+
+| # | Change | Evidence | Effort | Status |
+|---|---|---|---|---|
+| 1 | Reuse one `httplib::Client` per host, stored on `FirestoreClient` | 2.7x on WAN A/B | small | **done** |
+| 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
+| 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | open |
+| 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
+| 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
+| 6 | Decode `mapValue` to `STRUCT`, or at minimum to natural JSON | 2.1x smaller strings, no `.mapValue.fields.` paths | medium | open |
+| 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | open |
+| 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | open |
+
+---
+
+## 4. Implemented: #1 connection reuse and #4 `scan_limit`
+
+### #4 — `scan_limit` (correctness)
+
+`FirestoreScanGlobalState` gained a `rows_emitted` counter that survives page
+turnover; the limit check reads it instead of `current_index`.
+
+| `scan_limit` | rows before | rows after | docs fetched before → after |
+|---|---|---|---|
+| 500 | 500 | 500 | 600 → 600 |
+| 1000 | 1000 | 1000 | 1100 → 1100 |
+| 1001 | **200,000** | **1001** | 200,100 → 2,100 |
+| 2048 | **200,000** | **2048** | 200,100 → 3,100 |
+| 5000 | **200,000** | **5000** | 200,100 → 5,100 |
+| 50000 | **200,000** | **50,000** | 200,100 → 50,100 |
+
+Fetching is now proportional to the limit. The residue (e.g. 2,100 documents for
+a limit of 1,001) is one 1000-document page of unavoidable over-read plus the
+100-document schema sample.
+
+### #1 — connection reuse (performance)
+
+`httplib::Client` moved from a per-request local in `MakeRequest` to a member
+built once per host, plus `set_keep_alive(true)` — httplib defaults
+`keep_alive_` to `false` and sends `Connection: close`, so hoisting the object
+alone would not have reused the socket.
+
+50,000-document scan, 51 requests:
+
+| metric | before | after |
+|---|---|---|
+| TCP connections | 52 | 3 |
+| max requests on one connection | 1 | 50 |
+| loopback, no latency | 0.228 s | 0.224 s |
+| WAN: 15 ms/request + 40 ms/connection | 4.255 s | **1.519 s** |
+
+**2.8x faster** under simulated WAN, no change on loopback. The 3 remaining
+connections are the scan's client (50 requests), the separate `FirestoreClient`
+that `FirestoreScanBind` builds for schema inference (1), and the harness's own
+reset call — sharing one client between bind and execution would remove one more.
+
+### Verification
+
+- 9 SQL test files, 237 assertions — pass.
+- Full Firebase-emulator integration suite (74 tests, including insert, update,
+  delete and batch writes) — pass. This matters because connection reuse changes
+  the transport for *every* verb, not just the GETs a scan issues.
+- WASM: the new member, its accessor and the forward declaration are all behind
+  `#ifndef __EMSCRIPTEN__`, and the sole call site is inside the non-WASM branch
+  of `MakeRequest`, so the `HTTPUtil` path is untouched. **Not compile-verified —
+  no emscripten toolchain on this machine.**
+- `description.yml` and `README.md` reviewed per `CLAUDE.md`: both already
+  document `scan_limit` as an honoured fetch limit, so the fix brings the
+  implementation in line with the existing text rather than changing it. No
+  documentation edit needed; connection reuse is internal.

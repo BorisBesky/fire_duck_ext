@@ -823,7 +823,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	bool has_unpushed_filters =
 	    !bind_data.candidate_pushdown_filters.empty() && !global_state.pushdown_result.has_pushdown();
 	if (effective_limit.has_value() && !global_state.pushdown_failed && !has_unpushed_filters) {
-		idx_t total_returned = global_state.current_index;
+		idx_t total_returned = global_state.rows_emitted;
 		if (total_returned >= static_cast<idx_t>(effective_limit.value())) {
 			global_state.finished = true;
 			output.SetCardinality(0);
@@ -947,6 +947,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 		count++;
 		global_state.current_index++;
+		global_state.rows_emitted++;
 	}
 
 	if (count == 0) {

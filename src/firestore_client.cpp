@@ -74,6 +74,26 @@ FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentia
 	FS_LOG_DEBUG("FirestoreClient initialized for project: " + credentials_->project_id);
 }
 
+// Out of line so httplib::Client is complete at the point of destruction.
+FirestoreClient::~FirestoreClient() = default;
+
+#ifndef __EMSCRIPTEN__
+httplib::Client &FirestoreClient::GetHttpClient(const std::string &scheme_host) {
+	if (!http_client_ || http_client_host_ != scheme_host) {
+		http_client_ = std::make_unique<httplib::Client>(scheme_host);
+		http_client_host_ = scheme_host;
+		// httplib defaults keep_alive_ to false, which makes it send
+		// "Connection: close" and drop the socket after every response. Without
+		// this the client object would be reused but the connection would not.
+		http_client_->set_keep_alive(true);
+		http_client_->set_connection_timeout(30);
+		http_client_->set_read_timeout(30);
+		FS_LOG_DEBUG("Created keep-alive HTTP client for: " + scheme_host);
+	}
+	return *http_client_;
+}
+#endif
+
 std::string FirestoreClient::BuildBaseUrl() const {
 	char buffer[512];
 	std::string emulator_host = GetEmulatorHost();
@@ -183,9 +203,9 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_INIT, "Failed to parse URL: " + url, error_ctx);
 	}
 
-	httplib::Client cli(scheme_host);
-	cli.set_connection_timeout(30);
-	cli.set_read_timeout(30);
+	// Reused across requests -- see GetHttpClient. Previously a Client was
+	// constructed here per request, costing a TCP+TLS handshake per page.
+	auto &cli = GetHttpClient(scheme_host);
 
 	httplib::Headers headers = {{"Content-Type", "application/json"}};
 	if (!auth_header.empty()) {
