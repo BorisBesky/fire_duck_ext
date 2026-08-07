@@ -3,6 +3,7 @@
 #include "firestore_auth.hpp"
 #include "firestore_error.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_types.hpp" // FirestoreMapEncoding
 #include "duckdb.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -108,8 +109,9 @@ public:
 	// Infer schema from sample documents
 	// Use ~ prefix for collection group queries (e.g., "~profile")
 	// Returns pairs of (field_name, DuckDB LogicalType)
-	std::vector<std::pair<std::string, LogicalType>> InferSchema(const std::string &collection,
-	                                                             int64_t sample_size = 100, bool show_missing = true);
+	std::vector<std::pair<std::string, LogicalType>> InferSchema(
+	    const std::string &collection, int64_t sample_size = 100, bool show_missing = true,
+	    FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,

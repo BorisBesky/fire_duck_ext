@@ -109,3 +109,32 @@ SELECT count FROM firestore_delete_batch('users', ['id1']);
 
 statement ok
 DROP SECRET return_test;
+
+# ============================================
+# map_encoding parameter
+# ============================================
+
+# Accepts the three documented modes. These fail on credentials/network, not on
+# the parameter itself, so an error naming the encoding would be a regression.
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:='wire');
+----
+
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:='json');
+----
+
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:='variant');
+----
+
+# An unknown encoding is rejected by name, before any network access.
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:='nope');
+----
+Unknown map_encoding 'nope'
+
+# map_encoding must be a string
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:=42);
+----

@@ -273,6 +273,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["scan_limit"] = LogicalType::BIGINT;
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
+	scan_func.named_parameters["map_encoding"] = LogicalType::VARCHAR;
 
 	// Enable projection pushdown for efficiency
 	scan_func.projection_pushdown = true;
@@ -314,6 +315,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->parsed_order_by = ParseOrderByString(result->order_by.value());
 		} else if (kv.first == "show_missing") {
 			result->show_missing = kv.second.GetValue<bool>();
+		} else if (kv.first == "map_encoding") {
+			result->map_encoding = ParseMapEncoding(StringUtil::Lower(kv.second.GetValue<string>()));
 		}
 	}
 
@@ -348,8 +351,10 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		return std::move(result);
 	}
 
-	std::string cache_key =
-	    result->credentials->project_id + ":" + result->credentials->database_id + ":" + result->collection;
+	// The encoding changes the inferred column types, so it is part of the key --
+	// otherwise switching map_encoding within a session reuses the wrong schema.
+	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
+	                        MapEncodingName(result->map_encoding) + ":" + result->collection;
 	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
 		auto &schema_cache = GetSchemaCache();
@@ -397,7 +402,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials, DatabaseInstance::GetDatabase(context));
-	auto schema = client.InferSchema(result->collection, 100, result->show_missing);
+	auto schema = client.InferSchema(result->collection, 100, result->show_missing, result->map_encoding);
 
 	// Check if collection exists (has documents)
 	if (schema.empty()) {
@@ -832,6 +837,21 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		max_count = std::min(max_count, static_cast<idx_t>(effective_limit.value()) - total_returned);
 	}
 
+	// VARIANT columns cannot be written cell-by-cell: DuckDB builds a VARIANT
+	// vector from an entire chunk at once (VariantValue::ToVARIANT). Collect one
+	// VariantValue per emitted row here and convert after the loop.
+	const idx_t out_col_count = bind_data.projected_columns.size();
+	std::vector<bool> is_variant_col(out_col_count, false);
+	// Inner container must be duckdb::vector -- that is what ToVARIANT takes.
+	std::vector<duckdb::vector<VariantValue>> variant_values(out_col_count);
+	bool any_variant_col = false;
+	for (idx_t out_col = 0; out_col < out_col_count; out_col++) {
+		if (output.data[out_col].GetType().id() == LogicalTypeId::VARIANT) {
+			is_variant_col[out_col] = true;
+			any_variant_col = true;
+		}
+	}
+
 	while (count < max_count) {
 		// Check if we need to fetch more documents
 		if (global_state.current_index >= global_state.documents.size()) {
@@ -937,8 +957,16 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				// Regular field column
 				const auto &col_name = bind_data.column_names[src_col];
 
-				if (doc.fields.contains(col_name)) {
-					SetDuckDBValue(output.data[out_col], count, doc.fields[col_name], bind_data.column_types[src_col]);
+				if (is_variant_col[out_col]) {
+					// Accumulate only; the VARIANT vector is built once per chunk
+					// below. A default-constructed VariantValue is MISSING, which
+					// ToVARIANT renders as SQL NULL.
+					auto field_it = doc.fields.find(col_name);
+					variant_values[out_col].push_back(
+					    field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it) : VariantValue());
+				} else if (doc.fields.contains(col_name)) {
+					SetDuckDBValue(output.data[out_col], count, doc.fields[col_name],
+					               bind_data.column_types[src_col], bind_data.map_encoding);
 				} else {
 					FlatVector::SetNull(output.data[out_col], count, true);
 				}
@@ -948,6 +976,15 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		count++;
 		global_state.current_index++;
 		global_state.rows_emitted++;
+	}
+
+	if (any_variant_col) {
+		for (idx_t out_col = 0; out_col < out_col_count; out_col++) {
+			if (is_variant_col[out_col]) {
+				D_ASSERT(variant_values[out_col].size() == count);
+				VariantValue::ToVARIANT(variant_values[out_col], output.data[out_col]);
+			}
+		}
 	}
 
 	if (count == 0) {

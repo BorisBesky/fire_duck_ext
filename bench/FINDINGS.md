@@ -238,7 +238,7 @@ order and schemas drift over time.
 | 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
 | 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
 | 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
-| 6 | Decode `mapValue` to `STRUCT`, or at minimum to natural JSON | 2.1x smaller strings, no `.mapValue.fields.` paths | medium | open |
+| 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
 | 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | open |
 | 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | open |
 
@@ -314,9 +314,62 @@ conditional on `FIRESTORE_EMULATOR_HOST` — not done, as the absolute cost is
 No symbol conflict with DuckDB's vendored compression: DuckDB uses `miniz`,
 whose symbols live under `duckdb_miniz`/`mz_*`, not zlib's `inflate`/`deflate`.
 
+### #6 — `map_encoding` (prototype)
+
+New named parameter with three modes. `'wire'` stays the default, so nothing
+existing changes unless asked.
+
+| mode | column type | reaching a leaf 2 deep |
+|---|---|---|
+| `wire` (default) | VARCHAR | `$.child.mapValue.fields.leaf0.stringValue` |
+| `json` | JSON | `$.child.leaf0` |
+| `variant` | VARIANT | `payload.child.leaf0` |
+
+VARIANT is built by recursing into `VariantValue` and calling
+`VariantValue::ToVARIANT` once per chunk — DuckDB constructs a VARIANT vector
+from a whole chunk, not cell by cell, so the scanner accumulates one
+`VariantValue` per emitted row. A default-constructed (MISSING) entry becomes
+SQL NULL, which is what a document lacking the field should produce.
+
+**Scan cost, 20,000 documents** (median of 3, schema cache warm):
+
+| shape | wire | json | variant | variant vs wire |
+|---|---|---|---|---|
+| map depth 1 | 0.120 s | 0.123 s | 0.116 s | −3% |
+| map depth 4 | 0.193 s | 0.204 s | 0.198 s | +3% |
+| map depth 8 | 0.289 s | 0.320 s | 0.310 s | +7% |
+| map, 16 flat leaves | 0.281 s | 0.299 s | 0.293 s | +4% |
+
+Isolating conversion at depth 8 against the shared no-materialise baseline
+(0.240 s):
+
+| mode | total | conversion |
+|---|---|---|
+| wire | 0.290 s | 0.050 s |
+| json | 0.320 s | 0.080 s |
+| variant | 0.321 s | 0.081 s |
+
+So VARIANT costs ~1.6x the *conversion* work of a raw `.dump()`, but conversion
+is only ~17% of the scan, so end-to-end it is +7% at depth 8 and free at depth 1.
+That is the price for dot access and type fidelity.
+
+**Type fidelity** — verified on scanned data: `variant_typeof` reports `INT64`
+for Firestore's string-encoded integers, plus `DOUBLE` and `BOOL_FALSE`/
+`BOOL_TRUE`. Documents with differing keys, or differing types at the same path,
+are preserved; a missing key yields SQL NULL rather than an error. No fixed
+schema is involved, so unlike a STRUCT mapping there is no silent key dropping.
+
+The schema cache key includes the encoding — without that, switching
+`map_encoding` inside one session would reuse the previous schema. Verified:
+`wire → variant → json → wire` in a single session yields
+`VARCHAR / VARIANT / JSON / VARCHAR`.
+
+Known limitation: a LIST child cannot be VARIANT, so maps nested *inside arrays*
+render as natural JSON strings under `'variant'` rather than as VARIANT.
+
 ### Verification
 
-- 9 SQL test files, 237 assertions — pass.
+- 9 SQL test files, 242 assertions (5 new `map_encoding` cases) — pass.
 - Full Firebase-emulator integration suite (74 tests, including insert, update,
   delete and batch writes) — pass. This matters because connection reuse changes
   the transport for *every* verb, not just the GETs a scan issues.

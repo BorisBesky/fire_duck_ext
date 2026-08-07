@@ -828,8 +828,9 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 	}
 }
 
-std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
-                                                                              int64_t sample_size, bool show_missing) {
+std::vector<std::pair<std::string, LogicalType>>
+FirestoreClient::InferSchema(const std::string &collection, int64_t sample_size, bool show_missing,
+                             FirestoreMapEncoding map_encoding) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
 	FirestoreQuery query;
@@ -931,7 +932,7 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 				FS_LOG_DEBUG("Vector field '" + name + "' could not determine dimension, using LIST(DOUBLE)");
 			}
 		} else {
-			result.emplace_back(name, FirestoreTypeToDuckDB(type));
+			result.emplace_back(name, FirestoreTypeToDuckDB(type, map_encoding));
 		}
 	}
 

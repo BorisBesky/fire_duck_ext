@@ -227,12 +227,30 @@ docs:
     - `boolean` → BOOLEAN
     - `timestamp` → TIMESTAMP
     - `array` → LIST
-    - `map` → VARCHAR (JSON string)
+    - `map` → VARCHAR, JSON or VARIANT (selected by `map_encoding`)
     - `vector` → ARRAY(DOUBLE, N) (embedding)
     - `null` → NULL
     - `geoPoint` → STRUCT(latitude DOUBLE, longitude DOUBLE)
     - `reference` → VARCHAR
     - `bytes` → BLOB
+
+    ## Map Encoding
+    Firestore maps are schemaless — keys and value types vary per document — so
+    the `map_encoding` named parameter selects how they are surfaced:
+
+    - `'wire'` (default): VARCHAR holding the raw Firestore wire JSON, type
+      wrappers included. Leaves need paths like
+      `$.a.mapValue.fields.b.stringValue`.
+    - `'json'`: JSON holding natural JSON (`{"a":{"b":7}}`), so leaf paths are
+      `$.a.b` and integers are numbers.
+    - `'variant'`: native DuckDB VARIANT. Leaves are reached by dot access
+      (`payload.a.b`), `variant_typeof` reports each value's real type, and
+      documents with differing keys or differing types at the same path are all
+      preserved (a missing key yields SQL NULL).
+
+    `'wire'` remains the default so existing queries continue to work. Maps
+    nested inside arrays follow the same setting; a LIST child cannot be
+    VARIANT, so `'variant'` renders those as natural JSON strings.
 
     ## Schema Inference
     When you call `firestore_scan()`, the extension automatically infers the

@@ -93,7 +93,185 @@ std::string GetFirestoreTypeName(const json &value) {
 	return "unknown";
 }
 
-LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type) {
+FirestoreMapEncoding ParseMapEncoding(const std::string &name) {
+	if (name == "wire") {
+		return FirestoreMapEncoding::WIRE;
+	}
+	if (name == "json") {
+		return FirestoreMapEncoding::JSON;
+	}
+	if (name == "variant") {
+		return FirestoreMapEncoding::VARIANT;
+	}
+	throw InvalidInputException("Unknown map_encoding '%s'. Expected one of: wire, json, variant.", name);
+}
+
+const char *MapEncodingName(FirestoreMapEncoding encoding) {
+	switch (encoding) {
+	case FirestoreMapEncoding::JSON:
+		return "json";
+	case FirestoreMapEncoding::VARIANT:
+		return "variant";
+	default:
+		return "wire";
+	}
+}
+
+// Firestore encodes 64-bit integers as JSON strings to survive round-tripping
+// through JSON number precision. Recover the integer where possible.
+static bool TryParseFirestoreInteger(const json &val, int64_t &out) {
+	if (val.is_string()) {
+		try {
+			out = std::stoll(val.get<std::string>());
+			return true;
+		} catch (const std::exception &) {
+			return false;
+		}
+	}
+	if (val.is_number_integer()) {
+		out = val.get<int64_t>();
+		return true;
+	}
+	return false;
+}
+
+json UnwrapFirestoreValue(const json &fv) {
+	if (fv.contains("nullValue")) {
+		return nullptr;
+	}
+	if (fv.contains("stringValue")) {
+		return fv["stringValue"];
+	}
+	if (fv.contains("integerValue")) {
+		int64_t parsed;
+		if (TryParseFirestoreInteger(fv["integerValue"], parsed)) {
+			return parsed;
+		}
+		return fv["integerValue"]; // unparseable: keep the raw form rather than lose it
+	}
+	if (fv.contains("doubleValue")) {
+		return fv["doubleValue"];
+	}
+	if (fv.contains("booleanValue")) {
+		return fv["booleanValue"];
+	}
+	// Timestamps, references and bytes have no native JSON counterpart; keep
+	// their Firestore textual form (ISO-8601, document path, base64).
+	if (fv.contains("timestampValue")) {
+		return fv["timestampValue"];
+	}
+	if (fv.contains("referenceValue")) {
+		return fv["referenceValue"];
+	}
+	if (fv.contains("bytesValue")) {
+		return fv["bytesValue"];
+	}
+	if (fv.contains("geoPointValue")) {
+		const auto &geo = fv["geoPointValue"];
+		json out = json::object();
+		out["latitude"] = geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0;
+		out["longitude"] = geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0;
+		return out;
+	}
+	if (fv.contains("arrayValue")) {
+		json out = json::array();
+		if (fv["arrayValue"].contains("values")) {
+			for (const auto &elem : fv["arrayValue"]["values"]) {
+				out.push_back(UnwrapFirestoreValue(elem));
+			}
+		}
+		return out;
+	}
+	if (fv.contains("mapValue")) {
+		json out = json::object();
+		if (fv["mapValue"].contains("fields")) {
+			const auto &fields = fv["mapValue"]["fields"];
+			for (auto it = fields.begin(); it != fields.end(); ++it) {
+				out[it.key()] = UnwrapFirestoreValue(it.value());
+			}
+		}
+		return out;
+	}
+	return fv; // unrecognised: pass through untouched
+}
+
+VariantValue FirestoreValueToVariant(const json &fv) {
+	if (fv.contains("nullValue")) {
+		return VariantValue::NullValue();
+	}
+	if (fv.contains("stringValue")) {
+		return VariantValue(Value(fv["stringValue"].get<std::string>()));
+	}
+	if (fv.contains("integerValue")) {
+		int64_t parsed;
+		if (TryParseFirestoreInteger(fv["integerValue"], parsed)) {
+			return VariantValue(Value::BIGINT(parsed));
+		}
+		return VariantValue(Value(fv["integerValue"].dump()));
+	}
+	if (fv.contains("doubleValue")) {
+		return VariantValue(Value::DOUBLE(fv["doubleValue"].get<double>()));
+	}
+	if (fv.contains("booleanValue")) {
+		return VariantValue(Value::BOOLEAN(fv["booleanValue"].get<bool>()));
+	}
+	if (fv.contains("timestampValue")) {
+		// Keep the parsed timestamp so variant_typeof reports TIMESTAMP rather
+		// than VARCHAR; fall back to the raw text when it will not parse.
+		std::string ts_str = fv["timestampValue"].get<std::string>();
+		std::string normalised = ts_str;
+		if (!normalised.empty() && normalised.back() == 'Z') {
+			normalised.pop_back();
+		}
+		size_t t_pos = normalised.find('T');
+		if (t_pos != std::string::npos) {
+			normalised[t_pos] = ' ';
+		}
+		try {
+			return VariantValue(Value::TIMESTAMP(Timestamp::FromString(normalised, false)));
+		} catch (const std::exception &) {
+			return VariantValue(Value(ts_str));
+		}
+	}
+	if (fv.contains("referenceValue")) {
+		return VariantValue(Value(fv["referenceValue"].get<std::string>()));
+	}
+	if (fv.contains("bytesValue")) {
+		return VariantValue(Value::BLOB(Base64Decode(fv["bytesValue"].get<std::string>())));
+	}
+	if (fv.contains("geoPointValue")) {
+		const auto &geo = fv["geoPointValue"];
+		VariantValue obj(VariantValueType::OBJECT);
+		obj.AddChild("latitude", VariantValue(Value::DOUBLE(geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0)));
+		obj.AddChild("longitude",
+		             VariantValue(Value::DOUBLE(geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0)));
+		return obj;
+	}
+	if (fv.contains("arrayValue")) {
+		VariantValue arr(VariantValueType::ARRAY);
+		if (fv["arrayValue"].contains("values")) {
+			const auto &values = fv["arrayValue"]["values"];
+			arr.ReserveItems(values.size());
+			for (const auto &elem : values) {
+				arr.AddItem(FirestoreValueToVariant(elem));
+			}
+		}
+		return arr;
+	}
+	if (fv.contains("mapValue")) {
+		VariantValue obj(VariantValueType::OBJECT);
+		if (fv["mapValue"].contains("fields")) {
+			const auto &fields = fv["mapValue"]["fields"];
+			for (auto it = fields.begin(); it != fields.end(); ++it) {
+				obj.AddChild(it.key(), FirestoreValueToVariant(it.value()));
+			}
+		}
+		return obj;
+	}
+	return VariantValue(Value(fv.dump()));
+}
+
+LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type, FirestoreMapEncoding map_encoding) {
 	if (firestore_type == "stringValue")
 		return LogicalType::VARCHAR;
 	if (firestore_type == "integerValue")
@@ -132,8 +310,14 @@ LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type) {
 	}
 
 	if (firestore_type == "mapValue") {
-		// Nested maps become JSON strings
-		return LogicalType::VARCHAR;
+		switch (map_encoding) {
+		case FirestoreMapEncoding::VARIANT:
+			return LogicalType::VARIANT();
+		case FirestoreMapEncoding::JSON:
+			return LogicalType::JSON();
+		default:
+			return LogicalType::VARCHAR; // raw Firestore wire JSON
+		}
 	}
 
 	// Default fallback
@@ -146,7 +330,8 @@ LogicalType InferDuckDBType(const json &firestore_value) {
 	return FirestoreTypeToDuckDB(type_name);
 }
 
-Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
+Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type,
+                             FirestoreMapEncoding map_encoding) {
 	if (IsFirestoreNull(fv)) {
 		return Value(target_type); // NULL value with proper type
 	}
@@ -279,7 +464,7 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
 					}
 				} else if (elem.contains("arrayValue")) {
 					// Nested arrays - recursively convert to LIST
-					Value nested = FirestoreValueToDuckDB(elem, LogicalType::LIST(element_type));
+					Value nested = FirestoreValueToDuckDB(elem, LogicalType::LIST(element_type), map_encoding);
 					// For nested arrays in a VARCHAR list, serialize to JSON
 					if (element_type.id() == LogicalTypeId::VARCHAR) {
 						// Convert list to JSON array string
@@ -342,7 +527,11 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type) {
 	}
 
 	if (fv.contains("mapValue")) {
-		// Convert nested map to JSON string
+		if (map_encoding == FirestoreMapEncoding::JSON) {
+			return Value(UnwrapFirestoreValue(fv).dump());
+		}
+		// WIRE: the Firestore payload verbatim, type wrappers and all.
+		// (VARIANT never reaches here -- the scanner builds those per chunk.)
 		if (fv["mapValue"].contains("fields")) {
 			return Value(fv["mapValue"]["fields"].dump());
 		}
@@ -505,7 +694,8 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
 	}
 }
 
-void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type) {
+void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type,
+                    FirestoreMapEncoding map_encoding) {
 	if (IsFirestoreNull(firestore_value)) {
 		FlatVector::SetNull(vector, index, true);
 		return;
@@ -515,7 +705,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 	const LogicalType &actual_type = vector.GetType();
 
 	// Convert the Firestore value using actual vector type
-	Value converted = FirestoreValueToDuckDB(firestore_value, actual_type);
+	Value converted = FirestoreValueToDuckDB(firestore_value, actual_type, map_encoding);
 
 	// Handle type mismatch: Firestore documents can have inconsistent types
 	// If the converted value type doesn't match the actual vector type, try to handle gracefully

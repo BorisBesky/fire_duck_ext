@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/variant_value.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <string>
@@ -28,16 +29,54 @@ using json = nlohmann::json;
 LogicalType InferDuckDBType(const json &firestore_value);
 
 // Infer DuckDB type from Firestore type name
-LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type);
+// How a Firestore mapValue is surfaced to DuckDB.
+//
+// Firestore maps are schemaless: keys and value types vary per document, so no
+// fixed column type describes them all. These are the three encodings the
+// scanner can produce, selected with the `map_encoding` named parameter.
+enum class FirestoreMapEncoding : uint8_t {
+	// VARCHAR holding the raw Firestore wire JSON, type wrappers included:
+	//   {"a":{"stringValue":"x"}}
+	// Leaves need paths like $.a.mapValue.fields.b.stringValue. Historical
+	// default, kept so existing queries keep working.
+	WIRE,
+	// VARCHAR (JSON alias) holding natural JSON: {"a":"x"}. Leaf paths become
+	// $.a.b and integers are numbers, but every access re-parses the string.
+	JSON,
+	// Native DuckDB VARIANT: dot access (payload.a.b), per-value types via
+	// variant_typeof, and no fixed schema -- differing keys and differing types
+	// at the same path across documents are all preserved.
+	VARIANT,
+};
+
+// Parse a `map_encoding` parameter value. Throws on an unknown name.
+FirestoreMapEncoding ParseMapEncoding(const std::string &name);
+const char *MapEncodingName(FirestoreMapEncoding encoding);
+
+LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type,
+                                  FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
+
+// Strip Firestore's type wrappers, yielding natural JSON.
+// {"a":{"integerValue":"1"}} -> {"a":1}
+json UnwrapFirestoreValue(const json &firestore_value);
+
+// Build a DuckDB VariantValue from a Firestore value, preserving per-value
+// types and arbitrary nesting.
+VariantValue FirestoreValueToVariant(const json &firestore_value);
 
 // Convert Firestore JSON value to DuckDB Value
-Value FirestoreValueToDuckDB(const json &firestore_value, const LogicalType &target_type);
+Value FirestoreValueToDuckDB(const json &firestore_value, const LogicalType &target_type,
+                             FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 
 // Convert DuckDB Value to Firestore JSON format
 json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type);
 
 // Set a value in a DuckDB vector from Firestore JSON
-void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type);
+// Note: VARIANT columns are NOT written here. DuckDB builds a VARIANT vector
+// from a whole chunk at once (VariantValue::ToVARIANT), so the scanner
+// accumulates VariantValues per row and converts once per chunk.
+void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type,
+                    FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 
 // Column information inferred from documents
 struct InferredColumn {

@@ -32,6 +32,10 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Show missing/phantom documents (documents with no fields, only subcollections)
 	bool show_missing = true;
 
+	// How mapValue fields are surfaced. Defaults to WIRE so existing queries
+	// that reach into $.x.mapValue.fields.y keep working.
+	FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE;
+
 	// Document path mode: when the path has even segments (e.g. "artifacts/default-app-id"),
 	// we list subcollections during execution and return them as virtual __document_id rows.
 	bool is_document_path = false;

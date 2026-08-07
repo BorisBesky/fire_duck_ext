@@ -334,7 +334,30 @@ def group_wire():
     return [r]
 
 
+def group_map_encoding():
+    """
+    Compare the three map_encoding modes on map-shaped collections.
+
+    All three run the same materialising query, so the difference is purely the
+    cost of producing the payload column: `.dump()` of the wire format (wire),
+    a recursive unwrap then `.dump()` (json), or building a VariantValue tree
+    and one ToVARIANT per chunk (variant).
+    """
+    n = 20000
+    rows = []
+    for label, coll in [("map depth 1", f"bench_map_1_{n}"),
+                        ("map depth 4", f"bench_map_4_{n}"),
+                        ("map depth 8", f"bench_map_8_{n}"),
+                        ("map 16 leaves flat", f"bench_mapwide_16_{n}")]:
+        for enc in ("wire", "json", "variant"):
+            rows.append(measure(f"{label} [{enc}]",
+                                materializing_scan(coll, extra=f"map_encoding:='{enc}'"),
+                                group="map-encoding"))
+    return rows
+
+
 GROUPS = {
+    "map-encoding": group_map_encoding,
     "scaling": group_scaling,
     "nested": group_nested,
     "map-depth": group_map_depth,

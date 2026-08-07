@@ -271,6 +271,7 @@ SELECT * FROM firestore_scan('users', database:='my-other-db');
 | `scan_limit` | BIGINT | Maximum number of rows to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. SQL `LIMIT` can also be pushed down automatically, and named `scan_limit` takes precedence when both are present. |
 | `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). SQL `ORDER BY` can also be pushed down automatically, and named `order_by` takes precedence when both are present. Multi-field ordering requires a composite index. |
 | `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
+| `map_encoding` | VARCHAR | How Firestore `map` fields are surfaced: `'wire'` (default), `'json'`, or `'variant'`. See [Map Encoding](#map-encoding). |
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
@@ -323,12 +324,47 @@ CALL firestore_insert('users/user1/notes', (
 | boolean | BOOLEAN |
 | timestamp | TIMESTAMP |
 | array | LIST |
-| map | VARCHAR (JSON string) |
+| map | VARCHAR, JSON or VARIANT (see [Map Encoding](#map-encoding)) |
 | vector | ARRAY(DOUBLE, N) |
 | null | NULL |
 | geoPoint | STRUCT(latitude DOUBLE, longitude DOUBLE) |
 | reference | VARCHAR |
 | bytes | BLOB |
+
+### Map Encoding
+
+Firestore maps are schemaless: keys and value types vary from document to
+document, so no single fixed column type describes them all. `map_encoding`
+selects how they are surfaced.
+
+| Mode | Column type | Reaching a leaf |
+|------|-------------|-----------------|
+| `'wire'` (default) | VARCHAR | `json_extract_string(m, '$.a.mapValue.fields.b.stringValue')` |
+| `'json'` | JSON | `json_extract_string(m, '$.a.b')` |
+| `'variant'` | VARIANT | `m.a.b` |
+
+```sql
+-- Default: raw Firestore wire format, type wrappers included
+SELECT payload FROM firestore_scan('events');
+-- {"user":{"mapValue":{"fields":{"id":{"integerValue":"7"}}}}}
+
+-- Natural JSON: type wrappers stripped, integers become numbers
+SELECT payload FROM firestore_scan('events', map_encoding:='json');
+-- {"user":{"id":7}}
+
+-- VARIANT: dot access, per-value types preserved
+SELECT payload.user.id, variant_typeof(payload.user.id)
+FROM firestore_scan('events', map_encoding:='variant');
+-- 7, INT64
+```
+
+`'variant'` is the most faithful representation of Firestore's data model:
+documents with different keys, and documents with *different types at the same
+path*, are all preserved — a row missing the key yields SQL NULL rather than an
+error. `'wire'` remains the default so existing queries keep working.
+
+Maps nested inside arrays follow the same setting; because a LIST child cannot
+itself be VARIANT, `'variant'` renders those as natural JSON strings.
 
 ### Vector Embeddings
 
