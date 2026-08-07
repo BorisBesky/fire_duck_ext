@@ -234,8 +234,8 @@ order and schemas drift over time.
 | # | Change | Evidence | Effort | Status |
 |---|---|---|---|---|
 | 1 | Reuse one `httplib::Client` per host, stored on `FirestoreClient` | 2.7x on WAN A/B | small | **done** |
+| 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | **done** |
 | 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
-| 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | open |
 | 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
 | 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
 | 6 | Decode `mapValue` to `STRUCT`, or at minimum to natural JSON | 2.1x smaller strings, no `.mapValue.fields.` paths | medium | open |
@@ -285,16 +285,58 @@ connections are the scan's client (50 requests), the separate `FirestoreClient`
 that `FirestoreScanBind` builds for schema inference (1), and the harness's own
 reset call — sharing one client between bind and execution would remove one more.
 
+### #2 — gzip (transfer)
+
+`CPPHTTPLIB_ZLIB_SUPPORT` defined alongside `CPPHTTPLIB_OPENSSL_SUPPORT`, plus
+`find_package(ZLIB)` / `ZLIB::ZLIB` and a `zlib` entry in `vcpkg.json`. httplib
+then advertises `Accept-Encoding: gzip, deflate` automatically and inflates
+responses before the extension sees them (`decompress_` already defaulted to
+`true`), so no call-site changes were needed.
+
+50,000-document scan: all 51 requests negotiate gzip, **21.05 MiB → 1.56 MiB
+(13.5x)**.
+
+**Compression is not free, and on a fast link it can lose.** Time depends on
+whether bandwidth or CPU is the constraint:
+
+| link | gzip off | gzip on | effect |
+|---|---|---|---|
+| loopback (unthrottled) | 0.207 s | 0.262 s | **1.27x slower** |
+| 1 Gbps | 0.529 s | 0.283 s | 1.9x faster |
+| 100 Mbps | 2.789 s | 0.503 s | **5.5x faster** |
+
+Loopback has no bandwidth to save, so only the inflate cost shows. That case is
+the Firestore *emulator*; production Firestore is always remote, where the win
+is large. If local-emulator throughput ever matters, this could be made
+conditional on `FIRESTORE_EMULATOR_HOST` — not done, as the absolute cost is
+~55 ms per 50k documents.
+
+No symbol conflict with DuckDB's vendored compression: DuckDB uses `miniz`,
+whose symbols live under `duckdb_miniz`/`mz_*`, not zlib's `inflate`/`deflate`.
+
 ### Verification
 
 - 9 SQL test files, 237 assertions — pass.
 - Full Firebase-emulator integration suite (74 tests, including insert, update,
   delete and batch writes) — pass. This matters because connection reuse changes
   the transport for *every* verb, not just the GETs a scan issues.
-- WASM: the new member, its accessor and the forward declaration are all behind
-  `#ifndef __EMSCRIPTEN__`, and the sole call site is inside the non-WASM branch
-  of `MakeRequest`, so the `HTTPUtil` path is untouched. **Not compile-verified —
-  no emscripten toolchain on this machine.**
+- WASM (`make wasm_eh`, emsdk 3.1.71) — **builds clean and verified**:
+  - `node test/wasm/validate_wasm_module.mjs` — compiles as valid WebAssembly,
+    is a SIDE_MODULE, exports the entrypoint, and **no OpenSSL/socket symbols
+    across 828 imports**.
+  - `node test/wasm/validate_wasm_functional.mjs` — 4 checks pass; the extension
+    installs, loads and registers its functions under DuckDB-WASM.
+  - zlib provably stayed out: zero `zlib` mentions in the WASM build log, no
+    `ZLIB` entries in `build/wasm_eh/CMakeCache.txt`, and 0 zlib symbols in
+    `libfire_duck_ext_extension.a` (the native archive has 10).
+  - By construction: `find_package(ZLIB)` and the `ZLIB::ZLIB` link are inside
+    the existing `if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)` guards,
+    `CPPHTTPLIB_ZLIB_SUPPORT` is defined inside the `#else` (non-WASM) arm of the
+    transport `#ifdef`, `vcpkg.json` marks zlib `"platform": "!emscripten"`, and
+    the keep-alive client, its accessor and the httplib forward declaration are
+    all behind `#ifndef __EMSCRIPTEN__`. The WASM path still reaches the network
+    through DuckDB's `HTTPUtil`, and the browser's `fetch()` negotiates and
+    decodes gzip on its own — so WASM gets compression without linking zlib.
 - `description.yml` and `README.md` reviewed per `CLAUDE.md`: both already
   document `scan_limit` as an honoured fetch limit, so the fix brings the
   implementation in line with the existing text rather than changing it. No

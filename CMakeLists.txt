@@ -9,6 +9,12 @@ set(TARGET_NAME fire_duck_ext)
 # resolved nor linked. Skip resolution for clang-tidy builds which only parse source.
 if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
   find_package(OpenSSL REQUIRED)
+  # zlib backs CPPHTTPLIB_ZLIB_SUPPORT, which lets cpp-httplib request and
+  # transparently inflate gzipped Firestore responses. Same exclusions as
+  # OpenSSL: WASM routes HTTP through DuckDB's HTTPUtil (the browser handles
+  # Content-Encoding itself), and clang-tidy only parses source.
+  # No clash with DuckDB's vendored miniz: those symbols live in duckdb_miniz.
+  find_package(ZLIB REQUIRED)
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -61,10 +67,12 @@ if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
   target_link_libraries(${EXTENSION_NAME}
       OpenSSL::SSL
       OpenSSL::Crypto
+      ZLIB::ZLIB
   )
   target_link_libraries(${LOADABLE_EXTENSION_NAME}
       OpenSSL::SSL
       OpenSSL::Crypto
+      ZLIB::ZLIB
   )
 endif()
 

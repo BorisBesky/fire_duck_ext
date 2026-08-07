@@ -6,6 +6,10 @@
         {
             "name": "openssl",
             "platform": "!emscripten"
+        },
+        {
+            "name": "zlib",
+            "platform": "!emscripten"
         }
     ],
     "vcpkg-configuration": {

@@ -9,6 +9,13 @@
 #else
 // Native builds talk to Firestore directly over httplib + OpenSSL.
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+// Enables transparent response decompression. httplib then advertises
+// "Accept-Encoding: gzip, deflate" on every request and inflates the body
+// before we see it, so nothing downstream changes. Firestore's REST payloads
+// are highly repetitive ({"stringValue":...} per field) and compress ~13x.
+// WASM does not need this: that path goes through DuckDB's HTTPUtil to the
+// browser's fetch(), which negotiates and decodes gzip on its own.
+#define CPPHTTPLIB_ZLIB_SUPPORT
 #include "httplib.h"
 #endif
 #include <sstream>

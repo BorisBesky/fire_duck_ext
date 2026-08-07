@@ -47,6 +47,15 @@ from urllib.parse import urlparse, parse_qs, unquote
 CONNECT_DELAY_MS = float(os.environ.get("MOCK_CONNECT_DELAY_MS", "0"))
 REQUEST_DELAY_MS = float(os.environ.get("MOCK_DELAY_MS", "0"))
 
+# Link bandwidth in megabits/sec, applied to bytes actually put on the wire.
+# Loopback is effectively infinite bandwidth, which makes compression look like
+# pure overhead; throttling reveals the point where sending fewer bytes wins.
+BANDWIDTH_MBPS = float(os.environ.get("MOCK_BANDWIDTH_MBPS", "0"))
+
+# Ignore Accept-Encoding and always send identity. Lets one binary be measured
+# both with and without compression for a clean A/B.
+DISABLE_GZIP = os.environ.get("MOCK_DISABLE_GZIP", "") == "1"
+
 # --------------------------------------------------------------------------
 # Instrumentation
 # --------------------------------------------------------------------------
@@ -318,7 +327,8 @@ class Handler(BaseHTTPRequestHandler):
         if REQUEST_DELAY_MS:
             time.sleep(REQUEST_DELAY_MS / 1000.0)
         uncompressed = len(payload)
-        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+        accepts_gzip = (not DISABLE_GZIP) and \
+            "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
         gzipped = False
         if accepts_gzip and uncompressed > 1024:
             payload = gzip.compress(payload, 5)
@@ -331,6 +341,11 @@ class Handler(BaseHTTPRequestHandler):
                 STATS.gzip_responses += 1
             STATS.bytes_out += len(payload)
             STATS.bytes_out_uncompressed += uncompressed
+
+        # Charge transmission time for the bytes actually sent, so a smaller
+        # (compressed) body genuinely costs less link time.
+        if BANDWIDTH_MBPS:
+            time.sleep(len(payload) * 8.0 / (BANDWIDTH_MBPS * 1_000_000.0))
 
         self.send_response(status)
         self.send_header("Content-Type", ctype)
