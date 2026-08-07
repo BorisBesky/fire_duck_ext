@@ -4,6 +4,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
+#include <set>
+#include <vector>
 
 namespace duckdb {
 
@@ -35,6 +37,23 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// How mapValue fields are surfaced. Defaults to WIRE so existing queries
 	// that reach into $.x.mapValue.fields.y keep working.
 	FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE;
+
+	// Documents sampled to infer the schema. Unset means "use the
+	// firestore_schema_sample_size setting"; <= 0 means every document.
+	std::optional<int64_t> schema_sample_size;
+
+	// Append a trailing __unmapped column carrying fields that are not in the
+	// schema, so data missed by sampling stays reachable.
+	bool unmapped_column = false;
+
+	// Explicit schema supplied via columns:={...}; when set, inference is
+	// skipped entirely (which also avoids the bind-time sampling request).
+	bool has_columns_override = false;
+
+	// Sorted copy of column_names, used to spot fields a document carries but
+	// the schema does not. Sorted so it can be merged against a document's
+	// fields in one linear pass (nlohmann objects iterate in key order).
+	std::vector<std::string> sorted_known_columns;
 
 	// Document path mode: when the path has even segments (e.g. "artifacts/default-app-id"),
 	// we list subcollections during execution and return them as virtual __document_id rows.
@@ -108,6 +127,10 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	idx_t current_index;
 	bool finished;
 	std::string next_page_token;
+
+	// Field names already reported as unmapped, so a long scan warns once per
+	// distinct field rather than once per row.
+	std::set<std::string> reported_unmapped;
 
 	// Running count of rows handed to DuckDB across the whole scan.
 	// `current_index` cannot serve this purpose: it indexes into the *current

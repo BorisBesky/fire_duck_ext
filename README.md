@@ -272,6 +272,9 @@ SELECT * FROM firestore_scan('users', database:='my-other-db');
 | `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). SQL `ORDER BY` can also be pushed down automatically, and named `order_by` takes precedence when both are present. Multi-field ordering requires a composite index. |
 | `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
 | `map_encoding` | VARCHAR | How Firestore `map` fields are surfaced: `'wire'` (default), `'json'`, or `'variant'`. See [Map Encoding](#map-encoding). |
+| `schema_sample_size` | BIGINT | Documents sampled to infer the schema. Default `1000`; `-1` samples every document. Overrides the `firestore_schema_sample_size` setting. See [Schema Inference](#schema-inference-and-unmapped-fields). |
+| `unmapped_column` | BOOLEAN | Append a `__unmapped` column carrying any field not present in the inferred schema. Default: `false`. |
+| `columns` | STRUCT | Declare the schema explicitly (e.g. `columns:={'id':'VARCHAR','score':'BIGINT'}`), skipping inference and its sampling request entirely. |
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
@@ -330,6 +333,45 @@ CALL firestore_insert('users/user1/notes', (
 | geoPoint | STRUCT(latitude DOUBLE, longitude DOUBLE) |
 | reference | VARCHAR |
 | bytes | BLOB |
+
+### Schema Inference and Unmapped Fields
+
+The schema is inferred by sampling documents at bind time. Firestore is
+schemaless and returns documents in `__name__` order, so a field introduced
+later in a collection can fall outside the sample — in which case it is **not**
+a column and its data does not appear in results.
+
+Three controls address this:
+
+```sql
+-- Sample deeper (default 1000; -1 reads every document)
+SELECT * FROM firestore_scan('events', schema_sample_size:=-1);
+
+-- Keep whatever the schema missed, in a catch-all column
+SELECT __unmapped FROM firestore_scan('events', unmapped_column:=true);
+
+-- Skip inference entirely and declare the schema yourself
+SELECT * FROM firestore_scan('events',
+    columns:={'user_id':'VARCHAR', 'score':'BIGINT'});
+```
+
+Whenever a document carries a field the schema does not have, a warning naming
+that field is logged once per scan (set `FIRESTORE_LOG_LEVEL=WARN` to see it),
+so the omission is never silent.
+
+`__unmapped` follows `map_encoding`: `VARIANT` when `map_encoding:='variant'`
+(so `__unmapped.some_field` works), otherwise `JSON`. It is NULL for documents
+that have no extra fields.
+
+The sample size can also be set globally:
+
+```sql
+SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
+```
+
+Note: collection-group scans (`~` prefix) run through `runQuery`, which has no
+page-token pagination, so their sample is always bounded by a single request of
+at most 1000 documents regardless of `schema_sample_size`.
 
 ### Map Encoding
 

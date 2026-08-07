@@ -261,6 +261,81 @@ static std::vector<std::string> FetchDocPathIds(FirestoreClient &client, const s
 	return ids;
 }
 
+// Parse columns:={'name': 'TYPE', ...} into the bind data, bypassing schema
+// inference. Mirrors read_json's "columns" handling
+// (duckdb/extension/json/json_multi_file_info.cpp).
+static void ParseColumnsOverride(ClientContext &context, const Value &value, FirestoreScanBindData &bind_data) {
+	auto &struct_type = value.type();
+	if (struct_type.id() != LogicalTypeId::STRUCT) {
+		throw BinderException("firestore_scan \"columns\" parameter requires a struct as input, e.g. "
+		                      "columns:={'id': 'VARCHAR', 'score': 'BIGINT'}");
+	}
+	auto &struct_children = StructValue::GetChildren(value);
+	for (idx_t i = 0; i < struct_children.size(); i++) {
+		auto &name = StructType::GetChildName(struct_type, i);
+		auto &type_val = struct_children[i];
+		if (type_val.IsNull()) {
+			throw BinderException("firestore_scan \"columns\" type specification cannot be NULL (column '%s')", name);
+		}
+		if (type_val.type().id() != LogicalTypeId::VARCHAR) {
+			throw BinderException("firestore_scan \"columns\" type specification must be VARCHAR (column '%s')", name);
+		}
+		if (name == "__document_id") {
+			// Always emitted as the first column; listing it again would duplicate it.
+			throw BinderException("firestore_scan \"columns\" must not include '__document_id'; it is always present");
+		}
+		bind_data.column_names.push_back(name);
+		bind_data.column_types.push_back(TransformStringToLogicalType(StringValue::Get(type_val), context));
+	}
+	if (bind_data.column_names.empty()) {
+		throw BinderException("firestore_scan \"columns\" parameter needs at least one column");
+	}
+	bind_data.has_columns_override = true;
+}
+
+// Walk the fields a document carries that the schema does not know about.
+// Both sides are sorted -- nlohmann::json objects are std::map-backed so they
+// iterate in key order, and sorted_known_columns is sorted at bind time -- so
+// this is a single linear merge with no hashing and no allocation.
+template <typename FN>
+static void ForEachUnmappedField(const json &fields, const std::vector<std::string> &sorted_known, FN &&callback) {
+	if (!fields.is_object()) {
+		return;
+	}
+	auto known_it = sorted_known.begin();
+	const auto known_end = sorted_known.end();
+	for (auto it = fields.begin(); it != fields.end(); ++it) {
+		const std::string &name = it.key();
+		while (known_it != known_end && *known_it < name) {
+			++known_it;
+		}
+		if (known_it != known_end && *known_it == name) {
+			++known_it; // known column; each name appears once on either side
+			continue;
+		}
+		callback(name, it.value());
+	}
+}
+
+// Append the optional __unmapped catch-all column and record the sorted column
+// list used to spot fields a document has but the schema does not. Must run on
+// every path that produces a schema: columns override, cache hit, and fresh
+// inference alike.
+static void FinalizeScanSchema(FirestoreScanBindData &bind_data, vector<LogicalType> &return_types,
+                               vector<string> &names) {
+	bind_data.sorted_known_columns = bind_data.column_names;
+	std::sort(bind_data.sorted_known_columns.begin(), bind_data.sorted_known_columns.end());
+
+	if (bind_data.unmapped_column) {
+		// Not added to column_names: that vector maps 1:1 onto Firestore fields.
+		// FirestoreScanFunction recognises this column by its index being past the
+		// end of column_names.
+		names.push_back("__unmapped");
+		return_types.push_back(bind_data.map_encoding == FirestoreMapEncoding::VARIANT ? LogicalType::VARIANT()
+		                                                                               : LogicalType::JSON());
+	}
+}
+
 void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	TableFunction scan_func("firestore_scan", {LogicalType::VARCHAR}, // collection name (required)
 	                        FirestoreScanFunction, FirestoreScanBind, FirestoreScanInitGlobal, FirestoreScanInitLocal);
@@ -274,6 +349,11 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
 	scan_func.named_parameters["map_encoding"] = LogicalType::VARCHAR;
+	scan_func.named_parameters["schema_sample_size"] = LogicalType::BIGINT;
+	scan_func.named_parameters["unmapped_column"] = LogicalType::BOOLEAN;
+	// Struct of column name -> type string, e.g. columns:={'id':'VARCHAR'}.
+	// ANY because the struct's own type varies per call (same as read_json).
+	scan_func.named_parameters["columns"] = LogicalType::ANY;
 
 	// Enable projection pushdown for efficiency
 	scan_func.projection_pushdown = true;
@@ -317,6 +397,12 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->show_missing = kv.second.GetValue<bool>();
 		} else if (kv.first == "map_encoding") {
 			result->map_encoding = ParseMapEncoding(StringUtil::Lower(kv.second.GetValue<string>()));
+		} else if (kv.first == "schema_sample_size") {
+			result->schema_sample_size = kv.second.GetValue<int64_t>();
+		} else if (kv.first == "unmapped_column") {
+			result->unmapped_column = kv.second.GetValue<bool>();
+		} else if (kv.first == "columns") {
+			ParseColumnsOverride(context, kv.second, *result);
 		}
 	}
 
@@ -351,10 +437,36 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		return std::move(result);
 	}
 
-	// The encoding changes the inferred column types, so it is part of the key --
-	// otherwise switching map_encoding within a session reuses the wrong schema.
+	// An explicit schema means no inference at all -- and no bind-time sampling
+	// request. column_names/column_types were filled by ParseColumnsOverride.
+	if (result->has_columns_override) {
+		names.push_back("__document_id");
+		return_types.push_back(LogicalType::VARCHAR);
+		for (idx_t i = 0; i < result->column_names.size(); i++) {
+			names.push_back(result->column_names[i]);
+			return_types.push_back(result->column_types[i]);
+		}
+		// No index metadata is fetched here, so filter pushdown stays disabled and
+		// DuckDB applies every predicate itself -- correct, just not pushed down.
+		FinalizeScanSchema(*result, return_types, names);
+		return std::move(result);
+	}
+
+	int64_t sample_size = result->schema_sample_size.has_value() ? result->schema_sample_size.value()
+	                                                             : FirestoreSettings::SchemaSampleSize(context);
+	// Collapse every "sample everything" spelling to one value so equivalent
+	// requests share a cache entry.
+	if (sample_size <= 0) {
+		sample_size = FirestoreSettings::kSampleAllDocuments;
+	}
+
+	// Everything that changes the inferred schema belongs in the key, or a later
+	// query in the same session silently reuses the wrong one. show_missing was
+	// missing here before: it changes which documents inference sees.
 	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
-	                        MapEncodingName(result->map_encoding) + ":" + result->collection;
+	                        MapEncodingName(result->map_encoding) + ":" + std::to_string(sample_size) + ":" +
+	                        (result->show_missing ? "sm1" : "sm0") + ":" +
+	                        (result->unmapped_column ? "um1" : "um0") + ":" + result->collection;
 	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
 		auto &schema_cache = GetSchemaCache();
@@ -391,6 +503,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 					FS_LOG_DEBUG("Index cache restored from cache");
 				}
 
+				FinalizeScanSchema(*result, return_types, names);
 				return std::move(result);
 			}
 		} else if (it != schema_cache.end()) {
@@ -402,7 +515,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Create client and infer schema from collection
 	FirestoreClient client(result->credentials, DatabaseInstance::GetDatabase(context));
-	auto schema = client.InferSchema(result->collection, 100, result->show_missing, result->map_encoding);
+	auto schema = client.InferSchema(result->collection, sample_size, result->show_missing, result->map_encoding);
 
 	// Check if collection exists (has documents)
 	if (schema.empty()) {
@@ -480,6 +593,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->index_cache->default_single_field_enabled = true;
 		}
 	}
+
+	FinalizeScanSchema(*result, return_types, names);
 
 	// Store schema and index cache for future queries
 	{
@@ -927,6 +1042,18 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 		auto &doc = global_state.documents[global_state.current_index];
 
+		// Report fields the schema never saw. Inference only looks at the first
+		// schema_sample_size documents, so a field introduced later would otherwise
+		// vanish from every result with no indication at all.
+		ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns, [&](const std::string &name, const json &) {
+			if (global_state.reported_unmapped.insert(name).second) {
+				FS_LOG_WARN("Field '" + name + "' exists in collection '" + bind_data.collection +
+				            "' but is not in the inferred schema, so it is omitted from results. Raise "
+				            "schema_sample_size (-1 samples every document), pass an explicit columns:={...}, "
+				            "or set unmapped_column:=true to capture it.");
+			}
+		});
+
 		// Set values for each projected column
 		for (idx_t out_col = 0; out_col < bind_data.projected_columns.size(); out_col++) {
 			idx_t src_col = bind_data.projected_columns[out_col];
@@ -953,6 +1080,34 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				}
 				FlatVector::GetData<string_t>(output.data[out_col])[count] =
 				    StringVector::AddString(output.data[out_col], doc_id);
+			} else if (src_col >= bind_data.column_names.size()) {
+				// __unmapped catch-all: every field the schema does not cover.
+				// It sits past the end of column_names because that vector maps
+				// 1:1 onto Firestore fields and this column maps onto none.
+				if (is_variant_col[out_col]) {
+					VariantValue obj(VariantValueType::OBJECT);
+					bool any = false;
+					ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
+					                     [&](const std::string &name, const json &value) {
+						                     obj.AddChild(name, FirestoreValueToVariant(value));
+						                     any = true;
+					                     });
+					// No extra fields -> SQL NULL rather than an empty object.
+					variant_values[out_col].push_back(any ? std::move(obj) : VariantValue());
+				} else {
+					json extras = json::object();
+					ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
+					                     [&](const std::string &name, const json &value) {
+						                     extras[name] = UnwrapFirestoreValue(value);
+					                     });
+					if (extras.empty()) {
+						FlatVector::SetNull(output.data[out_col], count, true);
+					} else {
+						auto str = extras.dump();
+						FlatVector::GetData<string_t>(output.data[out_col])[count] =
+						    StringVector::AddString(output.data[out_col], str);
+					}
+				}
 			} else {
 				// Regular field column
 				const auto &col_name = bind_data.column_names[src_col];

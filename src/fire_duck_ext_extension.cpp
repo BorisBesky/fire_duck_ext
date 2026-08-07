@@ -157,6 +157,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("firestore_schema_cache_ttl", "Schema cache TTL in seconds (0 to disable caching)",
 	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultSchemaCacheTTLSeconds),
 	                          FirestoreSettings::SetSchemaCacheTTLSeconds);
+	config.AddExtensionOption("firestore_schema_sample_size",
+	                          "Documents sampled to infer a collection's schema (-1 samples every document)",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultSchemaSampleSize),
+	                          FirestoreSettings::SetSchemaSampleSize);
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);

@@ -27,6 +27,32 @@ struct FirestoreSettings {
 		parameter = Value::BIGINT(ttl);
 	}
 
+	// Documents sampled to infer a collection's schema.
+	// Firestore caps a single page at 1000, and inference already issues one
+	// request, so 1000 is the deepest sample obtainable for one round trip.
+	// -1 samples every document (paginating until the collection is exhausted).
+	static constexpr int64_t kDefaultSchemaSampleSize = 1000;
+	static constexpr int64_t kSampleAllDocuments = -1;
+
+	static int64_t SchemaSampleSize(const ClientContext &context) {
+		Value sample_value;
+		if (context.TryGetCurrentSetting("firestore_schema_sample_size", sample_value)) {
+			return NormalizeSampleSize(sample_value);
+		}
+		return kDefaultSchemaSampleSize;
+	}
+
+	static void SetSchemaSampleSize(ClientContext &context, SetScope scope, Value &parameter) {
+		parameter = Value::BIGINT(NormalizeSampleSize(parameter));
+	}
+
+	// Any negative value means "sample everything"; 0 would infer an empty
+	// schema, so treat it the same way rather than silently returning no columns.
+	static int64_t NormalizeSampleSize(const Value &value) {
+		auto sample = BigIntValue::Get(value);
+		return sample <= 0 ? kSampleAllDocuments : sample;
+	}
+
 private:
 	static int64_t NormalizeTTL(const Value &value) {
 		auto ttl = BigIntValue::Get(value);

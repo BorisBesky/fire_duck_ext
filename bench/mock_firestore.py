@@ -22,6 +22,7 @@ Collection naming grammar:  bench_<shape>_<param>_<count>
   arrint   <n_elems>    one arrayValue of <n_elems> integers
   vec      <n_dims>     one Firestore vector (__vector__) of <n_dims> doubles
   mixed    <n_fields>   scalar fields whose TYPE varies per document
+  late     <from_idx>   3 base fields; `late_field` appears from document <from_idx>
 
 Control endpoints:
   GET  /__stats   instrumentation counters as JSON
@@ -185,11 +186,11 @@ def make_fields(shape, param, i):
         }
 
     if shape == "late":
-        # Every document has f0..f{param-1}; documents at index >= 500 carry an
-        # extra field. Schema inference only samples the first 100 documents,
-        # so this field is invisible to it.
-        out = {f"f{j}": _scalar(j % 4, i, j) for j in range(param)}
-        if i >= 500:
+        # Three base fields on every document, plus `late_field` only from
+        # document index `param` onwards. Set param above the schema sample size
+        # to reproduce a field that inference cannot see.
+        out = {f"f{j}": _scalar(j % 4, i, j) for j in range(3)}
+        if i >= param:
             out["late_field"] = {"stringValue": f"late-{i}"}
         return out
 

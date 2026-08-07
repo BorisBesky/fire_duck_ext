@@ -138,3 +138,60 @@ Unknown map_encoding 'nope'
 statement error
 SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', map_encoding:=42);
 ----
+
+# ============================================
+# Schema inference: sampling, unmapped fields, explicit columns
+# ============================================
+
+# schema_sample_size accepts a positive bound and -1 ("sample everything").
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', schema_sample_size:=5000);
+----
+
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', schema_sample_size:=-1);
+----
+
+# schema_sample_size must be an integer
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', schema_sample_size:='lots');
+----
+
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', unmapped_column:=true);
+----
+
+# columns must be a struct of name -> type string
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', columns:='not-a-struct');
+----
+requires a struct as input
+
+# ... whose values are type names, not arbitrary values
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', columns:={'id': 42});
+----
+must be VARCHAR
+
+# __document_id is always emitted, so declaring it would duplicate the column
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', columns:={'__document_id': 'VARCHAR'});
+----
+must not include '__document_id'
+
+# An unparseable type name is rejected
+statement error
+SELECT * FROM firestore_scan('c', project_id:='p', api_key:='k', columns:={'id': 'NOSUCHTYPE'});
+----
+
+# The global sample-size setting exists and round-trips
+statement ok
+SET firestore_schema_sample_size = 250;
+
+query I
+SELECT current_setting('firestore_schema_sample_size');
+----
+250
+
+statement ok
+RESET firestore_schema_sample_size;

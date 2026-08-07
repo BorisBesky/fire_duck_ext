@@ -833,20 +833,45 @@ FirestoreClient::InferSchema(const std::string &collection, int64_t sample_size,
                              FirestoreMapEncoding map_encoding) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
-	FirestoreQuery query;
-	query.page_size = std::min(sample_size, static_cast<int64_t>(1000));
-	query.show_missing = show_missing;
+	// sample_size <= 0 means "every document".
+	const bool sample_all = sample_size <= 0;
+	const int64_t kMaxPageSize = 1000; // Firestore's per-page cap
 
 	FirestoreListResponse response;
 
-	// Check if this is a collection group query (starts with ~)
 	if (!collection.empty() && collection[0] == '~') {
-		// Collection group query - extract collection ID
-		std::string collection_id = collection.substr(1);
-		response = CollectionGroupQuery(collection_id, query);
+		// Collection group: runQuery has no page-token pagination, so the whole
+		// sample must come from a single request bounded by `limit`.
+		FirestoreQuery query;
+		query.show_missing = show_missing;
+		query.page_size = sample_all ? kMaxPageSize : std::min(sample_size, kMaxPageSize);
+		response = CollectionGroupQuery(collection.substr(1), query);
 	} else {
-		// Normal collection query
-		response = ListDocuments(collection, query);
+		// Page until we have enough documents or the collection runs out.
+		// Previously this issued exactly one request, so any sample_size above
+		// the page size silently sampled only the first page.
+		std::optional<std::string> page_token;
+		do {
+			FirestoreQuery query;
+			query.show_missing = show_missing;
+			query.page_token = page_token;
+			if (sample_all) {
+				query.page_size = kMaxPageSize;
+			} else {
+				int64_t remaining = sample_size - static_cast<int64_t>(response.documents.size());
+				query.page_size = std::min(remaining, kMaxPageSize);
+			}
+
+			auto page = ListDocuments(collection, query);
+			if (page.documents.empty()) {
+				break;
+			}
+			response.documents.insert(response.documents.end(), std::make_move_iterator(page.documents.begin()),
+			                          std::make_move_iterator(page.documents.end()));
+
+			page_token = page.next_page_token.empty() ? std::nullopt : std::optional<std::string>(page.next_page_token);
+		} while (page_token.has_value() &&
+		         (sample_all || static_cast<int64_t>(response.documents.size()) < sample_size));
 	}
 
 	// Collect all field names and their types

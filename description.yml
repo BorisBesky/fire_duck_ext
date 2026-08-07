@@ -254,7 +254,30 @@ docs:
 
     ## Schema Inference
     When you call `firestore_scan()`, the extension automatically infers the
-    schema by sampling up to 100 documents from the collection. For each
+    schema by sampling up to 1000 documents from the collection (configurable
+    with `schema_sample_size:=` or the `firestore_schema_sample_size` setting;
+    `-1` samples every document).
+
+    Firestore is schemaless and returns documents in `__name__` order, so a
+    field introduced later in a collection can fall outside the sample and
+    therefore not become a column. Three controls address this:
+
+    - `schema_sample_size:=N` (or `-1`) samples more deeply.
+    - `unmapped_column:=true` appends a `__unmapped` column holding any field
+      not in the schema. It follows `map_encoding` — VARIANT under
+      `map_encoding:='variant'`, otherwise JSON — and is NULL when a document
+      has no extra fields.
+    - `columns:={'name':'TYPE', ...}` declares the schema explicitly and skips
+      inference (and its sampling request) altogether.
+
+    Whenever a document carries a field the schema lacks, a warning naming that
+    field is logged once per scan, so the omission is never silent.
+
+    Collection-group scans (`~` prefix) use `runQuery`, which has no page-token
+    pagination, so their sample is bounded by a single request of at most 1000
+    documents regardless of `schema_sample_size`.
+
+    Historically the sample was a fixed 100 documents. For each
     field, it determines the DuckDB type using a voting system: the most
     common non-null Firestore type across the sampled documents wins. Fields
     that do not appear in every sampled document are marked nullable.

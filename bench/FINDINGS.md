@@ -239,7 +239,7 @@ order and schemas drift over time.
 | 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
 | 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
 | 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
-| 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | open |
+| 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | **done** |
 | 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | open |
 
 ---
@@ -367,9 +367,59 @@ The schema cache key includes the encoding — without that, switching
 Known limitation: a LIST child cannot be VARIANT, so maps nested *inside arrays*
 render as natural JSON strings under `'variant'` rather than as VARIANT.
 
+### #7 — schema sampling (silent field loss)
+
+`InferSchema` issued exactly one page request capped at `min(sample_size, 1000)`
+with the caller passing 100 — so a field appearing later simply was not a
+column, with no error and no warning.
+
+Four changes:
+
+1. **Real pagination + configurable depth.** `InferSchema` now pages until the
+   sample is filled or the collection is exhausted. `schema_sample_size:=N`
+   (named parameter) or `firestore_schema_sample_size` (setting); `-1` samples
+   every document. **Default raised 100 → 1000**, which costs the same single
+   request it already made.
+2. **A warning on every unmapped field**, once per distinct name per scan.
+3. **`unmapped_column:=true`** appends a `__unmapped` catch-all, typed to follow
+   `map_encoding` (VARIANT or JSON), NULL when a document has no extra fields.
+4. **`columns:={'name':'TYPE'}`** declares the schema outright, skipping
+   inference and its request.
+
+Verified against the mock (`late` shape now takes the appearance index as its
+parameter, so a field can be placed past the sample window):
+
+| case | before | after |
+|---|---|---|
+| field at doc 500 / 2000 (the reported bug) | absent | **in the schema** |
+| field at doc 1500 / 3000, default sample | absent, silent | absent but **warns by name** |
+| …with `schema_sample_size:=-1` | absent | **in the schema** |
+| …with `unmapped_column:=true` | absent | **recoverable** via `__unmapped` |
+
+`columns:={...}` also removes the bind-time sampling request: 4 requests /
+4,000 documents → 3 requests / 3,000.
+
+**Cost of the always-on detection: none measurable.** The check is a linear
+merge of the document's fields against a sorted column list — both sides are
+already key-sorted (nlohmann objects are `std::map`-backed), so there is no
+hashing or allocation. 200,000 documents × 8 columns, gzip disabled to match the
+original baseline conditions: **1.026–1.054 s vs the 1.040 s baseline**, i.e.
+within noise. (A naive reading of the gzip-enabled scaling run suggests +20%,
+but that delta is gzip's loopback decompression, not this check.)
+
+The schema cache key gained `schema_sample_size`, `unmapped_column` and
+`show_missing` — the last of which was **already missing before this change**,
+so two scans differing only in `show_missing` previously shared a cache entry.
+Verified in one session: default → 4 columns, `-1` → 5, `unmapped_column` → 5,
+`show_missing:=false` → 4, default again → 4.
+
+Known limitation: collection-group scans (`~`) use `runQuery`, which has no
+page-token pagination, so their sample stays bounded by one request of ≤1000
+documents whatever `schema_sample_size` says. Documented.
+
 ### Verification
 
-- 9 SQL test files, 242 assertions (5 new `map_encoding` cases) — pass.
+- 9 SQL test files, 253 assertions (11 new sampling/columns cases) — pass.
 - Full Firebase-emulator integration suite (74 tests, including insert, update,
   delete and batch writes) — pass. This matters because connection reuse changes
   the transport for *every* verb, not just the GETs a scan issues.

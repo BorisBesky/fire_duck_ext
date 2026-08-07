@@ -77,8 +77,10 @@ def shape_columns(collection):
     """Data columns a synthetic collection exposes (mirrors mock_firestore)."""
     _prefix, shape, param, _count = collection.split("_")
     param = int(param)
-    if shape in ("flat", "wide", "mixed", "late"):
+    if shape in ("flat", "wide", "mixed"):
         return [f"f{j}" for j in range(param)]
+    if shape == "late":
+        return ["f0", "f1", "f2"]  # param is the appearance index, not a field count
     if shape in ("map", "mapwide"):
         return ["doc_no", "payload"]
     if shape == "arr":

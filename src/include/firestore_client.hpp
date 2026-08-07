@@ -109,8 +109,11 @@ public:
 	// Infer schema from sample documents
 	// Use ~ prefix for collection group queries (e.g., "~profile")
 	// Returns pairs of (field_name, DuckDB LogicalType)
+	// sample_size <= 0 samples every document, paginating until the collection
+	// is exhausted. Collection-group scans (~ prefix) cannot paginate and are
+	// always bounded by a single request.
 	std::vector<std::pair<std::string, LogicalType>> InferSchema(
-	    const std::string &collection, int64_t sample_size = 100, bool show_missing = true,
+	    const std::string &collection, int64_t sample_size = 1000, bool show_missing = true,
 	    FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
