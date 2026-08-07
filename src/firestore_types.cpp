@@ -242,7 +242,8 @@ VariantValue FirestoreValueToVariant(const json &fv) {
 	if (fv.contains("geoPointValue")) {
 		const auto &geo = fv["geoPointValue"];
 		VariantValue obj(VariantValueType::OBJECT);
-		obj.AddChild("latitude", VariantValue(Value::DOUBLE(geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0)));
+		obj.AddChild("latitude",
+		             VariantValue(Value::DOUBLE(geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0)));
 		obj.AddChild("longitude",
 		             VariantValue(Value::DOUBLE(geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0)));
 		return obj;
@@ -330,8 +331,7 @@ LogicalType InferDuckDBType(const json &firestore_value) {
 	return FirestoreTypeToDuckDB(type_name);
 }
 
-Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type,
-                             FirestoreMapEncoding map_encoding) {
+Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type, FirestoreMapEncoding map_encoding) {
 	if (IsFirestoreNull(fv)) {
 		return Value(target_type); // NULL value with proper type
 	}

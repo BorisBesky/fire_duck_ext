@@ -465,8 +465,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	// missing here before: it changes which documents inference sees.
 	std::string cache_key = result->credentials->project_id + ":" + result->credentials->database_id + ":" +
 	                        MapEncodingName(result->map_encoding) + ":" + std::to_string(sample_size) + ":" +
-	                        (result->show_missing ? "sm1" : "sm0") + ":" +
-	                        (result->unmapped_column ? "um1" : "um0") + ":" + result->collection;
+	                        (result->show_missing ? "sm1" : "sm0") + ":" + (result->unmapped_column ? "um1" : "um0") +
+	                        ":" + result->collection;
 	int64_t ttl_seconds = FirestoreSettings::SchemaCacheTTLSeconds(context);
 	{
 		auto &schema_cache = GetSchemaCache();
@@ -1117,11 +1117,11 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 					// below. A default-constructed VariantValue is MISSING, which
 					// ToVARIANT renders as SQL NULL.
 					auto field_it = doc.fields.find(col_name);
-					variant_values[out_col].push_back(
-					    field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it) : VariantValue());
+					variant_values[out_col].push_back(field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it)
+					                                                               : VariantValue());
 				} else if (doc.fields.contains(col_name)) {
-					SetDuckDBValue(output.data[out_col], count, doc.fields[col_name],
-					               bind_data.column_types[src_col], bind_data.map_encoding);
+					SetDuckDBValue(output.data[out_col], count, doc.fields[col_name], bind_data.column_types[src_col],
+					               bind_data.map_encoding);
 				} else {
 					FlatVector::SetNull(output.data[out_col], count, true);
 				}

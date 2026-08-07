@@ -828,9 +828,9 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 	}
 }
 
-std::vector<std::pair<std::string, LogicalType>>
-FirestoreClient::InferSchema(const std::string &collection, int64_t sample_size, bool show_missing,
-                             FirestoreMapEncoding map_encoding) {
+std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
+                                                                              int64_t sample_size, bool show_missing,
+                                                                              FirestoreMapEncoding map_encoding) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
 	// sample_size <= 0 means "every document".

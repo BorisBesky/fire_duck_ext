@@ -112,9 +112,9 @@ public:
 	// sample_size <= 0 samples every document, paginating until the collection
 	// is exhausted. Collection-group scans (~ prefix) cannot paginate and are
 	// always bounded by a single request.
-	std::vector<std::pair<std::string, LogicalType>> InferSchema(
-	    const std::string &collection, int64_t sample_size = 1000, bool show_missing = true,
-	    FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
+	std::vector<std::pair<std::string, LogicalType>>
+	InferSchema(const std::string &collection, int64_t sample_size = 1000, bool show_missing = true,
+	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,
