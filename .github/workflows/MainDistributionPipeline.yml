@@ -4,6 +4,17 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    # Doc-only pushes skip the build+test matrix. Deliberately NOT applied to
+    # pull_request: the required-status-check contexts on main (e.g. "Build
+    # extension binaries / MacOS") are jobs *inside* the reusable workflows
+    # this file calls. If the calling job here never runs, those contexts
+    # never get a status posted at all -- not "skipped", just permanently
+    # missing -- and with required_status_checks.strict=true a doc-only PR
+    # would sit stuck forever. Direct pushes to main aren't affected by branch
+    # protection here (enforce_admins=false), so this is safe for that path only.
+    paths-ignore:
+      - 'README.md'
+      - 'description.yml'
   pull_request:
   workflow_dispatch:
 

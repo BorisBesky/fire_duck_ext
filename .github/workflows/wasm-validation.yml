@@ -11,6 +11,12 @@
 name: WASM validation
 on:
   push:
+    # Doc-only pushes skip the WASM build+validate. Not a required status
+    # check on main today, so this is low-risk either way -- kept push-only
+    # (matching MainDistributionPipeline.yml) for consistency.
+    paths-ignore:
+      - 'README.md'
+      - 'description.yml'
   pull_request:
   workflow_dispatch:
 
