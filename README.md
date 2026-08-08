@@ -63,9 +63,11 @@ call firestore_update_batch('users', getvariable('ids'), 'status', 'reviewed');
 
 ### Service Account (Recommended for production)
 
-`SERVICE_ACCOUNT_JSON` accepts either a **file path** or the **full JSON text** of a service account key.
+`SERVICE_ACCOUNT_JSON` must be a **file path** to a service account key file
+readable by the process running DuckDB. The extension opens and reads that
+file itself — it does **not** accept the JSON content inline; passing JSON
+text directly fails with `Failed to open service account file: {...}`.
 
-**File path:**
 ```sql
 CREATE SECRET prod_firestore (
     TYPE firestore,
@@ -74,23 +76,18 @@ CREATE SECRET prod_firestore (
 );
 ```
 
-**Inline JSON:**
-```sql
-CREATE SECRET prod_firestore (
-    TYPE firestore,
-    PROJECT_ID 'my-project',
-    SERVICE_ACCOUNT_JSON '{
-        "type": "service_account",
-        "project_id": "my-project",
-        "private_key_id": "key123abc",
-        "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
-        "client_email": "firestore-sa@my-project.iam.gserviceaccount.com",
-        "client_id": "123456789",
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token"
-    }'
-);
-```
+> **Never expose a service-account key to a browser, JavaScript, or SQL text
+> that could be inspected.** This key authenticates via Google Cloud IAM, and
+> requests made with it **bypass Firestore Security Rules entirely** — see
+> [Admin-only features](#admin-only-features-index-metadata). A leaked key can
+> be replayed by any native client (not just this extension) with the full
+> access its IAM role grants, regardless of what your Security Rules say.
+> Service-account auth is rejected outright on the
+> [WebAssembly build](#webassembly-duckdb-wasm) for the
+> same reason. If you need authenticated, Security-Rules-respecting access
+> from a browser, use
+> [Firebase Auth user](#firebase-auth-user-authenticated-browser-safe)
+> credentials instead — never a service account.
 
 ### API Key (For development/testing)
 
@@ -106,7 +103,7 @@ CREATE SECRET dev_firestore (
 
 ### Firebase Auth User (authenticated; browser-safe)
 
-Firebase user authentication gives **authenticated** access that respects Security Rules (`request.auth != null`), unlike a bare API key. It needs no OpenSSL, so it also works in the WebAssembly/browser build. Provide the public Web `API_KEY` plus a sign-in method.
+Firebase user authentication gives **authenticated** access that respects Security Rules (`request.auth != null`), unlike a bare API key. It needs no OpenSSL, so it also works in the [WebAssembly/browser build](#webassembly-duckdb-wasm). Provide the public Web `API_KEY` plus a sign-in method.
 
 **Email / password:**
 ```sql
@@ -242,6 +239,22 @@ CREATE SECRET emulator (
 | `firestore_array_union('collection', 'doc_id', 'field', ['v1', ...])` | Add to array (no duplicates) |
 | `firestore_array_remove('collection', 'doc_id', 'field', ['v1', ...])` | Remove from array |
 | `firestore_array_append('collection', 'doc_id', 'field', ['v1', ...])` | Append to array |
+| `firestore_connect('database')` | Set the active database for the session; used by subsequent calls until `firestore_disconnect()` |
+| `firestore_disconnect()` | Clear the session's active database |
+
+## Batch Operations
+
+`firestore_update_batch()` and `firestore_delete_batch()` group writes into requests of up to 500 operations each using Firestore's `batchWrite` API. `batchWrite` is **not atomic** — individual writes within a batch may succeed or fail independently. If `batchWrite` is unavailable (API key auth does not support it), the extension falls back to individual requests automatically.
+
+```sql
+-- Batch update: mark all pending users as reviewed
+SET VARIABLE ids = (
+    SELECT list(__document_id)
+    FROM firestore_scan('users')
+    WHERE status = 'pending'
+);
+CALL firestore_update_batch('users', getvariable('ids'), 'status', 'reviewed');
+```
 
 ## Named Parameters
 
@@ -333,6 +346,14 @@ CALL firestore_insert('users/user1/notes', (
 | geoPoint | STRUCT(latitude DOUBLE, longitude DOUBLE) |
 | reference | VARCHAR |
 | bytes | BLOB |
+
+### Null Semantics
+
+Both missing fields and explicit Firestore null values appear as `NULL` in DuckDB — there is no way to distinguish the two on read.
+
+Writing `NULL` to a field sets it to an explicit Firestore null value; it does not delete the field from the document.
+
+`WHERE field IS NULL` is not pushed down to Firestore: Firestore's `IS_NULL` operator only matches fields that exist and are explicitly null, while DuckDB also treats *missing* fields as `NULL`, so pushing the filter down would miss documents where the field is simply absent. `WHERE field IS NOT NULL` is pushed down safely.
 
 ### Schema Inference and Unmapped Fields
 
@@ -509,6 +530,18 @@ EXPLAIN SELECT * FROM firestore_scan('users') WHERE status = 'active' AND age > 
 -- Shows "Firestore Pushed Filters: status EQUAL 'active', age GREATER_THAN 25"
 ```
 
+## Collection Group Queries
+
+Use the `~collection` prefix to query across every subcollection with a given name, regardless of its parent document. `firestore_scan('~orders')` reads all documents from every subcollection named `orders` anywhere in the database — for example `users/user1/orders` and `users/user2/orders` together.
+
+```sql
+SELECT __document_id, product, quantity
+FROM firestore_scan('~orders')
+WHERE status = 'shipped';
+```
+
+Composite-index detection for multi-field `ORDER BY` on a collection group requires service-account auth — see [Admin-only features](#admin-only-features-index-metadata).
+
 ## Collection ID Listings
 
 When `firestore_scan()` is given a document path instead of a collection path, it lists that document's direct subcollection IDs instead of reading documents. This is useful for discovering unknown nested collection names.
@@ -575,6 +608,18 @@ When a collection contains only phantom documents (no fields at all), the result
 >
 > The 403 is reported for the scan's schema-inference `listDocuments` request (it carries
 > `showMissing=true&pageSize=100`), not for your documents — your read rules are unaffected.
+
+## WebAssembly (DuckDB-WASM)
+
+The extension builds and runs under DuckDB-WASM (e.g. in the browser). HTTP is routed through DuckDB's `HTTPUtil` instead of raw sockets, so reads, filtered `:runQuery` scans (including collection groups), and writes all work in the browser.
+
+Authentication in WASM is limited to **API key** and **Firebase Auth user** credentials (email/password, anonymous, or a pre-obtained ID token) — see [Authentication](#authentication). **Service-account** auth is rejected outright on WASM; if you're building a browser app, use Firebase Auth user credentials for Security-Rules-respecting access.
+
+Two consequences of rules-governed (API key / Firebase user) access apply on any platform, but matter most for browser apps:
+- `show_missing := true` (the default) lists phantom/missing documents, which is an Admin-only operation; Firestore returns `403 PERMISSION_DENIED` over rules-governed access even when rules allow the read. Pass `show_missing := false` — see [Missing Documents](#missing-documents).
+- The Firestore Admin API (index metadata) is reachable only with a service account; for API-key / Firebase-user auth the extension skips it and assumes default single-field indexes — see [Admin-only features](#admin-only-features-index-metadata).
+
+The WASM build must match the DuckDB version bundled by the `@duckdb/duckdb-wasm` runtime it is loaded into — the C++ extension ABI is not stable across versions.
 
 ## Building from Source
 
