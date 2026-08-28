@@ -237,13 +237,14 @@ order and schemas drift over time.
 | 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | **done** |
 | 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
 | 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | **done** |
-| 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
+| 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | **superseded by #12** |
 | 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
 | 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | **done** |
 | 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | **done** |
 | 9 | Paginate collection-group scans | correctness: silently truncated at 1000 documents | small | **done** |
 | 10 | Stream schema inference instead of buffering the sample | `schema_sample_size:=-1` held the whole collection at bind time | small | **done** |
 | 11 | Configurable + self-limiting page size (`page_size`, `firestore_page_byte_budget`) | a page of 1 MiB documents is ~1 GiB before parsing | small | **done** |
+| 12 | Parallel scan by `__name__` range | 2.33 s -> 1.23 s at 50 ms RTT, 20k documents | large | **done** |
 
 ---
 
@@ -623,3 +624,78 @@ counting early, and the result is capped client-side regardless.
 A deployment without the endpoint (older emulators, restricted credentials)
 answers 501; the scan falls back to reading documents, which is slower and
 never wrong.
+
+---
+
+## 8. Implemented: #12 — parallel scan by key range
+
+Firestore's REST pagination is sequential by construction: the next page needs
+the previous page's cursor. `MaxThreads()` returned 1 and pages were fetched
+inline on the execution thread, so a large scan was a chain of round trips with
+nothing overlapping them.
+
+Ranges of the key space are independent, so the scan now cuts the collection
+into ranges and reads several at once. Each thread claims a range, pages
+through it with its own client and its own paging policy, and claims another
+when it finishes. There are four times as many ranges as threads, so a thread
+that draws a light range takes the next one instead of idling.
+
+20,000 documents against the mock with 50 ms per request and 80 ms per
+connection:
+
+| threads | time |
+|---|---|
+| 1 | 2.33 s |
+| 2 | 1.57 s |
+| 4 | 1.23 s |
+| 8 | 1.18 s |
+
+Real speedup is bounded here by the mock itself (single Python process), and
+the flattening past four threads is partly that. Parallel scanning also issues
+*more* requests than sequential — 32 against 21 for 20,000 documents — because
+each range's last page is partial; it wins by overlapping them, not by making
+fewer.
+
+### Where the correctness sits
+
+- **Boundary ownership.** Firestore's cursor `before` flag means opposite
+  things on a start and an end cursor. The range's lower bound is `startAt`
+  (`before: true`, inclusive) and its upper bound `endBefore` (`before: true`,
+  exclusive), so a document whose id is exactly a boundary is read by the range
+  starting there and skipped by the one ending there. Both flags the same and
+  the document is either read twice or lost — the first draft had this wrong.
+- **Coverage.** The first range has no lower bound and the last no upper one,
+  so every id lands somewhere whatever characters it uses. A unit test asserts
+  exactly-one-range membership over ids spanning the whole byte ordering, at
+  several partition counts.
+- **Balance, separately.** Boundaries are cut evenly over Firestore's auto-id
+  alphabet. Hand-chosen keys pile into one range: still correct, just not
+  faster.
+
+### Where it does not apply
+
+`show_missing:=false` is required, because ranges are cursors and only
+`runQuery` supports those, and `runQuery` never returns phantom documents while
+a `show_missing` scan does. Also excluded: an ORDER BY (undone by reading
+ranges concurrently), a LIMIT (not enforceable per range), a pushed filter
+(needs its own ordering, which conflicts with ordering by `__name__`),
+collection groups (names span parent paths) and document paths. Everything else
+scans sequentially exactly as before.
+
+### Prerequisite: credentials were not thread-safe
+
+`RefreshTokenIfNeeded` mutated the shared `FirestoreCredentials` with no lock,
+and every client built from a secret shares one. Sequentially that never
+mattered; with one client per thread, an expiring service-account or Firebase
+token would be read while another thread rewrote it. The cached token is now
+guarded by a mutex held across the refresh, so one thread refreshes and the
+rest wake to a valid token.
+
+### On the mock
+
+Its cursor handling was an approximation — it recovered an offset by parsing a
+`/docNNNNNNNN` suffix. It now holds each collection's ids in sorted order and
+resolves `startAt`/`endAt` by bisecting them, honouring `before` on both sides;
+otherwise it could not have caught the boundary bug above. Collections may also
+be prefixed `auto_` to give documents Firestore-shaped auto-ids, since
+sequential `doc00000000` keys all sort into a single range.

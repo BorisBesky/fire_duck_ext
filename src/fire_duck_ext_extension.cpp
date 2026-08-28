@@ -171,6 +171,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "round trip (0 disables the guard)",
 	                          LogicalType::BIGINT, Value::BIGINT(FIRESTORE_DEFAULT_PAGE_BYTE_BUDGET),
 	                          FirestoreSettings::SetPageByteBudget);
+	config.AddExtensionOption("firestore_max_threads",
+	                          "Maximum threads one scan may split across, reading separate document-key ranges "
+	                          "(1 disables parallel scanning)",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultMaxThreads),
+	                          FirestoreSettings::SetMaxScanThreads);
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);

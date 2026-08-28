@@ -132,6 +132,40 @@ json BuildCountAggregationQuery(const std::string &collection_id, bool all_desce
 // scanning" rather than as an error.
 bool ParseCountAggregationResponse(const json &response, int64_t &count_out);
 
+// One slice of a collection's document-name space, scanned independently.
+//
+// Half-open: [start_document_id, end_document_id). An empty bound is open, so
+// the first partition has no lower bound and the last no upper one. Together
+// the partitions cover every possible document id, whatever characters it
+// uses -- coverage does not depend on ids looking like Firestore's auto-ids,
+// only the *balance* does.
+struct FirestoreKeyRange {
+	std::string start_document_id; // inclusive; empty means "from the beginning"
+	std::string end_document_id;   // exclusive; empty means "to the end"
+};
+
+// Split a collection's document-name space into `partitions` contiguous
+// ranges.
+//
+// Firestore orders documents by their resource name, byte by byte. Auto-ids
+// are 20 characters drawn uniformly from [A-Za-z0-9], so cutting that space
+// into equal slices gives roughly equal partitions. Ids chosen by hand
+// (emails, timestamps, sequence numbers) will land unevenly -- correct, just
+// not balanced.
+//
+// `partitions` <= 1 yields a single unbounded range.
+std::vector<FirestoreKeyRange> BuildKeyRangePartitions(int64_t partitions);
+
+// Build a StructuredQuery for one key range of an unfiltered collection scan.
+//
+// Ordered by __name__ so the range can be expressed as cursors and the pages
+// within it resumed. `document_path_prefix` is the collection's resource name
+// (projects/P/databases/D/documents/<collection>), which cursor values are
+// built from.
+json BuildKeyRangeStructuredQuery(const std::string &collection_id, const std::string &document_path_prefix,
+                                  const FirestoreKeyRange &range, int64_t page_size,
+                                  const FirestoreProjection &projection);
+
 // Build the `startAt` cursor that resumes a runQuery after `last_document`.
 //
 // The cursor must carry one value per orderBy entry, in order, or Firestore

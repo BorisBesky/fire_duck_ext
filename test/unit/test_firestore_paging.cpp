@@ -479,3 +479,248 @@ FD_TEST("count: malformed responses are refused rather than guessed at") {
 		FD_REQUIRE_FALSE(duckdb::ParseCountAggregationResponse(response, count));
 	}
 }
+
+// ---------------------------------------------------------------- key ranges
+
+namespace {
+
+// How many of `ranges` contain `document_id`. Must be exactly 1 for every
+// possible id, or a parallel scan drops or duplicates documents.
+int RangesContaining(const std::vector<duckdb::FirestoreKeyRange> &ranges, const std::string &document_id) {
+	int matches = 0;
+	for (const auto &range : ranges) {
+		const bool at_or_after_start = range.start_document_id.empty() || document_id >= range.start_document_id;
+		const bool before_end = range.end_document_id.empty() || document_id < range.end_document_id;
+		if (at_or_after_start && before_end) {
+			matches++;
+		}
+	}
+	return matches;
+}
+
+// Ids spanning the ordering: below, inside and above the auto-id alphabet, at
+// the boundaries of it, and some that are not auto-ids at all.
+std::vector<std::string> SampleDocumentIds() {
+	std::vector<std::string> ids = {
+	    "",
+	    " ",
+	    "!",
+	    "-",
+	    ".",
+	    "/",
+	    "0",
+	    "00",
+	    "0000000000",
+	    "5",
+	    "9",
+	    ":",
+	    "A",
+	    "M",
+	    "Z",
+	    "[",
+	    "_",
+	    "`",
+	    "a",
+	    "m",
+	    "z",
+	    "{",
+	    "~",
+	    "user@example.com",
+	    "2026-01-01T00:00:00Z",
+	    "order_000001",
+	    std::string("\xc3\xa9") + "accented",
+	    std::string(200, 'q'),
+	};
+	// A spread of auto-id-shaped values.
+	const char *alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	for (int i = 0; i < 62; i++) {
+		std::string id(20, alphabet[i]);
+		id[7] = alphabet[(i * 13) % 62];
+		ids.push_back(id);
+	}
+	return ids;
+}
+
+} // namespace
+
+FD_TEST("partitions: one partition is a single unbounded range") {
+	for (int64_t count : {int64_t(1), int64_t(0), int64_t(-4)}) {
+		auto ranges = duckdb::BuildKeyRangePartitions(count);
+		FD_REQUIRE_EQ(ranges.size(), 1u);
+		FD_REQUIRE(ranges[0].start_document_id.empty());
+		FD_REQUIRE(ranges[0].end_document_id.empty());
+	}
+}
+
+FD_TEST("partitions: the requested number of ranges is produced") {
+	for (int64_t count : {int64_t(2), int64_t(3), int64_t(8), int64_t(64), int64_t(1000)}) {
+		FD_REQUIRE_EQ(static_cast<int64_t>(duckdb::BuildKeyRangePartitions(count).size()), count);
+	}
+}
+
+FD_TEST("partitions: the ends of the space are left open") {
+	// Otherwise ids sorting before the first boundary or after the last would
+	// belong to no range at all.
+	auto ranges = duckdb::BuildKeyRangePartitions(8);
+	FD_REQUIRE(ranges.front().start_document_id.empty());
+	FD_REQUIRE(ranges.back().end_document_id.empty());
+}
+
+FD_TEST("partitions: ranges are contiguous and strictly increasing") {
+	auto ranges = duckdb::BuildKeyRangePartitions(16);
+	for (size_t i = 0; i + 1 < ranges.size(); i++) {
+		// Contiguous: no gap between one range's end and the next one's start.
+		FD_REQUIRE_EQ(ranges[i].end_document_id, ranges[i + 1].start_document_id);
+		// Strictly increasing: equal boundaries would make an empty range and
+		// waste a thread.
+		FD_REQUIRE(ranges[i].end_document_id > ranges[i].start_document_id || ranges[i].start_document_id.empty());
+	}
+}
+
+FD_TEST("partitions: every document id belongs to exactly one range") {
+	// The property the whole scheme rests on. Ids that look nothing like
+	// Firestore auto-ids still have to land somewhere, and only once.
+	for (int64_t count : {int64_t(1), int64_t(2), int64_t(3), int64_t(7), int64_t(16), int64_t(64)}) {
+		auto ranges = duckdb::BuildKeyRangePartitions(count);
+		for (const auto &document_id : SampleDocumentIds()) {
+			const int matches = RangesContaining(ranges, document_id);
+			if (matches != 1) {
+				FD_FAIL("id '" + document_id + "' matched " + std::to_string(matches) + " of " + std::to_string(count) +
+				        " ranges");
+			}
+		}
+	}
+}
+
+FD_TEST("partitions: auto-id-shaped keys spread evenly across ranges") {
+	// Correctness does not depend on this, but the point of partitioning does.
+	const char *alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	auto ranges = duckdb::BuildKeyRangePartitions(8);
+	std::vector<int> hits(ranges.size(), 0);
+
+	// A deterministic sweep over the first two characters approximates the
+	// uniform distribution of real auto-ids.
+	for (int first = 0; first < 62; first++) {
+		for (int second = 0; second < 62; second++) {
+			std::string id;
+			id += alphabet[first];
+			id += alphabet[second];
+			id += "kZ7q0RtY2vBn4mXs";
+			for (size_t r = 0; r < ranges.size(); r++) {
+				const auto &range = ranges[r];
+				const bool at_or_after = range.start_document_id.empty() || id >= range.start_document_id;
+				const bool before_end = range.end_document_id.empty() || id < range.end_document_id;
+				if (at_or_after && before_end) {
+					hits[r]++;
+				}
+			}
+		}
+	}
+
+	const int expected = (62 * 62) / static_cast<int>(ranges.size());
+	for (size_t r = 0; r < hits.size(); r++) {
+		if (hits[r] < expected / 2 || hits[r] > expected * 2) {
+			FD_FAIL("range " + std::to_string(r) + " took " + std::to_string(hits[r]) +
+			        " of 3844 keys, expected around " + std::to_string(expected));
+		}
+	}
+}
+
+FD_TEST("partitions: asking for more ranges than cut points is clamped") {
+	// Three characters of a 62-character alphabet gives 62^3 cut points;
+	// beyond that boundaries would repeat and produce empty ranges.
+	auto ranges = duckdb::BuildKeyRangePartitions(62LL * 62 * 62 + 1000);
+	FD_REQUIRE_EQ(static_cast<int64_t>(ranges.size()), 62LL * 62 * 62);
+	for (size_t i = 0; i + 1 < ranges.size(); i++) {
+		FD_REQUIRE(ranges[i].end_document_id > ranges[i].start_document_id || ranges[i].start_document_id.empty());
+	}
+}
+
+// ---------------------------------------------------------------- range queries
+
+FD_TEST("range query: a middle range carries both cursors") {
+	duckdb::FirestoreProjection projection;
+	json query = duckdb::BuildKeyRangeStructuredQuery("orders", "projects/p/databases/d/documents/orders",
+	                                                  duckdb::FirestoreKeyRange {"100", "200"}, 500, projection);
+
+	FD_REQUIRE_EQ(query["from"][0]["collectionId"].get<std::string>(), std::string("orders"));
+	FD_REQUIRE_FALSE(query["from"][0]["allDescendants"].get<bool>());
+	FD_REQUIRE_EQ(query["limit"].get<int64_t>(), 500);
+	FD_REQUIRE_EQ(FieldPathAt(query["orderBy"], 0), std::string("__name__"));
+
+	FD_REQUIRE_EQ(query["startAt"]["values"][0]["referenceValue"].get<std::string>(),
+	              std::string("projects/p/databases/d/documents/orders/100"));
+	FD_REQUIRE_EQ(query["endAt"]["values"][0]["referenceValue"].get<std::string>(),
+	              std::string("projects/p/databases/d/documents/orders/200"));
+
+	// The two bounds need opposite `before` flags. On a start cursor
+	// before=true is startAt (inclusive); on an end cursor before=true is
+	// endBefore (exclusive). A document whose id is exactly a boundary is then
+	// read by the range starting there and skipped by the one ending there --
+	// exactly once overall. Both flags the same loses it or doubles it.
+	FD_REQUIRE(query["startAt"]["before"].get<bool>());
+	FD_REQUIRE(query["endAt"]["before"].get<bool>());
+}
+
+FD_TEST("range query: adjacent ranges agree on who owns the boundary") {
+	duckdb::FirestoreProjection projection;
+	auto ranges = duckdb::BuildKeyRangePartitions(4);
+
+	for (size_t i = 0; i + 1 < ranges.size(); i++) {
+		json lower = duckdb::BuildKeyRangeStructuredQuery("c", "prefix", ranges[i], 100, projection);
+		json upper = duckdb::BuildKeyRangeStructuredQuery("c", "prefix", ranges[i + 1], 100, projection);
+
+		// The same document name is both range i's exclusive end and range
+		// i+1's inclusive start.
+		FD_REQUIRE_EQ(lower["endAt"]["values"][0]["referenceValue"].get<std::string>(),
+		              upper["startAt"]["values"][0]["referenceValue"].get<std::string>());
+		FD_REQUIRE(lower["endAt"]["before"].get<bool>());   // excluded below
+		FD_REQUIRE(upper["startAt"]["before"].get<bool>()); // included above
+	}
+}
+
+FD_TEST("range query: open ends carry no cursor") {
+	duckdb::FirestoreProjection projection;
+
+	json first = duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {"", "200"}, 100,
+	                                                  projection);
+	FD_REQUIRE_FALSE(first.contains("startAt"));
+	FD_REQUIRE(first.contains("endAt"));
+
+	json last = duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {"200", ""}, 100,
+	                                                 projection);
+	FD_REQUIRE(last.contains("startAt"));
+	FD_REQUIRE_FALSE(last.contains("endAt"));
+
+	json only = duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {}, 100, projection);
+	FD_REQUIRE_FALSE(only.contains("startAt"));
+	FD_REQUIRE_FALSE(only.contains("endAt"));
+}
+
+FD_TEST("range query: the projection and page size are applied") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"total"};
+
+	json query =
+	    duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {}, 99999, projection);
+	FD_REQUIRE_EQ(query["limit"].get<int64_t>(), duckdb::FIRESTORE_MAX_PAGE_SIZE);
+	FD_REQUIRE_EQ(query["select"]["fields"][0]["fieldPath"].get<std::string>(), std::string("total"));
+
+	duckdb::FirestoreProjection unmasked;
+	FD_REQUIRE_FALSE(
+	    duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {}, 100, unmasked)
+	        .contains("select"));
+}
+
+FD_TEST("range query: paging within a range resumes from the last document") {
+	// The startAt cursor for the next page must not lose the range's upper
+	// bound, or the thread would run past its slice into another's.
+	duckdb::FirestoreProjection projection;
+	json query = duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {"100", "200"}, 100,
+	                                                  projection);
+	query["startAt"] = duckdb::BuildStartAtCursor(query, "prefix/150", json::object());
+
+	FD_REQUIRE_EQ(query["startAt"]["values"][0]["referenceValue"].get<std::string>(), std::string("prefix/150"));
+	FD_REQUIRE_EQ(query["endAt"]["values"][0]["referenceValue"].get<std::string>(), std::string("prefix/200"));
+}

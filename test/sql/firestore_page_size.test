@@ -90,6 +90,42 @@ SELECT current_setting('firestore_page_byte_budget');
 statement ok
 RESET firestore_page_byte_budget;
 
+# Thread cap for parallel scans.
+query I
+SELECT current_setting('firestore_max_threads');
+----
+4
+
+# Fewer than one thread is not a scan.
+statement ok
+SET firestore_max_threads=0;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+1
+
+statement ok
+SET firestore_max_threads=-9;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+1
+
+# Capped, so a stray setting cannot open an unbounded number of connections
+# against a shared, rate-limited service.
+statement ok
+SET firestore_max_threads=100000;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+64
+
+statement ok
+RESET firestore_max_threads;
+
 # The page_size named parameter must be accepted by the binder. Credentials
 # are resolved before the collection is contacted, so this reports the
 # credential error rather than a binder error about an unknown parameter.
@@ -149,10 +185,12 @@ SELECT count(*) FROM firestore_scan('bench_flat_4_2500', page_size:=250);
 ----
 2500
 
+# Clamped up to one document per request, which is why this uses a tiny
+# collection: at that page size every document costs its own round trip.
 query I
-SELECT count(*) FROM firestore_scan('bench_flat_4_1200', page_size:=0);
+SELECT count(*) FROM firestore_scan('bench_flat_4_20', page_size:=0);
 ----
-1200
+20
 
 # Sampling every document no longer holds the collection in memory, and still
 # finds a field that first appears at document 1500.
@@ -166,6 +204,29 @@ query I
 SELECT count(late_field) FROM firestore_scan('~bench_late_1500_3000', schema_sample_size:=-1);
 ----
 1500
+
+# A collection split across threads by document-key range returns exactly the
+# documents a sequential scan does -- no gaps at the range boundaries, and no
+# document claimed by two ranges. The auto_ prefix gives the mock's documents
+# Firestore-style ids, which is what spreads them across ranges at all.
+query II
+SELECT count(*), count(DISTINCT __document_id)
+FROM firestore_scan('auto_bench_flat_8_3000', show_missing:=false, schema_sample_size:=5);
+----
+3000	3000
+
+# The same scan with parallelism off must agree.
+statement ok
+SET firestore_max_threads=1;
+
+query II
+SELECT count(*), count(DISTINCT __document_id)
+FROM firestore_scan('auto_bench_flat_8_3000', show_missing:=false, schema_sample_size:=5);
+----
+3000	3000
+
+statement ok
+RESET firestore_max_threads;
 
 # A page heavier than the byte budget shrinks later requests; every row still
 # arrives.

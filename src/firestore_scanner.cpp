@@ -689,6 +689,41 @@ static FirestoreProjection ResolveProjection(const FirestoreScanBindData &bind_d
 	return projection;
 }
 
+// Whether this scan can be split across threads by document-name range.
+//
+// Range partitioning is only exact under fairly narrow conditions, and every
+// one of them is about the parallel scan returning the same rows as the
+// sequential one:
+//   - Ranges are cursors on __name__, which only :runQuery supports. A scan
+//     with show_missing returns phantom documents, which runQuery never does,
+//     so those two do not agree. Collection groups are excluded for a
+//     different reason: their names span parent paths, which this scheme does
+//     not know how to cut.
+//   - An ORDER BY would be undone by reading ranges concurrently, and a LIMIT
+//     cannot be enforced per range. Both are cheap scans anyway.
+//   - A pushed filter needs its own orderBy on the filtered field, which
+//     conflicts with ordering by __name__ for the range cursors.
+//   - A count needs no documents at all, and a document-path scan reads
+//     subcollection ids rather than documents.
+static bool CanScanInParallel(const FirestoreScanBindData &bind_data, const std::vector<OrderByField> &order_by,
+                              const std::optional<int64_t> &limit, bool pushdown_active, idx_t max_threads) {
+	if (max_threads <= 1) {
+		return false;
+	}
+	if (bind_data.is_document_path || bind_data.is_collection_group || bind_data.count_star_only) {
+		return false;
+	}
+	if (bind_data.show_missing) {
+		FS_LOG_DEBUG("Not scanning in parallel because show_missing includes documents the range queries would not "
+		             "return; pass show_missing:=false to allow it");
+		return false;
+	}
+	if (!order_by.empty() || limit.has_value()) {
+		return false;
+	}
+	return !pushdown_active && bind_data.candidate_pushdown_filters.empty();
+}
+
 // Feed a response's weight back to the paging policy, so a page heavier than
 // the byte budget makes the next request smaller.
 static void ObservePageWeight(FirestoreScanGlobalState &global_state, const FirestoreListResponse &response,
@@ -846,6 +881,25 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	auto &effective_order_by =
 	    !bind_data.parsed_order_by.empty() ? bind_data.parsed_order_by : bind_data.sql_pushed_order_by;
 	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+
+	// Split the collection across threads when that is exact. Each thread pages
+	// through its own key range, so the round trips overlap.
+	const idx_t max_threads = static_cast<idx_t>(FirestoreSettings::MaxScanThreads(context));
+	if (CanScanInParallel(bind_data, effective_order_by, effective_limit, global_state->pushdown_result.has_pushdown(),
+	                      max_threads)) {
+		std::string parent_path;
+		SplitFirestoreCollectionPath(bind_data.collection, false, parent_path, global_state->collection_id);
+		global_state->document_path_prefix = global_state->client->CollectionResourceName(bind_data.collection);
+
+		// More ranges than threads: key distributions are rarely even, and a
+		// thread that finishes a light range takes the next one rather than
+		// idling while another grinds through a heavy one.
+		global_state->key_range_partitions = BuildKeyRangePartitions(static_cast<int64_t>(max_threads) * 4);
+		global_state->scan_threads = max_threads;
+		FS_LOG_DEBUG("Scanning '" + bind_data.collection + "' with " + std::to_string(max_threads) + " threads over " +
+		             std::to_string(global_state->key_range_partitions.size()) + " key ranges");
+		return std::move(global_state);
+	}
 
 	// A scan that needs no columns is fully described by how many rows it has,
 	// so ask Firestore for that number instead of reading the collection.
@@ -1026,13 +1080,254 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 unique_ptr<LocalTableFunctionState> FirestoreScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                            GlobalTableFunctionState *global_state) {
-	return make_uniq<FirestoreScanLocalState>();
+	auto local_state = make_uniq<FirestoreScanLocalState>();
+
+	auto &gstate = global_state->Cast<FirestoreScanGlobalState>();
+	if (!gstate.key_range_partitions.empty()) {
+		// Parallel scan: each thread needs its own HTTP client, since the
+		// underlying connection is not shareable, and its own paging policy so
+		// one heavy range does not shrink every other thread's pages.
+		auto &bind_data = input.bind_data->Cast<FirestoreScanBindData>();
+		local_state->client =
+		    make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context.client));
+		local_state->page_policy = gstate.page_policy;
+	}
+	return std::move(local_state);
+}
+
+// Per-chunk VARIANT accumulation.
+//
+// A VARIANT vector is built from a whole chunk at once (VariantValue::ToVARIANT)
+// rather than cell by cell, so values are collected here and converted when the
+// chunk is complete.
+struct VariantChunkBuffer {
+	explicit VariantChunkBuffer(DataChunk &output)
+	    : is_variant_col(output.ColumnCount(), false), values(output.ColumnCount()) {
+		for (idx_t out_col = 0; out_col < output.ColumnCount(); out_col++) {
+			if (output.data[out_col].GetType().id() == LogicalTypeId::VARIANT) {
+				is_variant_col[out_col] = true;
+				any = true;
+			}
+		}
+	}
+
+	void Finish(DataChunk &output, idx_t count) {
+		if (!any) {
+			return;
+		}
+		for (idx_t out_col = 0; out_col < is_variant_col.size(); out_col++) {
+			if (is_variant_col[out_col]) {
+				D_ASSERT(values[out_col].size() == count);
+				VariantValue::ToVARIANT(values[out_col], output.data[out_col]);
+			}
+		}
+	}
+
+	std::vector<bool> is_variant_col;
+	// Inner container must be duckdb::vector -- that is what ToVARIANT takes.
+	std::vector<duckdb::vector<VariantValue>> values;
+	bool any = false;
+};
+
+// Warn once per distinct field about data the schema does not cover.
+//
+// Inference only looks at the first schema_sample_size documents, so a field
+// introduced later would otherwise vanish from every result with no indication
+// at all. `guard` is non-null when several threads share the reported set.
+static void ReportUnmappedFields(const FirestoreScanBindData &bind_data, const FirestoreDocument &doc,
+                                 std::set<std::string> &reported, std::mutex *guard) {
+	ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns, [&](const std::string &name, const json &) {
+		bool first_time = false;
+		if (guard != nullptr) {
+			std::lock_guard<std::mutex> lock(*guard);
+			first_time = reported.insert(name).second;
+		} else {
+			first_time = reported.insert(name).second;
+		}
+		if (first_time) {
+			FS_LOG_WARN("Field '" + name + "' exists in collection '" + bind_data.collection +
+			            "' but is not in the inferred schema, so it is omitted from results. Raise "
+			            "schema_sample_size (-1 samples every document), pass an explicit columns:={...}, "
+			            "or set unmapped_column:=true to capture it.");
+		}
+	});
+}
+
+// Write one document into row `row` of the output chunk.
+static void WriteDocumentRow(const FirestoreScanBindData &bind_data, const FirestoreDocument &doc, DataChunk &output,
+                             idx_t row, VariantChunkBuffer &variants) {
+	for (idx_t out_col = 0; out_col < bind_data.projected_columns.size(); out_col++) {
+		idx_t src_col = bind_data.projected_columns[out_col];
+
+		if (src_col == COLUMN_IDENTIFIER_ROW_ID) {
+			// __document_id column
+			std::string doc_id;
+			if (bind_data.is_collection_group) {
+				// For collection group queries, use the full document path
+				// to uniquely identify documents across different parent collections
+				// doc.name is like: projects/{PROJECT}/databases/{DB}/documents/{PATH}
+				// We extract just the {PATH} part
+				const std::string marker = "/documents/";
+				size_t pos = doc.name.find(marker);
+				if (pos != std::string::npos) {
+					doc_id = doc.name.substr(pos + marker.length());
+				} else {
+					// Fallback to full name if marker not found
+					doc_id = doc.name;
+				}
+			} else {
+				// For regular queries, use just the document ID
+				doc_id = doc.document_id;
+			}
+			FlatVector::GetData<string_t>(output.data[out_col])[row] =
+			    StringVector::AddString(output.data[out_col], doc_id);
+		} else if (src_col >= bind_data.column_names.size()) {
+			// __unmapped catch-all: every field the schema does not cover.
+			// It sits past the end of column_names because that vector maps
+			// 1:1 onto Firestore fields and this column maps onto none.
+			if (variants.is_variant_col[out_col]) {
+				VariantValue obj(VariantValueType::OBJECT);
+				bool any = false;
+				ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
+				                     [&](const std::string &name, const json &value) {
+					                     obj.AddChild(name, FirestoreValueToVariant(value));
+					                     any = true;
+				                     });
+				// No extra fields -> SQL NULL rather than an empty object.
+				variants.values[out_col].push_back(any ? std::move(obj) : VariantValue());
+			} else {
+				json extras = json::object();
+				ForEachUnmappedField(
+				    doc.fields, bind_data.sorted_known_columns,
+				    [&](const std::string &name, const json &value) { extras[name] = UnwrapFirestoreValue(value); });
+				if (extras.empty()) {
+					FlatVector::SetNull(output.data[out_col], row, true);
+				} else {
+					auto str = extras.dump();
+					FlatVector::GetData<string_t>(output.data[out_col])[row] =
+					    StringVector::AddString(output.data[out_col], str);
+				}
+			}
+		} else {
+			// Regular field column
+			const auto &col_name = bind_data.column_names[src_col];
+
+			if (variants.is_variant_col[out_col]) {
+				// Accumulate only; the VARIANT vector is built once per chunk
+				// below. A default-constructed VariantValue is MISSING, which
+				// ToVARIANT renders as SQL NULL.
+				auto field_it = doc.fields.find(col_name);
+				variants.values[out_col].push_back(field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it)
+				                                                                : VariantValue());
+			} else {
+				// One lookup, not contains() plus operator[]: this runs
+				// once per column per row, so the second probe is pure
+				// overhead on every value the scan produces.
+				auto field_it = doc.fields.find(col_name);
+				if (field_it != doc.fields.end()) {
+					SetDuckDBValue(output.data[out_col], row, *field_it, bind_data.column_types[src_col],
+					               bind_data.map_encoding);
+				} else {
+					FlatVector::SetNull(output.data[out_col], row, true);
+				}
+			}
+		}
+	}
+}
+
+// Fetch until this thread has documents to emit, or has run out of work.
+//
+// Returns false when every key range has been claimed and this thread's own
+// range is exhausted -- there is nothing left for it anywhere.
+static bool EnsureLocalPage(FirestoreScanBindData &bind_data, FirestoreScanGlobalState &global_state,
+                            FirestoreScanLocalState &local_state) {
+	while (local_state.current_index >= local_state.documents.size()) {
+		// More pages inside the range this thread already holds?
+		if (local_state.has_partition && !local_state.documents.empty() && local_state.last_page_was_full) {
+			const auto &last_doc = local_state.documents.back();
+			json paginated_query = local_state.structured_query;
+			paginated_query["startAt"] =
+			    BuildStartAtCursor(local_state.structured_query, last_doc.name, last_doc.fields);
+			// endAt stays as the range built it, so the cursor cannot walk
+			// past this thread's slice into another's.
+			const int64_t page_size = local_state.page_policy.CurrentPageSize();
+			paginated_query["limit"] = page_size;
+
+			auto response = local_state.client->RunQuery(bind_data.collection, paginated_query, false);
+			local_state.last_page_was_full = static_cast<int64_t>(response.documents.size()) >= page_size;
+			local_state.page_policy.ObserveResponse(static_cast<int64_t>(response.documents.size()),
+			                                        response.response_bytes);
+			local_state.documents = std::move(response.documents);
+			local_state.current_index = 0;
+			if (local_state.documents.empty()) {
+				local_state.has_partition = false;
+			}
+			continue;
+		}
+
+		// This range is done. Claim the next one, if any is left.
+		local_state.has_partition = false;
+		local_state.documents.clear();
+		local_state.current_index = 0;
+		{
+			std::lock_guard<std::mutex> lock(global_state.partition_mutex);
+			if (global_state.next_partition >= global_state.key_range_partitions.size()) {
+				return false;
+			}
+			local_state.partition = global_state.key_range_partitions[global_state.next_partition++];
+		}
+		local_state.has_partition = true;
+
+		const int64_t page_size = local_state.page_policy.CurrentPageSize();
+		local_state.structured_query =
+		    BuildKeyRangeStructuredQuery(global_state.collection_id, global_state.document_path_prefix,
+		                                 local_state.partition, page_size, global_state.projection);
+
+		auto response = local_state.client->RunQuery(bind_data.collection, local_state.structured_query, false);
+		local_state.last_page_was_full = static_cast<int64_t>(response.documents.size()) >= page_size;
+		local_state.page_policy.ObserveResponse(static_cast<int64_t>(response.documents.size()),
+		                                        response.response_bytes);
+		local_state.documents = std::move(response.documents);
+		local_state.current_index = 0;
+	}
+	return true;
+}
+
+// One chunk of a parallel scan, read from this thread's own key range.
+static void ScanKeyRange(FirestoreScanBindData &bind_data, FirestoreScanGlobalState &global_state,
+                         FirestoreScanLocalState &local_state, DataChunk &output) {
+	if (!EnsureLocalPage(bind_data, global_state, local_state)) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	VariantChunkBuffer variants(output);
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && local_state.current_index < local_state.documents.size()) {
+		const auto &doc = local_state.documents[local_state.current_index];
+		// The reported set is shared, so the warning is emitted once per
+		// distinct field for the scan as a whole rather than once per thread.
+		ReportUnmappedFields(bind_data, doc, global_state.reported_unmapped, &global_state.unmapped_mutex);
+		WriteDocumentRow(bind_data, doc, output, count, variants);
+		count++;
+		local_state.current_index++;
+	}
+
+	variants.Finish(output, count);
+	output.SetCardinality(count);
 }
 
 void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->CastNoConst<FirestoreScanBindData>();
 	auto &global_state = data.global_state->Cast<FirestoreScanGlobalState>();
 	bool is_document_path_mode = global_state.is_document_path;
+
+	// A parallel scan is driven entirely from thread-local state: this
+	// thread's key range, its own page, and its own client.
+	if (!global_state.key_range_partitions.empty()) {
+		ScanKeyRange(bind_data, global_state, data.local_state->Cast<FirestoreScanLocalState>(), output);
+		return;
+	}
 
 	if (global_state.finished) {
 		output.SetCardinality(0);
@@ -1110,20 +1405,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		max_count = std::min(max_count, static_cast<idx_t>(effective_limit.value()) - total_returned);
 	}
 
-	// VARIANT columns cannot be written cell-by-cell: DuckDB builds a VARIANT
-	// vector from an entire chunk at once (VariantValue::ToVARIANT). Collect one
-	// VariantValue per emitted row here and convert after the loop.
-	const idx_t out_col_count = bind_data.projected_columns.size();
-	std::vector<bool> is_variant_col(out_col_count, false);
-	// Inner container must be duckdb::vector -- that is what ToVARIANT takes.
-	std::vector<duckdb::vector<VariantValue>> variant_values(out_col_count);
-	bool any_variant_col = false;
-	for (idx_t out_col = 0; out_col < out_col_count; out_col++) {
-		if (output.data[out_col].GetType().id() == LogicalTypeId::VARIANT) {
-			is_variant_col[out_col] = true;
-			any_variant_col = true;
-		}
-	}
+	VariantChunkBuffer variants(output);
 
 	while (count < max_count) {
 		// Check if we need to fetch more documents
@@ -1192,111 +1474,15 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 		auto &doc = global_state.documents[global_state.current_index];
 
-		// Report fields the schema never saw. Inference only looks at the first
-		// schema_sample_size documents, so a field introduced later would otherwise
-		// vanish from every result with no indication at all.
-		ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns, [&](const std::string &name, const json &) {
-			if (global_state.reported_unmapped.insert(name).second) {
-				FS_LOG_WARN("Field '" + name + "' exists in collection '" + bind_data.collection +
-				            "' but is not in the inferred schema, so it is omitted from results. Raise "
-				            "schema_sample_size (-1 samples every document), pass an explicit columns:={...}, "
-				            "or set unmapped_column:=true to capture it.");
-			}
-		});
-
-		// Set values for each projected column
-		for (idx_t out_col = 0; out_col < bind_data.projected_columns.size(); out_col++) {
-			idx_t src_col = bind_data.projected_columns[out_col];
-
-			if (src_col == COLUMN_IDENTIFIER_ROW_ID) {
-				// __document_id column
-				std::string doc_id;
-				if (bind_data.is_collection_group) {
-					// For collection group queries, use the full document path
-					// to uniquely identify documents across different parent collections
-					// doc.name is like: projects/{PROJECT}/databases/{DB}/documents/{PATH}
-					// We extract just the {PATH} part
-					const std::string marker = "/documents/";
-					size_t pos = doc.name.find(marker);
-					if (pos != std::string::npos) {
-						doc_id = doc.name.substr(pos + marker.length());
-					} else {
-						// Fallback to full name if marker not found
-						doc_id = doc.name;
-					}
-				} else {
-					// For regular queries, use just the document ID
-					doc_id = doc.document_id;
-				}
-				FlatVector::GetData<string_t>(output.data[out_col])[count] =
-				    StringVector::AddString(output.data[out_col], doc_id);
-			} else if (src_col >= bind_data.column_names.size()) {
-				// __unmapped catch-all: every field the schema does not cover.
-				// It sits past the end of column_names because that vector maps
-				// 1:1 onto Firestore fields and this column maps onto none.
-				if (is_variant_col[out_col]) {
-					VariantValue obj(VariantValueType::OBJECT);
-					bool any = false;
-					ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
-					                     [&](const std::string &name, const json &value) {
-						                     obj.AddChild(name, FirestoreValueToVariant(value));
-						                     any = true;
-					                     });
-					// No extra fields -> SQL NULL rather than an empty object.
-					variant_values[out_col].push_back(any ? std::move(obj) : VariantValue());
-				} else {
-					json extras = json::object();
-					ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
-					                     [&](const std::string &name, const json &value) {
-						                     extras[name] = UnwrapFirestoreValue(value);
-					                     });
-					if (extras.empty()) {
-						FlatVector::SetNull(output.data[out_col], count, true);
-					} else {
-						auto str = extras.dump();
-						FlatVector::GetData<string_t>(output.data[out_col])[count] =
-						    StringVector::AddString(output.data[out_col], str);
-					}
-				}
-			} else {
-				// Regular field column
-				const auto &col_name = bind_data.column_names[src_col];
-
-				if (is_variant_col[out_col]) {
-					// Accumulate only; the VARIANT vector is built once per chunk
-					// below. A default-constructed VariantValue is MISSING, which
-					// ToVARIANT renders as SQL NULL.
-					auto field_it = doc.fields.find(col_name);
-					variant_values[out_col].push_back(field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it)
-					                                                               : VariantValue());
-				} else {
-					// One lookup, not contains() plus operator[]: this runs
-					// once per column per row, so the second probe is pure
-					// overhead on every value the scan produces.
-					auto field_it = doc.fields.find(col_name);
-					if (field_it != doc.fields.end()) {
-						SetDuckDBValue(output.data[out_col], count, *field_it, bind_data.column_types[src_col],
-						               bind_data.map_encoding);
-					} else {
-						FlatVector::SetNull(output.data[out_col], count, true);
-					}
-				}
-			}
-		}
+		ReportUnmappedFields(bind_data, doc, global_state.reported_unmapped, nullptr);
+		WriteDocumentRow(bind_data, doc, output, count, variants);
 
 		count++;
 		global_state.current_index++;
 		global_state.rows_emitted++;
 	}
 
-	if (any_variant_col) {
-		for (idx_t out_col = 0; out_col < out_col_count; out_col++) {
-			if (is_variant_col[out_col]) {
-				D_ASSERT(variant_values[out_col].size() == count);
-				VariantValue::ToVARIANT(variant_values[out_col], output.data[out_col]);
-			}
-		}
-	}
+	variants.Finish(output, count);
 
 	if (count == 0) {
 		global_state.finished = true;

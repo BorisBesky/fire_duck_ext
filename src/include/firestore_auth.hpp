@@ -3,6 +3,7 @@
 #include <string>
 #include <memory>
 #include <chrono>
+#include <mutex>
 #include <optional>
 
 namespace duckdb {
@@ -38,9 +39,25 @@ struct FirestoreCredentials {
 	std::string access_token;
 	std::chrono::system_clock::time_point token_expiry;
 
+	// Guards the cached token. One FirestoreCredentials is shared by every
+	// client built from it, and a parallel scan runs one client per thread --
+	// so an expiring token would otherwise be read while another thread is
+	// rewriting it. Held across the refresh itself, which also means only one
+	// thread does the work and the rest wake to a valid token.
+	//
+	// Making this struct non-copyable is deliberate and costs nothing: it is
+	// only ever handled through unique_ptr/shared_ptr.
+	mutable std::mutex token_mutex;
+
 	bool IsTokenValid() const;
 	std::string GetAuthHeader() const;
 	std::string GetUrlSuffix() const;
+
+private:
+	friend class FirestoreAuthManager;
+
+	// Caller must hold token_mutex.
+	bool IsTokenValidUnlocked() const;
 };
 
 class FirestoreAuthManager {

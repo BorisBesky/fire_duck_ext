@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <string>
+#include <vector>
 
 namespace duckdb {
 
@@ -163,6 +164,92 @@ json BuildSelectClause(const FirestoreProjection &projection) {
 		}
 	}
 	return json {{"fields", fields}};
+}
+
+namespace {
+
+// Firestore's auto-id alphabet, in the byte order Firestore sorts by: digits,
+// then upper case, then lower case. Auto-ids draw uniformly from these 62
+// characters, so cutting the space evenly over this alphabet cuts a
+// collection of auto-ids into roughly equal parts.
+const char *const kSortedIdAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+constexpr int64_t kIdAlphabetSize = 62;
+
+// Characters per boundary. Three gives 62^3 = 238,328 distinct cut points --
+// far more than any useful thread count, while keeping the boundary strings
+// short enough to read in a log.
+constexpr int kBoundaryLength = 3;
+
+// Render `value` as a fixed-width boundary over the sorted alphabet.
+std::string RenderBoundary(int64_t value) {
+	std::string boundary(kBoundaryLength, kSortedIdAlphabet[0]);
+	for (int position = kBoundaryLength - 1; position >= 0; position--) {
+		boundary[position] = kSortedIdAlphabet[value % kIdAlphabetSize];
+		value /= kIdAlphabetSize;
+	}
+	return boundary;
+}
+
+} // namespace
+
+std::vector<FirestoreKeyRange> BuildKeyRangePartitions(int64_t partitions) {
+	std::vector<FirestoreKeyRange> ranges;
+	if (partitions <= 1) {
+		ranges.push_back(FirestoreKeyRange {});
+		return ranges;
+	}
+
+	int64_t total_points = 1;
+	for (int i = 0; i < kBoundaryLength; i++) {
+		total_points *= kIdAlphabetSize;
+	}
+	// More partitions than distinct cut points would produce duplicate
+	// boundaries and therefore empty ranges.
+	if (partitions > total_points) {
+		partitions = total_points;
+	}
+
+	std::string previous_boundary;
+	for (int64_t index = 1; index < partitions; index++) {
+		const std::string boundary = RenderBoundary(index * total_points / partitions);
+		ranges.push_back(FirestoreKeyRange {previous_boundary, boundary});
+		previous_boundary = boundary;
+	}
+	ranges.push_back(FirestoreKeyRange {previous_boundary, std::string()});
+	return ranges;
+}
+
+json BuildKeyRangeStructuredQuery(const std::string &collection_id, const std::string &document_path_prefix,
+                                  const FirestoreKeyRange &range, int64_t page_size,
+                                  const FirestoreProjection &projection) {
+	json structured_query;
+	structured_query["from"] = {{{"collectionId", collection_id}, {"allDescendants", false}}};
+	structured_query["orderBy"] = BuildOrderByArray({});
+	structured_query["limit"] = ClampFirestorePageSize(page_size);
+	if (projection.masked) {
+		structured_query["select"] = BuildSelectClause(projection);
+	}
+
+	// Cursors on __name__ take the document's full resource name.
+	//
+	// Firestore's `before` flag says which side of the given position the
+	// cursor sits on, and the two bounds need opposite answers: a document
+	// whose id is exactly a boundary must be read by the range that starts
+	// there and skipped by the one that ends there. Get this wrong in the same
+	// direction on both and the document is either read twice or lost.
+	if (!range.start_document_id.empty()) {
+		// before=true on a start cursor is startAt: inclusive.
+		structured_query["startAt"] = {
+		    {"values", json::array({json {{"referenceValue", document_path_prefix + "/" + range.start_document_id}}})},
+		    {"before", true}};
+	}
+	if (!range.end_document_id.empty()) {
+		// before=true on an end cursor is endBefore: exclusive.
+		structured_query["endAt"] = {
+		    {"values", json::array({json {{"referenceValue", document_path_prefix + "/" + range.end_document_id}}})},
+		    {"before", true}};
+	}
+	return structured_query;
 }
 
 json BuildCountAggregationQuery(const std::string &collection_id, bool all_descendants, int64_t up_to) {

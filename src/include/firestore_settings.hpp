@@ -81,6 +81,36 @@ struct FirestoreSettings {
 		parameter = Value::BIGINT(NormalizeFirestorePageByteBudget(BigIntValue::Get(parameter)));
 	}
 
+	// Upper bound on threads a single scan may use.
+	//
+	// Firestore's REST pagination is sequential within a key range, so the only
+	// way to overlap round trips is to read several ranges at once. Four keeps
+	// a useful amount of overlap without opening a connection per core against
+	// a shared, rate-limited service. 1 disables parallel scanning.
+	static constexpr int64_t kDefaultMaxThreads = 4;
+
+	static int64_t MaxScanThreads(const ClientContext &context) {
+		Value threads_value;
+		if (context.TryGetCurrentSetting("firestore_max_threads", threads_value)) {
+			return NormalizeMaxThreads(threads_value);
+		}
+		return kDefaultMaxThreads;
+	}
+
+	static void SetMaxScanThreads(ClientContext &context, SetScope scope, Value &parameter) {
+		parameter = Value::BIGINT(NormalizeMaxThreads(parameter));
+	}
+
+	// Fewer than one thread is not a scan; cap the top so a stray setting
+	// cannot open an unbounded number of connections.
+	static int64_t NormalizeMaxThreads(const Value &value) {
+		auto threads = BigIntValue::Get(value);
+		if (threads < 1) {
+			return 1;
+		}
+		return threads > 64 ? 64 : threads;
+	}
+
 	// Any negative value means "sample everything"; 0 would infer an empty
 	// schema, so treat it the same way rather than silently returning no columns.
 	static int64_t NormalizeSampleSize(const Value &value) {

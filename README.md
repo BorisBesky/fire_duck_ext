@@ -16,6 +16,7 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Streaming scans** that page through collections of any size, with a tunable page size for large documents
 - **Projection pushdown** so only the selected fields cross the wire
 - **Count pushdown** answering `COUNT(*)` from Firestore's aggregation API without reading documents
+- **Parallel scans** splitting a collection into document-key ranges read concurrently
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -405,6 +406,7 @@ SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
 | `firestore_schema_sample_size` | `1000` | Documents sampled to infer a schema; `-1` samples every document. |
 | `firestore_page_size` | `1000` | Documents fetched per round trip, clamped to Firestore's 1-1000 range. |
 | `firestore_page_byte_budget` | `67108864` | Uncompressed bytes a page may weigh before the scan requests fewer documents; `0` disables the guard. See [Large Collections](#large-collections). |
+| `firestore_max_threads` | `4` | Threads one scan may split across, reading separate key ranges; `1` disables parallel scanning, and the value is capped at 64. |
 
 Sampling streams: each page is folded into the inferred schema and released, so
 `schema_sample_size:=-1` costs one page of memory rather than the whole
@@ -657,6 +659,45 @@ The count is used only when nothing can read a value: no `WHERE`, no
 `Firestore Pushed Count` when it applies. If the endpoint is unavailable —
 older emulators, restricted credentials — the scan reads the documents
 instead, which is slower but never wrong.
+
+### Reading a collection with several threads
+
+Firestore's REST pagination is sequential: the next page needs the previous
+one's cursor, so a large scan is a chain of round trips whose latency cannot be
+hidden. Ranges of the key space are independent, though, so the scan can cut
+the collection into ranges and read several at once:
+
+```sql
+-- Up to 4 threads by default; 1 disables parallel scanning
+SET firestore_max_threads = 8;
+SELECT * FROM firestore_scan('events', show_missing:=false);
+```
+
+Each thread takes a range, pages through it with its own connection, and takes
+another when it finishes — so an uneven key distribution costs balance, not
+correctness. Measured against the mock at 50 ms simulated round-trip latency
+over 20,000 documents: 2.33 s on one thread, 1.23 s on four.
+
+Balance does depend on the keys. Firestore auto-ids are 20 characters drawn
+uniformly from `[A-Za-z0-9]`, and the ranges are cut evenly over that space, so
+auto-ids spread well. Keys chosen by hand — e-mail addresses, timestamps,
+sequence numbers — will pile into one range: still correct, just no faster than
+a single thread.
+
+Parallel scanning applies only where a range split returns exactly the rows a
+sequential scan would, which means all of:
+
+- `show_missing:=false`. Ranges are cursors, which only `runQuery` supports,
+  and `runQuery` never returns phantom documents while a `show_missing` scan
+  does.
+- No `ORDER BY`, no `LIMIT`, and no `WHERE` that reaches Firestore. Ordering is
+  undone by reading ranges concurrently, a limit cannot be enforced per range,
+  and a pushed filter needs its own ordering, which conflicts with ordering by
+  `__name__`.
+- An ordinary collection — not a collection group (whose names span parent
+  paths) and not a document path.
+
+Anything else scans sequentially, exactly as before.
 
 Reducing the transfer itself is usually better than paging around it:
 

@@ -5,6 +5,8 @@
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
 #include "firestore_paging.hpp"
+#include <memory>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -186,14 +188,54 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	FirestoreScanGlobalState() : current_index(0), finished(false) {
 	}
 
+	// ---- parallel scanning -------------------------------------------------
+	//
+	// A collection can be read by several threads at once by cutting its
+	// document-name space into ranges and giving each thread a range to page
+	// through. Firestore's REST pagination is sequential *within* a range, but
+	// the ranges are independent, so the round trips overlap.
+	//
+	// There are more ranges than threads: key distributions are rarely even,
+	// and a thread that finishes a light range takes the next one rather than
+	// idling while another grinds through a heavy one.
+
+	// Ranges not yet claimed. Empty when the scan is sequential.
+	std::vector<FirestoreKeyRange> key_range_partitions;
+	idx_t next_partition = 0;
+	std::mutex partition_mutex;
+
+	// Collection identity in the form range cursors need:
+	// projects/P/databases/D/documents/<collection>, and the final segment.
+	std::string document_path_prefix;
+	std::string collection_id;
+
+	// Threads to ask DuckDB for. 1 means this scan runs sequentially.
+	idx_t scan_threads = 1;
+
+	// Guards reported_unmapped, which every thread adds to.
+	std::mutex unmapped_mutex;
+
 	idx_t MaxThreads() const override {
-		return 1;
-	} // REST API is sequential
+		return scan_threads;
+	}
 };
 
-// Local state - per-thread state (minimal for single-threaded)
+// Local state - one per thread.
+//
+// In a parallel scan each thread owns its key range, its HTTP client (httplib
+// clients are not shareable across threads), its page of documents and its own
+// paging policy. In a sequential scan none of this is used and the state below
+// stays empty.
 struct FirestoreScanLocalState : public LocalTableFunctionState {
-	// Single-threaded, no local state needed
+	std::unique_ptr<FirestoreClient> client;
+	std::vector<FirestoreDocument> documents;
+	idx_t current_index = 0;
+
+	bool has_partition = false;
+	FirestoreKeyRange partition;
+	json structured_query;
+	bool last_page_was_full = true;
+	FirestorePageSizePolicy page_policy;
 };
 
 // Register the firestore_scan function

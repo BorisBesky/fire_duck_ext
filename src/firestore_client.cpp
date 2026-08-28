@@ -708,6 +708,11 @@ std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
 	return base;
 }
 
+std::string FirestoreClient::CollectionResourceName(const std::string &collection) const {
+	return "projects/" + credentials_->project_id + "/databases/" + credentials_->database_id + "/documents/" +
+	       collection;
+}
+
 bool FirestoreClient::CountDocuments(const std::string &collection, bool is_collection_group, int64_t up_to,
                                      int64_t &count_out) {
 	// Same URL shape as runQuery: a nested subcollection is counted against

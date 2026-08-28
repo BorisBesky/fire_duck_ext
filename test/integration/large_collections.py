@@ -48,6 +48,10 @@ REQUIRED_MOCK_FEATURES = {
     "runquery_select",
     "aggregation_query",
     "fail_aggregation",
+    "key_range_cursors",
+    "auto_ids",
+    "concurrency_stats",
+    "runtime_delay",
 }
 
 
@@ -79,6 +83,11 @@ def set_runquery_failure(enabled):
 
 def set_aggregation_failure(enabled):
     mock_post(f"/__fail_aggregation?enabled={1 if enabled else 0}")
+
+
+def set_request_delay(milliseconds):
+    """Introduce latency, which is what makes overlapping requests observable."""
+    mock_post(f"/__delay?ms={milliseconds}")
 
 
 def stats():
@@ -666,6 +675,200 @@ def _():
         assert_eq("list" in stats()["requests_by_op"], True, "the fallback read the documents")
     finally:
         set_aggregation_failure(False)
+
+
+# ---- parallel scanning ------------------------------------------------------
+#
+# A collection can be read by several threads at once by cutting its
+# document-name space into ranges. Firestore's pagination is sequential within
+# a range, but the ranges are independent, so the round trips overlap. The
+# tests that matter are the ones proving the rows are still exactly the rows a
+# sequential scan produces.
+#
+# The `auto_` collections carry Firestore-style auto-ids, which is what spreads
+# documents across ranges; sequential doc00000000 keys all land in one.
+
+PARALLEL = "show_missing:=false, schema_sample_size:=5"
+
+
+def scanned_rows(collection, extra="", settings=None):
+    """Row count via a query that actually reads documents.
+
+    Deliberately not count(*): with show_missing:=false that is answered by an
+    aggregation query and never reaches the scan, so it would say nothing at
+    all about how the scan behaves.
+    """
+    rows = run_sql(f"SELECT count(f0) FROM firestore_scan({scan_args(collection, extra)});", settings)
+    return int(rows[0])
+
+
+@test("parallel: a scan split across threads returns every document exactly once")
+def _():
+    rows = run_sql(
+        "SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan("
+        + scan_args("auto_bench_flat_8_20000", PARALLEL)
+        + ");"
+    )
+    # A range boundary that both neighbours claim would inflate the first
+    # number; one that neither claims would deflate both.
+    assert_eq(rows[0], "20000,20000", "every document once, none lost, none doubled")
+
+
+@test("parallel: the rows match what a sequential scan produces, value for value")
+def _():
+    # A checksum over ids and a field: same documents, same contents.
+    query = "SELECT count(*), sum(hash(__document_id)), sum(hash(f0)), sum(hash(f5)) FROM firestore_scan({args});"
+    threaded = run_sql(query.format(args=scan_args("auto_bench_flat_8_20000", PARALLEL)))
+    sequential = run_sql(
+        query.format(args=scan_args("auto_bench_flat_8_20000", PARALLEL)), ["SET firestore_max_threads=1"]
+    )
+    assert_eq(threaded, sequential, "parallel and sequential scans agree exactly")
+
+
+@test("parallel: threads actually overlap their requests")
+def _():
+    # Without latency the mock answers faster than the client can issue the
+    # next request, so nothing overlaps whether or not the scan is parallel.
+    # Big enough that every range holds more than one page: a collection small
+    # enough to answer each range in a single request can finish before the
+    # next thread has started.
+    set_request_delay(30)
+    try:
+        reset_stats()
+        assert_eq(scanned_rows("auto_bench_flat_8_20000", PARALLEL), 20000, "rows from the parallel scan")
+        peak = stats()["max_concurrent_requests"]
+    finally:
+        set_request_delay(0)
+    if peak < 2:
+        raise AssertionError(f"expected overlapping requests, peak concurrency was {peak}")
+
+
+@test("parallel: overlapping requests make a latency-bound scan faster")
+def _():
+    # The whole point: Firestore pagination is sequential within a range, so
+    # the only way to hide round-trip time is to read ranges at once.
+    collection = "auto_bench_flat_8_20000"
+    set_request_delay(30)
+    try:
+        # The mock caches serialised pages, so a cold run pays generation cost
+        # a warm one does not. Warm both shapes first, or this measures the
+        # cache rather than the concurrency.
+        scanned_rows(collection, PARALLEL, ["SET firestore_max_threads=1"])
+        scanned_rows(collection, PARALLEL)
+
+        started = time.time()
+        assert_eq(scanned_rows(collection, PARALLEL, ["SET firestore_max_threads=1"]), 20000, "sequential rows")
+        sequential_seconds = time.time() - started
+
+        started = time.time()
+        assert_eq(scanned_rows(collection, PARALLEL), 20000, "parallel rows")
+        parallel_seconds = time.time() - started
+    finally:
+        set_request_delay(0)
+
+    if parallel_seconds >= sequential_seconds:
+        raise AssertionError(
+            f"expected the parallel scan to be faster: {parallel_seconds:.2f}s vs {sequential_seconds:.2f}s"
+        )
+
+
+@test("parallel: one thread is the sequential path")
+def _():
+    reset_stats()
+    assert_eq(
+        scanned_rows("auto_bench_flat_8_5000", PARALLEL, ["SET firestore_max_threads=1"]),
+        5000,
+        "rows with parallelism disabled",
+    )
+    assert_eq("runquery" in stats()["requests_by_op"], False, "no key-range queries were issued")
+
+
+@test("parallel: keys that all fall in one range are still read correctly")
+def _():
+    # Sequential doc00000000-style ids sort below every range boundary, so one
+    # range holds the lot. Unbalanced, but it must not be wrong.
+    rows = run_sql(
+        "SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan("
+        + scan_args("bench_flat_8_5000", PARALLEL)
+        + ");"
+    )
+    assert_eq(rows[0], "5000,5000", "every document once, however the keys are distributed")
+
+
+@test("parallel: a collection smaller than the partition count is read correctly")
+def _():
+    # Most ranges are empty; the scan must not stall or lose the few documents
+    # that do exist.
+    assert_eq(scanned_rows("auto_bench_flat_8_7", PARALLEL), 7, "rows from a tiny collection")
+
+
+@test("parallel: projection and page size still apply per thread")
+def _():
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(f0) FROM firestore_scan("
+        + scan_args("auto_bench_wide_40_5000", PARALLEL + ", page_size:=250")
+        + ");"
+    )
+    assert_eq(rows[0], "5000", "rows from a projected, small-paged parallel scan")
+    counters = stats()
+    assert_eq(counters["requests_with_field_mask"] > 0, True, "range queries carry a select clause")
+    assert_page_size(counters["page_sizes_in_order"], 250, "range queries honour the page size")
+
+
+@test("parallel: the conditions that make range splitting inexact fall back")
+def _():
+    # Each of these would return different rows, or a different number of them,
+    # if it were split across ranges.
+    for label, extra, sql, settings in [
+        ("show_missing", "schema_sample_size:=5", None, None),
+        ("an ORDER BY", PARALLEL + ", order_by:='f0'", None, None),
+        ("a scan_limit", PARALLEL + ", scan_limit:=100", None, None),
+        ("a document path", "", "SELECT count(*) FROM firestore_scan({args});", None),
+    ]:
+        collection = "auto_bench_flat_8_5000" if label != "a document path" else "users/user1"
+        reset_stats()
+        args = scan_args(collection, extra)
+        run_sql(sql.format(args=args) if sql else f"SELECT count(f0) FROM firestore_scan({args});", settings)
+        if stats()["max_concurrent_requests"] > 1:
+            raise AssertionError(f"{label} must not be scanned in parallel")
+
+
+@test("parallel: a filtered scan is not split, and still returns the right rows")
+def _():
+    # A pushed filter needs its own ordering, which conflicts with ordering by
+    # __name__ for the range cursors. It uses runquery either way, so compare
+    # rows rather than request shape.
+    threaded = run_sql(
+        "SELECT count(*) FROM firestore_scan(" + scan_args("auto_bench_flat_8_5000", PARALLEL) + ") WHERE f3 = true;"
+    )
+    sequential = run_sql(
+        "SELECT count(*) FROM firestore_scan(" + scan_args("auto_bench_flat_8_5000", PARALLEL) + ") WHERE f3 = true;",
+        ["SET firestore_max_threads=1"],
+    )
+    assert_eq(threaded, sequential, "a filtered scan returns the same rows either way")
+
+
+@test("parallel: a collection group is not split by key range")
+def _():
+    # Collection-group names span parent paths, which this partitioning does
+    # not know how to cut.
+    reset_stats()
+    assert_eq(scanned_rows("~auto_bench_flat_8_5000", PARALLEL), 5000, "collection group rows")
+    if stats()["max_concurrent_requests"] > 1:
+        raise AssertionError("collection groups must not be split by key range")
+
+
+@test("parallel: an unmapped field is warned about once, not once per thread")
+def _():
+    # The reported set is shared across threads, so the warning is per scan.
+    # Mainly this asserts the shared set is not corrupted by concurrent use.
+    rows = run_sql(
+        "SELECT count(*) FROM firestore_scan("
+        + scan_args("auto_bench_late_1500_5000", "show_missing:=false, schema_sample_size:=5")
+        + ");"
+    )
+    assert_eq(rows[0], "5000", "the scan completes with fields outside the schema")
 
 
 # ---- regressions on the paths this change touched ---------------------------

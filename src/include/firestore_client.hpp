@@ -152,6 +152,11 @@ public:
 	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE,
 	            int64_t page_size = FIRESTORE_MAX_PAGE_SIZE);
 
+	// Resource name of a collection: projects/P/databases/D/documents/<path>.
+	// This is the form cursors and referenceValue use, and it is the same
+	// against the emulator -- only the request URL's host differs.
+	std::string CollectionResourceName(const std::string &collection) const;
+
 	// Count a collection's documents with :runAggregationQuery, without
 	// transferring any of them. `up_to` bounds the count (0 for no bound).
 	// Returns false when the service does not answer with a count -- older
