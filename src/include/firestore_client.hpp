@@ -48,6 +48,10 @@ struct FirestoreQuery {
 	// array carried over from the previous page. Null for the first page.
 	// documents.list uses page_token instead -- runQuery has no page tokens.
 	json start_at;
+
+	// Fields to ask Firestore for. When this requests a mask, unselected
+	// fields never cross the wire at all.
+	FirestoreProjection projection;
 };
 
 // Response from listing documents

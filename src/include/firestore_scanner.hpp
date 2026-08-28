@@ -158,6 +158,10 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	// weighs more than the byte budget allows.
 	FirestorePageSizePolicy page_policy;
 
+	// Fields Firestore is asked to return, derived from DuckDB's projection.
+	// Unselected fields then never cross the wire.
+	FirestoreProjection projection;
+
 	// Documents the *last* request actually asked for. The end-of-results
 	// check compares against this rather than the policy's current size:
 	// after a shrink those differ, and comparing against the new (smaller)

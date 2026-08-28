@@ -96,6 +96,72 @@ json BuildCollectionGroupStructuredQuery(const std::string &collection_id, const
 	return structured_query;
 }
 
+std::string QuoteFirestoreFieldPath(const std::string &field_name) {
+	// Firestore accepts a segment unquoted only when it matches
+	// [a-zA-Z_][a-zA-Z_0-9]*. `__`-prefixed names are excluded here as well:
+	// they are Firestore's reserved space, and __name__ in particular already
+	// means the document's resource name.
+	bool simple = !field_name.empty() && field_name.rfind("__", 0) != 0;
+	if (simple) {
+		for (size_t i = 0; i < field_name.size(); i++) {
+			const char c = field_name[i];
+			const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+			const bool digit = c >= '0' && c <= '9';
+			if (!(alpha || (i > 0 && digit))) {
+				simple = false;
+				break;
+			}
+		}
+	}
+	if (simple) {
+		return field_name;
+	}
+
+	// Backtick-quoted, with backslashes and backticks escaped.
+	std::string quoted = "`";
+	for (const char c : field_name) {
+		if (c == '\\' || c == '`') {
+			quoted += '\\';
+		}
+		quoted += c;
+	}
+	quoted += '`';
+	return quoted;
+}
+
+std::string UrlEncodeQueryValue(const std::string &value) {
+	static const char *kHexDigits = "0123456789ABCDEF";
+	std::string encoded;
+	encoded.reserve(value.size());
+	for (const char c : value) {
+		const bool unreserved = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+		                        c == '-' || c == '_' || c == '.' || c == '~';
+		if (unreserved) {
+			encoded += c;
+			continue;
+		}
+		const auto byte = static_cast<unsigned char>(c);
+		encoded += '%';
+		encoded += kHexDigits[byte >> 4];
+		encoded += kHexDigits[byte & 0x0F];
+	}
+	return encoded;
+}
+
+json BuildSelectClause(const FirestoreProjection &projection) {
+	json fields = json::array();
+	if (projection.field_paths.empty()) {
+		// Firestore's keys-only projection: every document comes back with a
+		// name and no fields.
+		fields.push_back({{"fieldPath", "__name__"}});
+	} else {
+		for (const auto &field_path : projection.field_paths) {
+			fields.push_back({{"fieldPath", QuoteFirestoreFieldPath(field_path)}});
+		}
+	}
+	return json {{"fields", fields}};
+}
+
 json BuildStartAtCursor(const json &structured_query, const std::string &last_document_name,
                         const json &last_document_fields) {
 	json values = json::array();

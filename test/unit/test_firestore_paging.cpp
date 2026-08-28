@@ -282,3 +282,102 @@ FD_TEST("cursor: a malformed orderBy entry still yields an aligned value") {
 		FD_REQUIRE_EQ(value["referenceValue"].get<std::string>(), std::string("docs/order7"));
 	}
 }
+
+// ---------------------------------------------------------------- field paths
+
+FD_TEST("field path: a simple identifier is left alone") {
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("name"), std::string("name"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("_private"), std::string("_private"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("field2"), std::string("field2"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("CamelCase_9"), std::string("CamelCase_9"));
+}
+
+FD_TEST("field path: a name containing a dot is quoted") {
+	// Unquoted, Firestore would read "a.b" as a path into a nested map and
+	// return the wrong field -- or none.
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("a.b"), std::string("`a.b`"));
+}
+
+FD_TEST("field path: names needing quotes get them") {
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("with space"), std::string("`with space`"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("2leading_digit"), std::string("`2leading_digit`"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("dash-ed"), std::string("`dash-ed`"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath(""), std::string("``"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("na\xc3\xafve"), std::string("`na\xc3\xafve`"));
+}
+
+FD_TEST("field path: a reserved-looking name is quoted so it stays a field") {
+	// Unquoted, __name__ means the document's resource name rather than a
+	// field that happens to be called that.
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("__name__"), std::string("`__name__`"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("__id"), std::string("`__id`"));
+	// A single leading underscore is not reserved.
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("_x"), std::string("_x"));
+}
+
+FD_TEST("field path: backticks and backslashes inside a quoted name are escaped") {
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("back`tick"), std::string("`back\\`tick`"));
+	FD_REQUIRE_EQ(duckdb::QuoteFirestoreFieldPath("back\\slash"), std::string("`back\\\\slash`"));
+}
+
+// ---------------------------------------------------------------- url encoding
+
+FD_TEST("url encoding: unreserved characters pass through") {
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("abcXYZ019-_.~"), std::string("abcXYZ019-_.~"));
+}
+
+FD_TEST("url encoding: everything else is percent-encoded") {
+	// A backtick-quoted field name is full of characters that would otherwise
+	// terminate or corrupt the query string.
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("`a.b`"), std::string("%60a.b%60"));
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("a b"), std::string("a%20b"));
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("a&b=c"), std::string("a%26b%3Dc"));
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("100%"), std::string("100%25"));
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue(""), std::string(""));
+}
+
+FD_TEST("url encoding: non-ASCII bytes are encoded, not mangled") {
+	// UTF-8 is encoded byte by byte; a signed char must not sign-extend into
+	// the hex conversion.
+	FD_REQUIRE_EQ(duckdb::UrlEncodeQueryValue("\xc3\xa9"), std::string("%C3%A9"));
+}
+
+// ---------------------------------------------------------------- select clause
+
+FD_TEST("select: projected fields become a select clause") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"name", "score"};
+
+	json select = duckdb::BuildSelectClause(projection);
+	FD_REQUIRE_EQ(select["fields"].size(), 2u);
+	FD_REQUIRE_EQ(select["fields"][0]["fieldPath"].get<std::string>(), std::string("name"));
+	FD_REQUIRE_EQ(select["fields"][1]["fieldPath"].get<std::string>(), std::string("score"));
+}
+
+FD_TEST("select: field names are quoted on the way into the clause") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"a.b"};
+	FD_REQUIRE_EQ(duckdb::BuildSelectClause(projection)["fields"][0]["fieldPath"].get<std::string>(),
+	              std::string("`a.b`"));
+}
+
+FD_TEST("select: wanting no fields becomes Firestore's keys-only projection") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+
+	FD_REQUIRE(projection.KeysOnly());
+	json select = duckdb::BuildSelectClause(projection);
+	FD_REQUIRE_EQ(select["fields"].size(), 1u);
+	FD_REQUIRE_EQ(select["fields"][0]["fieldPath"].get<std::string>(), std::string("__name__"));
+}
+
+FD_TEST("select: an unmasked projection is never keys-only") {
+	// masked == false means "send everything", which is the opposite of
+	// keys-only and must not be confused with it just because the field list
+	// is empty.
+	duckdb::FirestoreProjection projection;
+	FD_REQUIRE_FALSE(projection.masked);
+	FD_REQUIRE_FALSE(projection.KeysOnly());
+}

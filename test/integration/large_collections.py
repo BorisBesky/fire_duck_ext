@@ -38,7 +38,15 @@ MAX_PAGE_SIZE = 1000
 # Mock capabilities these tests need. A server already listening on the port is
 # only reused when it reports all of them; an older one would fail in confusing
 # ways rather than obviously.
-REQUIRED_MOCK_FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order"}
+REQUIRED_MOCK_FEATURES = {
+    "fat_shape",
+    "array_type_shapes",
+    "fail_runquery",
+    "page_sizes_in_order",
+    "odd_shape",
+    "field_mask",
+    "runquery_select",
+}
 
 
 # ---------------------------------------------------------------- mock control
@@ -442,6 +450,110 @@ def _():
     ]:
         rows = run_sql(f"SELECT typeof({column}) FROM firestore_scan({scan_args(collection)}) LIMIT 1;")
         assert_eq(rows[0], expected, f"{collection}.{column} element type")
+
+
+# ---- projection pushdown ----------------------------------------------------
+
+
+@test("projection: selecting one column of many shrinks the transfer")
+def _():
+    # Projection pushdown was enabled for DuckDB but never reached the wire:
+    # every field of every document was transferred whatever the query asked
+    # for. A small schema sample keeps the unmasked bind-time request from
+    # dominating the comparison.
+    sample = "schema_sample_size:=5"
+
+    reset_stats()
+    assert_eq(
+        run_sql("SELECT count(f0) FROM firestore_scan(" + scan_args("bench_wide_40_5000", sample) + ");")[0],
+        "5000",
+        "rows with one column projected",
+    )
+    narrow = stats()
+    assert_eq(narrow["requests_with_field_mask"] > 0, True, "the scan requests sent a field mask")
+
+    reset_stats()
+    run_sql("SELECT count(*) FROM (SELECT * FROM firestore_scan(" + scan_args("bench_wide_40_5000", sample) + "));")
+    wide = stats()
+    assert_eq(wide["requests_with_field_mask"], 0, "selecting every column sends no mask")
+
+    if narrow["bytes_out_uncompressed"] >= wide["bytes_out_uncompressed"] / 2:
+        raise AssertionError(
+            f"expected projecting 1 of 40 columns to at least halve the transfer, "
+            f"got {narrow['bytes_out_uncompressed']} vs {wide['bytes_out_uncompressed']} bytes"
+        )
+
+
+@test("projection: projected values are still correct across page boundaries")
+def _():
+    rows = run_sql(
+        "SELECT count(f0), count(f7), count(__document_id) FROM firestore_scan("
+        + scan_args("bench_wide_40_2500", "schema_sample_size:=5")
+        + ");"
+    )
+    assert_eq(rows[0], "2500,2500,2500", "every projected column is filled on every page")
+
+
+@test("projection: field names needing backtick quoting round-trip")
+def _():
+    # A field named "a.b" read as an unquoted field path would address b inside
+    # a map called a -- so it would come back empty rather than wrong, which is
+    # exactly the kind of bug a row count would not catch.
+    rows = run_sql(
+        'SELECT count("a.b"), count("with space"), count("2digit"), count("back`tick"), count(plain) '
+        "FROM firestore_scan(" + scan_args("bench_odd_4_200") + ");"
+    )
+    assert_eq(rows[0], "200,200,200,200,200", "awkward field names survive the mask")
+
+
+@test("projection: values behind awkward names are the real values")
+def _():
+    masked = run_sql('SELECT "a.b" FROM firestore_scan(' + scan_args("bench_odd_4_200") + ") ORDER BY 1 LIMIT 3;")
+    # Same column, but fetched with no mask at all, so the two paths must agree.
+    unmasked = run_sql(
+        'SELECT "a.b" FROM firestore_scan(' + scan_args("bench_odd_4_200", "unmapped_column:=true") + ") "
+        "ORDER BY 1 LIMIT 3;"
+    )
+    assert_eq(masked, unmasked, "masked and unmasked reads of the same column agree")
+
+
+@test("projection: __document_id alone needs no fields")
+def _():
+    rows = run_sql(
+        "SELECT count(__document_id), count(DISTINCT __document_id) FROM firestore_scan("
+        + scan_args("bench_flat_8_2500")
+        + ");"
+    )
+    assert_eq(rows[0], "2500,2500", "document ids come back without asking for any field")
+
+
+@test("projection: an unmapped catch-all column disables the mask")
+def _():
+    # __unmapped is defined as every field the schema does not cover, so a
+    # mask would empty it by construction.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(__unmapped) FROM firestore_scan("
+        + scan_args("bench_late_1500_3000", "schema_sample_size:=5, unmapped_column:=true")
+        + ");"
+    )
+    assert_eq(stats()["requests_with_field_mask"], 0, "no mask is sent when __unmapped is selected")
+    if int(rows[0]) == 0:
+        raise AssertionError("expected __unmapped to carry the fields the sample missed")
+
+
+@test("projection: a filter on an unselected column still filters correctly")
+def _():
+    filtered = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+    projected = run_sql("SELECT count(f0) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+    assert_eq(filtered[0], projected[0], "projecting a different column does not change which rows match")
+
+
+@test("projection: collection groups project through select")
+def _():
+    reset_stats()
+    assert_eq(count_rows("~bench_wide_40_2500", "schema_sample_size:=5"), 2500, "rows from a projected group scan")
+    assert_eq(stats()["requests_with_field_mask"] > 0, True, "collection-group requests carry a select clause")
 
 
 # ---- regressions on the paths this change touched ---------------------------

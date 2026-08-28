@@ -50,8 +50,9 @@ docs:
     firestore_update(), firestore_delete(), their batch counterparts
     (firestore_update_batch(), firestore_delete_batch()), and the array-transform
     functions firestore_array_union(), firestore_array_remove(), and
-    firestore_array_append(). WHERE filters and SQL ORDER BY / LIMIT are pushed
-    down to Firestore where possible to reduce data transferred.
+    firestore_array_append(). WHERE filters, SQL ORDER BY / LIMIT, and the
+    column projection are pushed down to Firestore where possible, so
+    unselected fields and non-matching rows never cross the wire.
 
     Scans stream: one page of documents is held at a time and the next is
     fetched only as DuckDB consumes the current one, so a collection of any

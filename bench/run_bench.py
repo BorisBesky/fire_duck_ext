@@ -95,6 +95,8 @@ def shape_columns(collection):
         return ["doc_no", "embedding"]
     if shape == "fat":
         return ["doc_no", "blob"]
+    if shape == "odd":
+        return ["plain"] + ["a.b", "with space", "2digit", "back`tick"][:param]
     raise ValueError(shape)
 
 

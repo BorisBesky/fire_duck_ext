@@ -236,7 +236,7 @@ order and schemas drift over time.
 | 1 | Reuse one `httplib::Client` per host, stored on `FirestoreClient` | 2.7x on WAN A/B | small | **done** |
 | 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | **done** |
 | 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
-| 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
+| 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | **done** |
 | 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
 | 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
 | 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | **done** |
@@ -535,3 +535,48 @@ sizes as well as rows. `scripts/run_coverage.sh` merges both runs and reports
 coverage of the lines this change adds or modifies — 98% at the time of
 writing; the remainder is `GetDocument`/`CreateDocument` (covered by the
 emulator suite, not the mock) and a `FunctionData::Equals` clause.
+
+---
+
+## 6. Implemented: #3 — projection reaches the wire
+
+`projection_pushdown = true` was set, so DuckDB skipped converting unselected
+columns, but no mask was ever sent: every field of every document was
+transferred regardless of what the query asked for.
+
+The scan now builds a `FirestoreProjection` from `bind_data.projected_columns`
+and sends it as `mask.fieldPaths` on `documents.list` and `select.fields` on
+`runQuery`. Measured against the mock, 5,000 documents of 40 fields, with the
+schema sample held at 5 documents so the unmasked bind-time request does not
+dominate:
+
+| query | transferred |
+|---|---|
+| `count(*)` over `SELECT *` (40 columns) | 7.03 MiB |
+| `count(f0)` (1 column) | **1.11 MiB** |
+| `count(f0..f3)` (4 columns) | 1.52 MiB |
+
+6.3x on a 1-of-40 projection. The floor is document names and timestamps,
+which a mask cannot remove.
+
+Three details the implementation has to get right:
+
+- **Field names are not identifiers.** A Firestore field may be called `a.b`,
+  and a field path is dot-separated, so unquoted it addresses `b` inside a map
+  called `a` — the column would come back empty rather than wrong. Names that
+  are not simple identifiers are backtick-quoted (escaping backticks and
+  backslashes) and percent-encoded into the query string. Names beginning
+  `__` are quoted too: unquoted, `__name__` means the document's resource
+  name, not a field of that name.
+- **`unmapped_column:=true` cannot be masked** — that column is defined as
+  every field the schema does not cover, so a mask would empty it by
+  construction. The projection is dropped entirely in that case.
+- **Keys-only is not expressible on `documents.list`.** An absent mask means
+  "all fields" and a URL cannot carry an empty repeated parameter, so a query
+  needing no fields sends no mask there. `runQuery` has the documented
+  keys-only form (`select __name__`) and uses it.
+
+The mock now honours masks and `select` clauses, including unquoting backticks
+the way Firestore does — without that it would look for a key spelled with the
+backticks still on, and a quoting bug in the extension would show up as an
+empty column rather than a failure.

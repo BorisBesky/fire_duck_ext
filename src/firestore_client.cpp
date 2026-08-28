@@ -390,6 +390,17 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 		add_param("orderBy", query.order_by.value());
 	}
 
+	// Ask only for the fields the query projects, so the rest never crosses
+	// the wire. A keys-only projection cannot be expressed here -- an absent
+	// mask parameter means "every field", and there is no way to spell an
+	// empty one in a URL -- so that case sends no mask and pays for the
+	// fields it will ignore.
+	if (query.projection.masked && !query.projection.KeysOnly()) {
+		for (const auto &field_path : query.projection.field_paths) {
+			add_param("mask.fieldPaths", UrlEncodeQueryValue(QuoteFirestoreFieldPath(field_path)));
+		}
+	}
+
 	FirestoreErrorContext ctx;
 	ctx.withOperation("list").withCollection(collection);
 
@@ -637,6 +648,9 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 
 	const int64_t page_size = ClampFirestorePageSize(query.page_size);
 	json structured_query = BuildCollectionGroupStructuredQuery(collection_id, order_by, page_size);
+	if (query.projection.masked) {
+		structured_query["select"] = BuildSelectClause(query.projection);
+	}
 	if (!query.start_at.is_null()) {
 		structured_query["startAt"] = query.start_at;
 	}

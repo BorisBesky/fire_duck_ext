@@ -628,6 +628,28 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	return std::move(result);
 }
 
+// Work out which document fields Firestore needs to send for this scan.
+//
+// __document_id needs no field: it comes from the document's resource name,
+// which every response carries. A projection that reaches the __unmapped
+// catch-all cannot be masked at all -- that column is defined as "every field
+// the schema does not cover", so restricting the response would empty it by
+// construction.
+static FirestoreProjection ResolveProjection(const FirestoreScanBindData &bind_data) {
+	FirestoreProjection projection;
+	for (const auto src_col : bind_data.projected_columns) {
+		if (src_col == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (src_col >= bind_data.column_names.size()) {
+			return FirestoreProjection {};
+		}
+		projection.field_paths.push_back(bind_data.column_names[src_col]);
+	}
+	projection.masked = true;
+	return projection;
+}
+
 // Feed a response's weight back to the paging policy, so a page heavier than
 // the byte budget makes the next request smaller.
 static void ObservePageWeight(FirestoreScanGlobalState &global_state, const FirestoreListResponse &response,
@@ -661,6 +683,9 @@ static FirestoreListResponse StartUnfilteredScan(FirestoreScanBindData &bind_dat
 		const std::string collection_id = bind_data.collection.substr(1);
 		const std::vector<OrderByField> server_order_by = can_order ? order_by : std::vector<OrderByField>();
 		json structured_query = BuildCollectionGroupStructuredQuery(collection_id, server_order_by, page_size);
+		if (global_state.projection.masked) {
+			structured_query["select"] = BuildSelectClause(global_state.projection);
+		}
 
 		global_state.structured_query = structured_query;
 		global_state.uses_run_query = true;
@@ -676,6 +701,7 @@ static FirestoreListResponse StartUnfilteredScan(FirestoreScanBindData &bind_dat
 	FirestoreQuery query;
 	query.show_missing = bind_data.show_missing;
 	query.page_size = page_size;
+	query.projection = global_state.projection;
 	if (can_order) {
 		query.order_by = FormatOrderByForREST(order_by);
 	} else if (!order_by.empty()) {
@@ -715,6 +741,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	    bind_data.page_size.has_value() ? bind_data.page_size.value() : FirestoreSettings::PageSize(context);
 	global_state->page_policy =
 	    FirestorePageSizePolicy(configured_page_size, FirestoreSettings::PageByteBudget(context));
+	global_state->projection = ResolveProjection(bind_data);
 
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
@@ -792,6 +819,13 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		json sq;
 		sq["from"] = {{{"collectionId", collection_id}, {"allDescendants", bind_data.is_collection_group}}};
+
+		// Ask only for the projected fields. The WHERE clause is evaluated
+		// server-side against the whole document, so a filter on a field the
+		// query does not select still works.
+		if (global_state->projection.masked) {
+			sq["select"] = BuildSelectClause(global_state->projection);
+		}
 
 		// Add WHERE clause
 		sq["where"] = BuildWhereClause(global_state->pushdown_result.pushed_filters);
@@ -1047,6 +1081,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 				query.show_missing = bind_data.show_missing;
 				query.page_token = global_state.next_page_token;
 				query.page_size = global_state.page_policy.CurrentPageSize();
+				query.projection = global_state.projection;
 				bool can_order_named =
 				    !bind_data.parsed_order_by.empty() && CanOrderByOnServer(bind_data.parsed_order_by, bind_data);
 				if (can_order_named) {

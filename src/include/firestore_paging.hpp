@@ -86,6 +86,41 @@ json BuildOrderByArray(const std::vector<OrderByField> &order_by);
 json BuildCollectionGroupStructuredQuery(const std::string &collection_id, const std::vector<OrderByField> &order_by,
                                          int64_t page_size);
 
+// Quote a Firestore field name for use in a field path.
+//
+// A field path is dot-separated, so a field whose name contains a dot has to
+// be backtick-quoted or Firestore reads it as a path into a nested map and
+// returns the wrong thing (or nothing). Names starting with `__` are quoted
+// too: `__name__` unquoted means the document's resource name, not a field
+// that happens to be called that.
+std::string QuoteFirestoreFieldPath(const std::string &field_name);
+
+// Percent-encode a value for a URL query parameter. Field names are arbitrary
+// Firestore strings and reach the wire as query parameters in a document mask.
+std::string UrlEncodeQueryValue(const std::string &value);
+
+// What a scan needs Firestore to send back for each document.
+struct FirestoreProjection {
+	// Field names to request. Empty with `masked` set means keys only.
+	std::vector<std::string> field_paths;
+
+	// False when every field is needed and no mask may be sent -- an unmapped
+	// catch-all column, for instance, is defined as "whatever the schema does
+	// not cover", so masking would empty it.
+	bool masked = false;
+
+	// True when no document fields are wanted at all, only names. runQuery
+	// expresses this as select __name__; documents.list cannot express it (an
+	// absent mask parameter means "all fields"), so that path sends no mask.
+	bool KeysOnly() const {
+		return masked && field_paths.empty();
+	}
+};
+
+// Build the `select` clause for a StructuredQuery. A projection wanting no
+// fields becomes Firestore's documented keys-only form, select __name__.
+json BuildSelectClause(const FirestoreProjection &projection);
+
 // Build the `startAt` cursor that resumes a runQuery after `last_document`.
 //
 // The cursor must carry one value per orderBy entry, in order, or Firestore

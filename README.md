@@ -14,6 +14,7 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **SQL ORDER BY / LIMIT pushdown** for faster top-N and sorted scans
 - **Collection ID listings** by scanning a Firestore document path
 - **Streaming scans** that page through collections of any size, with a tunable page size for large documents
+- **Projection pushdown** so only the selected fields cross the wire
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -630,6 +631,14 @@ trips are added.
 
 Reducing the transfer itself is usually better than paging around it:
 
+- Only the columns a query selects are requested. The scan sends Firestore a
+  `mask.fieldPaths` (or `select.fields` on a collection group) built from the
+  projection, so unselected fields never cross the wire — selecting 1 of 40
+  columns from 5,000 documents moves 1.11 MiB instead of 7.03 MiB. Two cases
+  opt out: `unmapped_column:=true`, which is defined as everything the schema
+  does not cover, and a query needing no fields at all, which the
+  `documents.list` URL has no way to express (`runQuery` uses Firestore's
+  keys-only `select __name__`).
 - `WHERE` clauses that Firestore can serve are pushed down, so filtered rows
   never cross the wire — see [Filter Pushdown](#filter-pushdown).
 - `scan_limit:=` and SQL `LIMIT` bound how much is fetched — see

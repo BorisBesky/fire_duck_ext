@@ -27,6 +27,7 @@ Collection naming grammar:  bench_<shape>_<param>_<count>
   mixed    <n_fields>   scalar fields whose TYPE varies per document
   late     <from_idx>   3 base fields; `late_field` appears from document <from_idx>
   fat      <kib>        one string field of <kib> KiB, for page-weight limits
+  odd      <n_fields>   field names needing backtick quoting in a field path
 
 Control endpoints:
   GET  /__stats          instrumentation counters as JSON
@@ -113,7 +114,8 @@ class Stats:
 # Capabilities a caller can require before reusing an already-running mock.
 # Add a name here whenever a shape or control endpoint is added that tests
 # depend on.
-FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order"}
+FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order", "odd_shape",
+            "field_mask", "runquery_select"}
 
 STATS = Stats()
 
@@ -247,6 +249,16 @@ def make_fields(shape, param, i):
             "blob": {"stringValue": filler[: param * 1024]},
         }
 
+    if shape == "odd":
+        # Names a Firestore field path cannot carry unquoted: a dot would read
+        # as a path into a nested map, a space and a leading digit are not
+        # valid identifier characters.
+        out = {"plain": _scalar(0, i, 0)}
+        names = ["a.b", "with space", "2digit", "back`tick"]
+        for j in range(min(param, len(names))):
+            out[names[j]] = _scalar(j % 4, i, j + 1)
+        return out
+
     if shape == "mixed":
         # Field type cycles with the document index, so a schema inferred from
         # the first page is wrong for most later documents.
@@ -256,6 +268,29 @@ def make_fields(shape, param, i):
         return out
 
     raise ValueError(f"unknown shape {shape!r}")
+
+
+def unquote_field_path(field_path):
+    """Undo the backtick quoting Firestore requires for awkward field names.
+
+    A mask or select arrives as `a.b` for a field literally named "a.b";
+    without unquoting here the mock would look for a key that includes the
+    backticks and quietly return nothing, which would let a quoting bug in the
+    extension pass as an empty column.
+    """
+    if len(field_path) >= 2 and field_path.startswith("`") and field_path.endswith("`"):
+        inner = field_path[1:-1]
+        out, escaped = [], False
+        for ch in inner:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            else:
+                out.append(ch)
+        return "".join(out)
+    return field_path
 
 
 def parse_collection(name):
@@ -291,7 +326,8 @@ def build_page(collection, offset, page_size, mask=None):
     for i in range(offset, end):
         fields = make_fields(shape, param, i)
         if mask:
-            fields = {k: v for k, v in fields.items() if k in mask}
+            wanted = {unquote_field_path(f) for f in mask}
+            fields = {k: v for k, v in fields.items() if k in wanted}
         docs.append({
             "name": f"{DB_PREFIX}/{collection}/doc{i:08d}",
             "fields": fields,
@@ -310,8 +346,8 @@ def build_page(collection, offset, page_size, mask=None):
     return result
 
 
-def build_runquery_page(collection, offset, limit):
-    key = ("__rq__", collection, offset, limit)
+def build_runquery_page(collection, offset, limit, select=None):
+    key = ("__rq__", collection, offset, limit, tuple(select) if select is not None else None)
     with PAGE_CACHE_LOCK:
         hit = PAGE_CACHE.get(key)
     if hit is not None:
@@ -323,12 +359,19 @@ def build_runquery_page(collection, offset, limit):
     shape, param, total = parsed
 
     end = min(offset + limit, total)
+    wanted = None
+    if select is not None:
+        # select __name__ is Firestore's keys-only projection: names, no fields.
+        wanted = {unquote_field_path(f) for f in select if f != "__name__"}
     out = []
     for i in range(offset, end):
+        fields = make_fields(shape, param, i)
+        if wanted is not None:
+            fields = {k: v for k, v in fields.items() if k in wanted}
         out.append({
             "document": {
                 "name": f"{DB_PREFIX}/{collection}/doc{i:08d}",
-                "fields": make_fields(shape, param, i),
+                "fields": fields,
                 "createTime": "2026-01-01T00:00:00.000000Z",
                 "updateTime": "2026-01-01T00:00:00.000000Z",
             },
@@ -534,12 +577,16 @@ class Handler(BaseHTTPRequestHandler):
                         except ValueError:
                             pass
 
-            page = build_runquery_page(collection, offset, limit)
+            select = None
+            if "select" in sq:
+                select = [f.get("fieldPath", "") for f in sq["select"].get("fields", [])]
+
+            page = build_runquery_page(collection, offset, limit, select)
             if page is None:
                 self._count("runquery_404")
                 self._error(404, f"Collection '{collection}' not found"); return
             raw, ndocs = page
-            self._count("runquery", docs=ndocs, page_size=limit)
+            self._count("runquery", docs=ndocs, page_size=limit, mask=select is not None)
             self._send(raw); return
 
         if path.endswith(":listCollectionIds"):
