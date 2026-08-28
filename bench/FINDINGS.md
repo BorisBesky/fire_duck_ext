@@ -699,3 +699,103 @@ resolves `startAt`/`endAt` by bisecting them, honouring `before` on both sides;
 otherwise it could not have caught the boundary bug above. Collections may also
 be prefixed `auto_` to give documents Firestore-shaped auto-ids, since
 sequential `doc00000000` keys all sort into a single range.
+
+---
+
+## 9. A/B against the pre-change binary
+
+Everything above was measured while the work was being done, mostly by turning
+a feature off and on within one build. That controls for machine and compiler
+but is not an old-commit-vs-new-commit comparison, and none of it came from the
+benchmark harness -- which was not run at all, so nothing checked whether the
+untouched paths had got slower.
+
+This section is the real thing: `bench/run_bench.py` run twice against the same
+mock, once with a binary built from `072e51e` (the branch point) and once from
+the branch, with `DUCKDB_BIN` selecting between them. Scenarios use only syntax
+both builds understand, so the contrast comes from the binary rather than from
+different SQL.
+
+```bash
+python3 bench/mock_firestore.py 8099 &
+git checkout main && make release && cp build/release/duckdb /tmp/duckdb-base
+git checkout - && make release
+DUCKDB_BIN=/tmp/duckdb-base python3 bench/run_bench.py --json before.json
+python3 bench/run_bench.py --json after.json
+python3 bench/compare_ab.py before.json after.json
+```
+
+The `MiB` column is bytes on the wire, i.e. after gzip. Elsewhere in this
+document the figures quoted from the mock's own counters are uncompressed;
+they measure different things and are not comparable to each other.
+
+### What got faster
+
+| scenario | before | after | |
+|---|---|---|---|
+| `count(*)` over 200k documents, `show_missing:=false` | 11.117 s, 200 requests, 200,000 documents | **0.002 s, 1 request, 0 documents** | the aggregation query |
+| 1 of 40 columns, 20k documents | 3.18 MiB | **0.31 MiB** | 10.3x fewer bytes |
+| all 40 columns, 20k documents | 1.319 s | 1.045 s | 1.26x |
+| scan of 20k auto-id documents @20 ms RTT | 1.446 s | 0.808 s | 1.79x, opt-in |
+
+`count(*)` with the default `show_missing` is unchanged at ~11 s, which is the
+intended behaviour: a scan returns phantom documents that an aggregation query
+would not count, so it stays on the reading path.
+
+### What the A/B caught
+
+**Parallel scanning regressed clustered keys by 2x**, and was on by default.
+Measured over 20,000 documents on loopback: auto-ids 1.08 s -> 0.67 s on four
+threads, but sequential ids 1.02 s -> **2.05 s**. Every range but one comes
+back empty, the work funnels through one thread regardless, and runQuery's
+per-document envelope costs about 22% more bytes than documents.list (5.44 MiB
+against 4.41 MiB uncompressed). The default is now 1, and the README no longer
+claims clustered keys are merely "no faster".
+
+**`ParseDocument`'s `std::move` costs about 17% on array-heavy documents.**
+Introduced to avoid deep-copying a page's fields while the parsed response is
+still alive -- roughly halving peak memory per page -- it turns out to cost
+real time on documents with large JSON structures, and nothing on scalar ones:
+
+| `count(*)` over 20k documents | median | vs branch point |
+|---|---|---|
+| `072e51e` (copies) | 1.408 s | 1.00x |
+| branch HEAD (moves) | 1.652 s | **1.17x slower** |
+| HEAD with only that line reverted | 1.362 s | 0.97x |
+
+Localised by interleaved measurement (base and branch alternating, 7-9 pairs,
+median, run-to-run spread 3-6%): the gap is in the scan, not in schema
+inference -- binding alone is 0.79x, i.e. faster -- and the wire traffic is
+byte-identical, 21 requests and 39.78 MiB uncompressed either way. Inlining the
+wire-format helpers that the same commit moved into their own translation unit
+does not recover it, so cross-translation-unit call overhead is not the cause.
+The likely mechanism is locality: copying produces a fresh compact subtree and
+frees the parsed response as a block, while moving leaves each document's
+fields pointing into nodes scattered through the response's allocations.
+
+This is a genuine trade-off -- roughly 2x peak page memory against ~17% CPU on
+array-heavy scans -- and it is left as it is for now, because bounding memory
+is what this branch set out to do and the page-byte budget only shrinks a page
+after it has already been held. Reproduce with:
+
+```sql
+SELECT count(*) FROM firestore_scan('bench_arr_64_20000',
+    project_id:='bench-project', api_key:='benchkey');
+```
+
+### Regression check
+
+Every other group is unchanged within noise. Re-measured at 5 repeats after the
+first sweep at 1 repeat showed wobbles: map depths 1-8, array widths 1-64, the
+nested-shape set, `scaling` at 1k/10k/50k/200k documents, both limit groups and
+the wire group all come out `=`. So the row-emission refactor into shared
+helpers, and the change from `contains()` plus `operator[]` to a single
+`find()` per field, cost nothing measurable -- and a projected scalar scan
+(`count(f0)` over flat8) is 15% *faster* thanks to the field mask.
+
+One measurement lesson worth recording: at one repeat the sweep reported
+`map depth 16` and `array 64 elems [no materialize]` as 1.28x and 1.39x slower,
+and `map depth 16` as *faster* than `map depth 8` on the base binary, which is
+impossible. Single-run medians on a shared container are not trustworthy at
+this effect size; the numbers above come from interleaved runs with the spread
+reported alongside.

@@ -337,7 +337,17 @@ FirestoreDocument FirestoreClient::ParseDocument(json &&doc_json) {
 
 	if (doc_json.contains("fields")) {
 		// Moved, not copied: a page holds up to 1000 of these, and copying
-		// them while the parsed response is still alive doubles peak memory.
+		// them while the parsed response is still alive roughly doubles peak
+		// memory for the page.
+		//
+		// This is a trade, not a free win. Measured against the branch point
+		// over 20,000 documents carrying 64-element arrays, `count(*)` costs
+		// 1.408s copying and 1.652s moving -- about 17% -- with byte-identical
+		// wire traffic; scalar-field collections show no difference. The
+		// likely mechanism is locality: a copy produces a fresh compact
+		// subtree and frees the parsed response as a block, while a move
+		// leaves these fields pointing into nodes scattered through the
+		// response's allocations. See bench/FINDINGS.md section 9.
 		doc.fields = std::move(doc_json["fields"]);
 	}
 
