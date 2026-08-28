@@ -24,7 +24,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DUCKDB = os.path.join(ROOT, "build", "release", "duckdb")
+# Overridable so one harness can measure two builds -- the point of an A/B.
+DUCKDB = os.environ.get("DUCKDB_BIN") or os.path.join(ROOT, "build", "release", "duckdb")
 PORT = int(os.environ.get("MOCK_PORT", "8099"))
 BASE = f"http://127.0.0.1:{PORT}"
 REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
@@ -41,6 +42,18 @@ def mock_get(path):
 
 def mock_post(path):
     req = urllib.request.Request(BASE + path, data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def set_delay(milliseconds):
+    """Per-request latency on the mock.
+
+    Loopback has none, which hides the whole point of overlapping requests: a
+    scan that issues them one at a time and one that issues four at a time cost
+    the same when each costs nothing.
+    """
+    req = urllib.request.Request(f"{BASE}/__delay?ms={milliseconds}", data=b"", method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
@@ -75,7 +88,8 @@ PREAMBLE = """LOAD fire_duck_ext;
 
 def shape_columns(collection):
     """Data columns a synthetic collection exposes (mirrors mock_firestore)."""
-    _prefix, shape, param, _count = collection.split("_")
+    name = collection[len("auto_"):] if collection.startswith("auto_") else collection
+    _prefix, shape, param, _count = name.split("_")
     param = int(param)
     if shape in ("flat", "wide", "mixed"):
         return [f"f{j}" for j in range(param)]
@@ -296,6 +310,51 @@ def group_projection():
     ]
 
 
+def group_count():
+    """Is a bare COUNT(*) answered without transferring the documents?"""
+    n = 200000
+    coll = f"bench_flat_8_{n}"
+    args = ("project_id:='bench-project', api_key:='benchkey', "
+            "columns:={'f0':'VARCHAR'}")
+    return [
+        # show_missing:=false is what makes a count eligible: an aggregation
+        # query never counts phantom documents, while a show_missing scan
+        # returns them as rows.
+        measure("flat8 200k: count(*) show_missing=false",
+                f"SELECT count(*) FROM firestore_scan('{coll}', {args}, show_missing:=false)",
+                group="count"),
+        measure("flat8 200k: count(*) default",
+                f"SELECT count(*) FROM firestore_scan('{coll}', {args})",
+                group="count"),
+        # Reads a value, so it can never be answered by a count -- the control.
+        measure("flat8 200k: count(f0) show_missing=false",
+                f"SELECT count(f0) FROM firestore_scan('{coll}', {args}, show_missing:=false)",
+                group="count"),
+    ]
+
+
+def group_parallel():
+    """Does splitting a collection across threads overlap the round trips?
+
+    Run with latency, because that is the cost parallelism hides. The `auto_`
+    collection carries Firestore-shaped document ids; sequential doc00000000
+    keys all sort into one key range and would not spread across threads.
+    """
+    n = 20000
+    args = "project_id:='bench-project', api_key:='benchkey', show_missing:=false, schema_sample_size:=5"
+    rows = []
+    set_delay(20)
+    try:
+        for coll in (f"auto_bench_flat_8_{n}", f"bench_flat_8_{n}"):
+            label = "auto-ids" if coll.startswith("auto_") else "sequential ids"
+            rows.append(measure(f"flat8 20k {label}: scan @20ms",
+                                f"SELECT count(f0) FROM firestore_scan('{coll}', {args})",
+                                group="parallel"))
+    finally:
+        set_delay(0)
+    return rows
+
+
 def group_limit():
     """Is scan_limit honoured, and does it stop fetching early?"""
     rows = []
@@ -376,6 +435,8 @@ GROUPS = {
     "limit": group_limit,
     "sql-limit": group_sql_limit,
     "wire": group_wire,
+    "count": group_count,
+    "parallel": group_parallel,
 }
 
 
@@ -421,6 +482,7 @@ def main():
     if not wait_for_mock():
         sys.exit(f"mock firestore not reachable at {BASE} -- start bench/mock_firestore.py")
 
+    print(f"# duckdb: {DUCKDB}", file=sys.stderr, flush=True)
     selected = args or list(GROUPS)
     rows = []
     for name in selected:
