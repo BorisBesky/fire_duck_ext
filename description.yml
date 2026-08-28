@@ -28,6 +28,9 @@ docs:
     -- Read documents
     SELECT * FROM firestore_scan('users');
 
+    -- Read a collection of large documents in smaller pages
+    SELECT * FROM firestore_scan('scanned_documents', page_size:=50);
+
     -- Filter with SQL
     SELECT __document_id, name, email
     FROM firestore_scan('users')
@@ -50,10 +53,21 @@ docs:
     firestore_array_append(). WHERE filters and SQL ORDER BY / LIMIT are pushed
     down to Firestore where possible to reduce data transferred.
 
+    Scans stream: one page of documents is held at a time and the next is
+    fetched only as DuckDB consumes the current one, so a collection of any
+    size can be read without holding it in memory. Collection groups paginate
+    by cursor rather than stopping at the first page. page_size (or the
+    firestore_page_size setting) controls how many documents each round trip
+    fetches, and firestore_page_byte_budget shrinks that automatically when a
+    page turns out to weigh more than the budget allows -- which matters for
+    collections whose documents approach Firestore's 1 MiB limit.
+
     Firestore's schemaless documents are mapped to typed DuckDB columns
     automatically, with configurable handling for nested maps (map_encoding)
     and fields that only appear in some documents (schema_sample_size,
-    unmapped_column, columns).
+    unmapped_column, columns). Schema inference streams too, so sampling every
+    document of a large collection costs one page of memory rather than the
+    whole collection.
 
     Secrets require PROJECT_ID and one of: a service-account key **file path**
     (SERVICE_ACCOUNT_JSON, admin access, bypasses Security Rules via IAM,

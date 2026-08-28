@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+Integration tests for large-collection handling.
+
+These cover the parts that unit tests cannot reach: the scanner and client
+glue that only exists in terms of real HTTP round trips -- pagination,
+per-request page sizes, and what the extension actually puts on the wire.
+The pure logic underneath is covered by scripts/run_unit_tests.sh.
+
+Runs against bench/mock_firestore.py, which serves synthetic collections
+named bench_<shape>_<param>_<count> and reports per-request instrumentation,
+so an assertion can be about request counts and page sizes rather than only
+about rows.
+
+    python3 test/integration/large_collections.py            # all tests
+    python3 test/integration/large_collections.py collection # substring filter
+
+Requires a built extension at build/release/duckdb.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+DUCKDB = os.path.join(ROOT, "build", "release", "duckdb")
+MOCK = os.path.join(ROOT, "bench", "mock_firestore.py")
+PORT = int(os.environ.get("MOCK_PORT", "8123"))
+BASE = f"http://127.0.0.1:{PORT}"
+
+# Firestore's own per-page cap, which the extension clamps to.
+MAX_PAGE_SIZE = 1000
+
+# Mock capabilities these tests need. A server already listening on the port is
+# only reused when it reports all of them; an older one would fail in confusing
+# ways rather than obviously.
+REQUIRED_MOCK_FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order"}
+
+
+# ---------------------------------------------------------------- mock control
+
+
+def mock_get(path):
+    # The mock is on loopback; an HTTPS proxy in the environment must not
+    # intercept it.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(BASE + path, timeout=60) as response:
+        return json.load(response)
+
+
+def mock_post(path):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(BASE + path, data=b"", method="POST")
+    with opener.open(request, timeout=60) as response:
+        return json.load(response)
+
+
+def reset_stats():
+    mock_post("/__reset")
+
+
+def set_runquery_failure(enabled):
+    mock_post(f"/__fail_runquery?enabled={1 if enabled else 0}")
+
+
+def stats():
+    return mock_get("/__stats")
+
+
+# ---------------------------------------------------------------- duckdb driver
+
+
+def run_sql(sql, settings=None):
+    """Run SQL through the real CLI against the mock, returning CSV rows."""
+    script = "LOAD fire_duck_ext;\n"
+    for statement in settings or []:
+        script += statement + ";\n"
+    script += ".mode csv\n.headers off\n" + sql + "\n"
+
+    env = dict(os.environ)
+    env["FIRESTORE_EMULATOR_HOST"] = f"127.0.0.1:{PORT}"
+    completed = subprocess.run(
+        [DUCKDB, "-batch", "-init", "/dev/null"],
+        input=script,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        cwd=ROOT,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"duckdb exited {completed.returncode}\nSQL: {sql}\n"
+            f"stdout: {completed.stdout}\nstderr: {completed.stderr}"
+        )
+    return [line for line in completed.stdout.strip().splitlines() if line]
+
+
+def scan_args(collection, extra=""):
+    args = f"'{collection}', project_id:='bench-project', api_key:='benchkey'"
+    return args + (", " + extra if extra else "")
+
+
+def count_rows(collection, extra="", settings=None):
+    rows = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection, extra)});", settings)
+    return int(rows[0])
+
+
+# ---------------------------------------------------------------- harness
+
+TESTS = []
+
+
+def test(name):
+    def decorate(function):
+        TESTS.append((name, function))
+        return function
+
+    return decorate
+
+
+def assert_eq(actual, expected, what):
+    if actual != expected:
+        raise AssertionError(f"{what}: expected {expected!r}, got {actual!r}")
+
+
+def assert_page_size(sizes, expected, what):
+    """Every request is at most `expected`, and `expected` is actually used.
+
+    Not every request lands exactly on the page size: the last request of a
+    bounded schema sample asks only for the documents still wanted, so a
+    sample of 1000 at a page size of 400 ends with a request for 200.
+    """
+    if max(sizes) != expected:
+        raise AssertionError(f"{what}: largest request was {max(sizes)}, expected {expected}; sizes {sizes}")
+
+
+# ================================================================ the tests
+
+# ---- collection groups: pagination past the first page ----------------------
+#
+# Before this change a collection-group scan issued exactly one runQuery with
+# `limit` set to the page size and never asked for a second page, so any
+# collection group larger than 1000 documents silently returned its first 1000
+# and reported success. These are the regression tests for that.
+
+
+@test("collection group: a collection group larger than one page returns every document")
+def _():
+    assert_eq(count_rows("~bench_flat_4_4500"), 4500, "rows from a 4500-document collection group")
+
+
+@test("collection group: a collection group smaller than one page returns every document")
+def _():
+    assert_eq(count_rows("~bench_flat_4_300"), 300, "rows from a 300-document collection group")
+
+
+@test("collection group: a size that is an exact multiple of the page size terminates")
+def _():
+    # The last full page looks identical to a page with more behind it, so the
+    # scan has to issue one more request and see it come back empty. Getting
+    # this wrong either drops the tail or loops forever.
+    assert_eq(count_rows("~bench_flat_4_2000"), 2000, "rows from a 2000-document collection group")
+
+
+@test("collection group: a custom page size paginates correctly")
+def _():
+    assert_eq(
+        count_rows("~bench_flat_4_1500", "page_size:=100"),
+        1500,
+        "rows from a 1500-document collection group at page_size 100",
+    )
+
+
+@test("collection group: documents are not duplicated across page boundaries")
+def _():
+    # Cursor pagination without a total order can repeat or skip rows at a page
+    # edge. Distinct document ids must still equal the row count.
+    rows = run_sql(
+        "SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan(" + scan_args("~bench_flat_4_2500") + ");"
+    )
+    total, distinct = rows[0].split(",")
+    assert_eq(total, "2500", "total rows")
+    assert_eq(distinct, "2500", "distinct document ids")
+
+
+@test("collection group: ordering is preserved across pages")
+def _():
+    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("~bench_flat_4_2400", "order_by:='f1'") + ");")
+    assert_eq(int(rows[0]), 2400, "rows from an ordered collection group")
+
+
+@test("collection group: scan_limit stops the scan early")
+def _():
+    reset_stats()
+    assert_eq(count_rows("~bench_flat_4_5000", "scan_limit:=1200"), 1200, "rows under scan_limit")
+    served = stats()["docs_served"]
+    # Bounded by the limit plus at most one page of over-read and the schema
+    # sample -- not the whole 5000-document collection group.
+    if served > 1200 + 2 * MAX_PAGE_SIZE:
+        raise AssertionError(f"scan_limit fetched {served} documents, expected far fewer than the whole collection")
+
+
+# ---- collection group schema inference --------------------------------------
+
+
+@test("collection group: schema sampling pages past the first request")
+def _():
+    # `late_field` first appears at document 1500, past a single 1000-document
+    # request. Sampling everything has to paginate the collection group to see
+    # it -- which it previously could not do at all.
+    rows = run_sql(
+        "SELECT count(late_field) FROM firestore_scan("
+        + scan_args("~bench_late_1500_3000", "schema_sample_size:=-1")
+        + ");"
+    )
+    assert_eq(int(rows[0]), 1500, "documents carrying the late field")
+
+
+# ---- streaming schema inference ---------------------------------------------
+
+
+@test("inference: sampling every document of a large collection still infers late fields")
+def _():
+    rows = run_sql(
+        "SELECT count(late_field) FROM firestore_scan("
+        + scan_args("bench_late_1500_3000", "schema_sample_size:=-1")
+        + ");"
+    )
+    assert_eq(int(rows[0]), 1500, "documents carrying the late field")
+
+
+@test("inference: a bounded sample requests exactly the documents it asked for")
+def _():
+    reset_stats()
+    run_sql(
+        "SELECT count(*) FROM firestore_scan("
+        + scan_args("bench_flat_4_5000", "schema_sample_size:=250, scan_limit:=10")
+        + ");"
+    )
+    sizes = stats()["page_sizes_in_order"]
+    assert_eq(sizes[0], 250, "first request is the schema sample, sized to the sample")
+
+
+# ---- page size --------------------------------------------------------------
+
+
+@test("page size: the named parameter sets the size of every request")
+def _():
+    reset_stats()
+    assert_eq(count_rows("bench_flat_4_2500", "page_size:=250"), 2500, "rows at page_size 250")
+    assert_page_size(
+        stats()["page_sizes_in_order"],
+        250,
+        "every request, including the bind-time schema sample, respects the page size",
+    )
+
+
+@test("page size: the session setting applies when no parameter is given")
+def _():
+    reset_stats()
+    assert_eq(
+        count_rows("bench_flat_4_1200", settings=["SET firestore_page_size=400"]),
+        1200,
+        "rows at firestore_page_size 400",
+    )
+    assert_page_size(stats()["page_sizes_in_order"], 400, "requests use the session page size")
+
+
+@test("page size: the named parameter overrides the session setting")
+def _():
+    reset_stats()
+    assert_eq(
+        count_rows("bench_flat_4_1200", "page_size:=300", settings=["SET firestore_page_size=900"]),
+        1200,
+        "rows when both are set",
+    )
+    assert_page_size(stats()["page_sizes_in_order"], 300, "the named parameter wins")
+
+
+@test("page size: values outside Firestore's range are clamped, not rejected")
+def _():
+    reset_stats()
+    assert_eq(count_rows("bench_flat_4_1200", "page_size:=99999"), 1200, "rows above the cap")
+    assert_page_size(stats()["page_sizes_in_order"], MAX_PAGE_SIZE, "clamped down to Firestore's cap")
+
+    reset_stats()
+    # A page size of zero would fetch nothing and stall the scan.
+    assert_eq(count_rows("bench_flat_4_5", "page_size:=0"), 5, "rows at a page size of zero")
+    assert_eq(set(stats()["page_sizes_in_order"]), {1}, "clamped up to one document per request")
+
+
+@test("page size: the setting is clamped when it is set")
+def _():
+    rows = run_sql("SELECT current_setting('firestore_page_size');", ["SET firestore_page_size=100000"])
+    assert_eq(int(rows[0]), MAX_PAGE_SIZE, "setting clamped to Firestore's cap")
+
+    rows = run_sql("SELECT current_setting('firestore_page_size');", ["SET firestore_page_size=-3"])
+    assert_eq(int(rows[0]), 1, "setting clamped up to one")
+
+
+# ---- adaptive page weight ---------------------------------------------------
+
+
+@test("page weight: a page over the byte budget shrinks the next request")
+def _():
+    # 20 KiB documents: a 1000-document page is ~20 MiB, well over a 2 MiB
+    # budget, so the scan should drop to roughly budget/document-size.
+    reset_stats()
+    assert_eq(
+        count_rows("bench_fat_20_2200", "schema_sample_size:=10", settings=["SET firestore_page_byte_budget=2097152"]),
+        2200,
+        "every row still arrives after shrinking",
+    )
+
+    sizes = stats()["page_sizes_in_order"]
+    assert_eq(sizes[0], 10, "the schema sample is unaffected")
+    assert_eq(sizes[1], MAX_PAGE_SIZE, "the first scan page uses the configured size")
+    if not (0 < sizes[2] < MAX_PAGE_SIZE):
+        raise AssertionError(f"expected a shrunken page size after the first page, got {sizes}")
+    if len(set(sizes[2:])) != 1:
+        raise AssertionError(f"page size should settle after shrinking, got {sizes}")
+
+
+@test("page weight: a zero budget disables shrinking")
+def _():
+    reset_stats()
+    assert_eq(
+        count_rows("bench_fat_20_2200", "schema_sample_size:=10", settings=["SET firestore_page_byte_budget=0"]),
+        2200,
+        "rows with the guard disabled",
+    )
+    scan_sizes = set(stats()["page_sizes_in_order"][1:])
+    assert_eq(scan_sizes, {MAX_PAGE_SIZE}, "page size never moves when the budget is disabled")
+
+
+@test("page weight: an ordinary collection never shrinks")
+def _():
+    # The guard must be invisible on normal data, or it would cost round trips
+    # for nothing.
+    reset_stats()
+    assert_eq(count_rows("bench_flat_8_3000", "schema_sample_size:=10"), 3000, "rows from an ordinary collection")
+    assert_eq(set(stats()["page_sizes_in_order"][1:]), {MAX_PAGE_SIZE}, "page size stays at the default")
+
+
+@test("page weight: shrinking is bounded below by one document per request")
+def _():
+    # A budget far smaller than a single document cannot be honoured; the scan
+    # must still complete rather than stall on a page size of zero.
+    assert_eq(
+        count_rows("bench_fat_20_1100", "schema_sample_size:=5", settings=["SET firestore_page_byte_budget=1"]),
+        1100,
+        "rows under an unsatisfiable budget",
+    )
+
+
+# ---- ordering and pushdown paths --------------------------------------------
+
+
+@test("ordering: a filter and an ORDER BY are pushed to Firestore together")
+def _():
+    # Exercises the pushdown query builder's orderBy path: the ordering has to
+    # carry a __name__ tiebreaker, or cursor pagination loses rows at page
+    # boundaries and the counts below diverge.
+    #
+    # The mock does not evaluate `where`, so it answers with documents the
+    # filter would have excluded. That is harmless here: the extension leaves
+    # the original predicate in the plan for DuckDB to re-verify, so the row
+    # count is still the true one -- it just does not shrink the transfer the
+    # way real Firestore would.
+    reset_stats()
+    ordered = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_2500")
+        + ") WHERE f3 = true ORDER BY f1);"
+    )
+    assert_eq("runquery" in stats()["requests_by_op"], True, "the filter reached Firestore")
+
+    plain = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+    assert_eq(ordered[0], plain[0], "ordering must not change how many rows a filtered scan returns")
+    if int(plain[0]) == 0:
+        raise AssertionError("expected the filter to match something")
+
+
+@test("ordering: a multi-field ORDER BY without a composite index sorts client-side")
+def _():
+    # No composite index exists, so the ordering cannot be sent to Firestore.
+    # The scan must still deliver every row for DuckDB to sort.
+    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500", "order_by:='f0, f1'") + ");")
+    assert_eq(int(rows[0]), 2500, "rows when ordering stays client-side")
+
+
+@test("pushdown: a runQuery failure falls back to a full scan without losing rows")
+def _():
+    # When the filtered query fails, the extension re-runs it unfiltered and
+    # lets DuckDB apply the predicate. The fallback has to page like any other
+    # scan, or it truncates the result.
+    set_runquery_failure(True)
+    try:
+        rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+        fallback_total = int(rows[0])
+    finally:
+        set_runquery_failure(False)
+
+    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+    assert_eq(fallback_total, int(rows[0]), "the fallback returns the same rows as pushdown")
+    if fallback_total == 0:
+        raise AssertionError("expected the filter to match something")
+
+
+@test("pushdown: the collection-group fallback also pages")
+def _():
+    set_runquery_failure(True)
+    try:
+        # Both the filtered query and the unfiltered retry go through
+        # runQuery for a collection group, so this one has to surface the
+        # failure rather than silently return a short result.
+        rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("~bench_flat_4_2500") + ") WHERE f3 = true;")
+        raise AssertionError(f"expected an error when runQuery is unavailable, got {rows}")
+    except AssertionError as error:
+        if "expected an error" in str(error):
+            raise
+    finally:
+        set_runquery_failure(False)
+
+
+# ---- inferred element types -------------------------------------------------
+
+
+@test("inference: array element types map onto DuckDB list types")
+def _():
+    for collection, column, expected in [
+        ("bench_arr_4_20", "tags", "VARCHAR[]"),
+        ("bench_arrint_4_20", "nums", "BIGINT[]"),
+        ("bench_arrdbl_4_20", "nums", "DOUBLE[]"),
+        ("bench_arrbool_4_20", "flags", "BOOLEAN[]"),
+        ("bench_arrts_4_20", "stamps", "TIMESTAMP[]"),
+    ]:
+        rows = run_sql(f"SELECT typeof({column}) FROM firestore_scan({scan_args(collection)}) LIMIT 1;")
+        assert_eq(rows[0], expected, f"{collection}.{column} element type")
+
+
+# ---- regressions on the paths this change touched ---------------------------
+
+
+@test("regression: a plain multi-page collection still returns every document")
+def _():
+    assert_eq(count_rows("bench_flat_8_4500"), 4500, "rows from a 4500-document collection")
+
+
+@test("regression: scan_limit larger than one page is still honoured")
+def _():
+    assert_eq(count_rows("bench_flat_4_5000", "scan_limit:=2048"), 2048, "rows under scan_limit")
+
+
+@test("regression: SQL LIMIT is still pushed down")
+def _():
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan(" + scan_args("bench_flat_4_5000") + ") LIMIT 1500);"
+    )
+    assert_eq(int(rows[0]), 1500, "rows under SQL LIMIT")
+    served = stats()["docs_served"]
+    if served > 1500 + 2 * MAX_PAGE_SIZE:
+        raise AssertionError(f"LIMIT fetched {served} documents, expected pushdown to bound it")
+
+
+@test("regression: ORDER BY with LIMIT still returns the right number of rows")
+def _():
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_3000")
+        + ") ORDER BY f1 LIMIT 700);"
+    )
+    assert_eq(int(rows[0]), 700, "rows from ORDER BY with LIMIT")
+
+
+@test("regression: projected columns still materialise across page boundaries")
+def _():
+    rows = run_sql(
+        "SELECT count(f0), count(f1), count(__document_id) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ");"
+    )
+    assert_eq(rows[0], "2500,2500,2500", "every projected column is filled on every page")
+
+
+@test("regression: nested and list values still convert across page boundaries")
+def _():
+    rows = run_sql("SELECT count(payload) FROM firestore_scan(" + scan_args("bench_map_3_2500") + ");")
+    assert_eq(int(rows[0]), 2500, "map values across pages")
+
+    rows = run_sql("SELECT count(tags) FROM firestore_scan(" + scan_args("bench_arr_4_2500") + ");")
+    assert_eq(int(rows[0]), 2500, "array values across pages")
+
+
+@test("regression: vector dimension is still inferred")
+def _():
+    rows = run_sql("SELECT typeof(embedding) FROM firestore_scan(" + scan_args("bench_vec_8_10") + ") LIMIT 1;")
+    assert_eq(rows[0], "DOUBLE[8]", "vector inferred as a fixed-size array")
+
+
+@test("regression: a filter DuckDB applies itself still sees every document")
+def _():
+    # The mock reports no indexes, so nothing is pushed down and DuckDB
+    # filters client-side -- which requires full pages to be delivered.
+    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("bench_flat_4_2500") + ") WHERE f3 = true;")
+    total = int(rows[0])
+    if not (0 < total < 2500):
+        raise AssertionError(f"expected a proper subset to match the filter, got {total}")
+
+
+# ================================================================ runner
+
+
+def main():
+    filter_text = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    if not os.path.exists(DUCKDB):
+        print(f"missing {DUCKDB}; run `make release` first", file=sys.stderr)
+        return 2
+
+    # Reuse a mock already listening on this port. Binding a second one would
+    # succeed (SO_REUSEADDR) and then split requests between two servers, so a
+    # flag like /__fail_runquery set on one would be invisible to the other.
+    server = None
+    try:
+        health = mock_get("/__health")
+        missing = REQUIRED_MOCK_FEATURES - set(health.get("features", []))
+        if missing:
+            print(
+                f"a mock firestore is already on 127.0.0.1:{PORT} but is missing {sorted(missing)}; "
+                "stop it and re-run",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"using the mock firestore already on 127.0.0.1:{PORT}")
+    except Exception:
+        server = subprocess.Popen(
+            [sys.executable, MOCK, str(PORT)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                mock_get("/__health")
+                break
+            except Exception:
+                time.sleep(0.2)
+        else:
+            print("mock firestore did not come up", file=sys.stderr)
+            return 2
+
+        passed, failures = 0, []
+        for name, body in TESTS:
+            if filter_text and filter_text not in name:
+                continue
+            try:
+                body()
+                passed += 1
+                print(f"ok    {name}")
+            except Exception as error:
+                failures.append((name, error))
+                print(f"FAIL  {name}\n        {error}")
+
+        print(f"\n{passed} passed, {len(failures)} failed")
+        return 1 if failures else 0
+    finally:
+        if server is not None:
+            server.terminate()
+            server.wait(timeout=10)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

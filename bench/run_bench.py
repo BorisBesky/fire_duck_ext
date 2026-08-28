@@ -85,10 +85,16 @@ def shape_columns(collection):
         return ["doc_no", "payload"]
     if shape == "arr":
         return ["doc_no", "tags"]
-    if shape == "arrint":
+    if shape in ("arrint", "arrdbl"):
         return ["doc_no", "nums"]
+    if shape == "arrbool":
+        return ["doc_no", "flags"]
+    if shape == "arrts":
+        return ["doc_no", "stamps"]
     if shape == "vec":
         return ["doc_no", "embedding"]
+    if shape == "fat":
+        return ["doc_no", "blob"]
     raise ValueError(shape)
 
 

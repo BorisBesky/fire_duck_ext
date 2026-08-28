@@ -4,6 +4,7 @@
 #include "firestore_error.hpp"
 #include "firestore_logger.hpp"
 #include "firestore_types.hpp" // FirestoreMapEncoding
+#include "firestore_paging.hpp"
 #include "duckdb.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -40,14 +41,35 @@ struct FirestoreQuery {
 	std::optional<std::string> order_by;
 	std::optional<int64_t> limit;
 	std::optional<std::string> page_token;
-	int64_t page_size = 1000; // Max allowed by Firestore
-	bool show_missing = true; // Include phantom documents (no fields, only subcollections)
+	int64_t page_size = FIRESTORE_DEFAULT_PAGE_SIZE; // Clamped to Firestore's cap when sent
+	bool show_missing = true;                        // Include phantom documents (no fields, only subcollections)
+
+	// Cursor resuming a collection-group (runQuery) scan: the `startAt.values`
+	// array carried over from the previous page. Null for the first page.
+	// documents.list uses page_token instead -- runQuery has no page tokens.
+	json start_at;
 };
 
 // Response from listing documents
 struct FirestoreListResponse {
 	std::vector<FirestoreDocument> documents;
+
+	// Continuation for documents.list. Empty when the collection is exhausted.
 	std::string next_page_token;
+
+	// Continuation for runQuery-based (collection-group) pagination: the
+	// cursor to pass back as FirestoreQuery::start_at. Null when exhausted.
+	json next_start_at;
+
+	// Uncompressed size of the response body, which is what the JSON DOM was
+	// built from. Feeds FirestorePageSizePolicy so pages of unusually heavy
+	// documents shrink the next request instead of exhausting memory.
+	int64_t response_bytes = 0;
+
+	// True while there is another page to fetch, whichever mechanism applies.
+	bool HasMorePages() const {
+		return !next_page_token.empty() || !next_start_at.is_null();
+	}
 };
 
 struct FirestoreCollectionIdsPage {
@@ -102,19 +124,29 @@ public:
 	void ArrayTransform(const std::string &collection, const std::string &document_id, const std::string &field_name,
 	                    const json &elements, ArrayTransformType transform_type);
 
-	// Collection group query - queries all subcollections with a given name
-	// Use this to query across all documents in subcollections
+	// Collection group query - queries all subcollections with a given name.
+	// Ordered by __name__ (after any caller ordering) so the result can be
+	// paginated: pass the previous response's next_start_at back in
+	// FirestoreQuery::start_at to fetch the following page. Without that the
+	// query returns only its first page, silently truncating a large
+	// collection group at the page size.
 	FirestoreListResponse CollectionGroupQuery(const std::string &collection_id, const FirestoreQuery &query = {});
 
 	// Infer schema from sample documents
 	// Use ~ prefix for collection group queries (e.g., "~profile")
 	// Returns pairs of (field_name, DuckDB LogicalType)
 	// sample_size <= 0 samples every document, paginating until the collection
-	// is exhausted. Collection-group scans (~ prefix) cannot paginate and are
-	// always bounded by a single request.
+	// is exhausted -- collection groups included, via cursor pagination.
+	// Documents are folded into a running summary and released as each page is
+	// consumed, so the peak memory is the page, not the sample.
+	// `page_size` bounds each sampling round trip. It matters most here: this
+	// request happens at bind time, before any LIMIT or filter, so a
+	// collection of large documents can exhaust memory before the scan even
+	// starts.
 	std::vector<std::pair<std::string, LogicalType>>
 	InferSchema(const std::string &collection, int64_t sample_size = 1000, bool show_missing = true,
-	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
+	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE,
+	            int64_t page_size = FIRESTORE_MAX_PAGE_SIZE);
 
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,
@@ -168,15 +200,19 @@ private:
 	// Build URL for Admin API (indexes, fields, etc.)
 	std::string BuildAdminUrl(const std::string &path) const;
 
-	// Make HTTP request with error context
+	// Make HTTP request with error context.
+	// `response_bytes_out`, when given, receives the uncompressed size of the
+	// response body -- the figure the paging policy budgets against.
 	json MakeRequest(const std::string &method, const std::string &url, const json &body = {},
-	                 const FirestoreErrorContext &ctx = {});
+	                 const FirestoreErrorContext &ctx = {}, int64_t *response_bytes_out = nullptr);
 
 	// Handle error response with context
 	void HandleError(int status_code, const json &response, const FirestoreErrorContext &ctx);
 
-	// Parse document from JSON response
-	FirestoreDocument ParseDocument(const json &doc_json);
+	// Parse document from JSON response. Takes the value by rvalue reference so
+	// the (potentially large) fields object is moved out rather than deep
+	// copied while the parsed response is still alive.
+	FirestoreDocument ParseDocument(json &&doc_json);
 
 	// Extract document ID from full path
 	std::string ExtractDocumentId(const std::string &path);

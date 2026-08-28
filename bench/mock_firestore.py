@@ -20,14 +20,21 @@ Collection naming grammar:  bench_<shape>_<param>_<count>
   mapwide  <n_leaves>   one mapValue, depth 1, <n_leaves> scalar leaves
   arr      <n_elems>    one arrayValue of <n_elems> strings
   arrint   <n_elems>    one arrayValue of <n_elems> integers
+  arrdbl   <n_elems>    one arrayValue of <n_elems> doubles
+  arrbool  <n_elems>    one arrayValue of <n_elems> booleans
+  arrts    <n_elems>    one arrayValue of <n_elems> timestamps
   vec      <n_dims>     one Firestore vector (__vector__) of <n_dims> doubles
   mixed    <n_fields>   scalar fields whose TYPE varies per document
   late     <from_idx>   3 base fields; `late_field` appears from document <from_idx>
+  fat      <kib>        one string field of <kib> KiB, for page-weight limits
 
 Control endpoints:
-  GET  /__stats   instrumentation counters as JSON
-  POST /__reset   zero the counters
-  GET  /__health  readiness probe
+  GET  /__stats          instrumentation counters as JSON
+  POST /__reset          zero the counters
+  GET  /__health         readiness probe
+  POST /__fail_runquery?enabled=1
+                         make :runQuery return HTTP 500, so the extension's
+                         pushdown-failure fallback can be exercised
 """
 
 import gzip
@@ -73,6 +80,7 @@ class Stats:
         self.connections = 0
         self.requests_by_op = {}
         self.page_sizes = []
+        self.page_sizes_in_order = []
         self.accept_encoding_requests = 0
         self.gzip_responses = 0
         self.mask_requests = 0
@@ -95,13 +103,24 @@ class Stats:
                 "docs_served": self.docs_served,
                 "requests_by_op": dict(self.requests_by_op),
                 "page_sizes_requested": sorted(set(self.page_sizes)),
+                "page_sizes_in_order": list(self.page_sizes_in_order),
                 "requests_advertising_gzip": self.accept_encoding_requests,
                 "responses_gzipped": self.gzip_responses,
                 "requests_with_field_mask": self.mask_requests,
             }
 
 
+# Capabilities a caller can require before reusing an already-running mock.
+# Add a name here whenever a shape or control endpoint is added that tests
+# depend on.
+FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order"}
+
 STATS = Stats()
+
+# When set, :runQuery answers 500. The extension is supposed to fall back to
+# documents.list and let DuckDB apply the filters itself; this makes that
+# path reachable without breaking the server for every other test.
+FAIL_RUNQUERY = threading.Event()
 
 # Per-connection request counter. One thread == one TCP connection under
 # ThreadingHTTPServer, so thread-local state is per-connection state.
@@ -174,6 +193,30 @@ def make_fields(shape, param, i):
             ]}},
         }
 
+    if shape == "arrdbl":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "nums": {"arrayValue": {"values": [
+                {"doubleValue": ((i + k) % 1000) / 8.0} for k in range(param)
+            ]}},
+        }
+
+    if shape == "arrbool":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "flags": {"arrayValue": {"values": [
+                {"booleanValue": (i + k) % 2 == 0} for k in range(param)
+            ]}},
+        }
+
+    if shape == "arrts":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "stamps": {"arrayValue": {"values": [
+                {"timestampValue": f"2026-01-{(k % 28) + 1:02d}T00:00:00.000000Z"} for k in range(param)
+            ]}},
+        }
+
     if shape == "vec":
         return {
             "doc_no": {"integerValue": str(i)},
@@ -193,6 +236,16 @@ def make_fields(shape, param, i):
         if i >= param:
             out["late_field"] = {"stringValue": f"late-{i}"}
         return out
+
+    if shape == "fat":
+        # One large string field. Firestore allows documents up to 1 MiB, so a
+        # full 1000-document page can weigh far more than a process can hold --
+        # this shape makes that regime reachable in a test.
+        filler = _WORDS[i % len(_WORDS)] * (param * 1024 // 8 + 1)
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "blob": {"stringValue": filler[: param * 1024]},
+        }
 
     if shape == "mixed":
         # Field type cycles with the document index, so a schema inferred from
@@ -313,6 +366,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS.docs_served += docs
             if page_size is not None:
                 STATS.page_sizes.append(page_size)
+                STATS.page_sizes_in_order.append(page_size)
             if mask:
                 STATS.mask_requests += 1
             # ThreadingHTTPServer handles each TCP connection on exactly one
@@ -375,7 +429,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__stats":
             self._json(STATS.snapshot()); return
         if path == "/__health":
-            self._json({"ok": True}); return
+            # `features` lets a caller that finds a server already on the port
+            # tell whether it is this version of the mock. Reusing an older one
+            # fails in confusing ways -- a missing shape 404s, a missing control
+            # endpoint is silently ignored -- so callers check before reusing.
+            self._json({"ok": True, "features": sorted(FEATURES)}); return
 
         # Admin API: indexes. Report none so the extension takes its documented
         # "assume default single-field indexes" path.
@@ -408,6 +466,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         path = u.path
+
+        if path == "/__fail_runquery":
+            enabled = parse_qs(u.query).get("enabled", ["1"])[0] == "1"
+            if enabled:
+                FAIL_RUNQUERY.set()
+            else:
+                FAIL_RUNQUERY.clear()
+            self._json({"fail_runquery": enabled})
+            return
 
         if path == "/__reset":
             with STATS.lock:
@@ -442,6 +509,10 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b"{}"
 
         if path.endswith(":runQuery"):
+            if FAIL_RUNQUERY.is_set():
+                self._count("runquery_failed")
+                self._error(500, "runQuery disabled for this test")
+                return
             try:
                 req = json.loads(body)
             except json.JSONDecodeError:

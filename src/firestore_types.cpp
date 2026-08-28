@@ -24,75 +24,6 @@ static std::string Base64Decode(const std::string &encoded) {
 	}
 }
 
-// Check if a Firestore mapValue represents a vector (embedding)
-// Vectors are encoded as:
-//   { "mapValue": { "fields": {
-//       "__type__": { "stringValue": "__vector__" },
-//       "value": { "arrayValue": { "values": [ { "doubleValue": ... }, ... ] } }
-//   }}}
-static bool IsFirestoreVector(const json &value) {
-	if (!value.contains("mapValue"))
-		return false;
-	const auto &mv = value["mapValue"];
-	if (!mv.contains("fields"))
-		return false;
-	const auto &fields = mv["fields"];
-	if (!fields.contains("__type__"))
-		return false;
-	const auto &type_field = fields["__type__"];
-	if (!type_field.contains("stringValue"))
-		return false;
-	if (type_field["stringValue"].get<std::string>() != "__vector__")
-		return false;
-	if (!fields.contains("value"))
-		return false;
-	const auto &value_field = fields["value"];
-	if (!value_field.contains("arrayValue"))
-		return false;
-	return true;
-}
-
-// Get the dimension (number of elements) of a Firestore vector value
-static idx_t GetVectorDimension(const json &value) {
-	const auto &arr = value["mapValue"]["fields"]["value"]["arrayValue"];
-	if (arr.contains("values")) {
-		return arr["values"].size();
-	}
-	return 0;
-}
-
-bool IsFirestoreNull(const json &value) {
-	return value.contains("nullValue");
-}
-
-std::string GetFirestoreTypeName(const json &value) {
-	if (value.contains("stringValue"))
-		return "stringValue";
-	if (value.contains("integerValue"))
-		return "integerValue";
-	if (value.contains("doubleValue"))
-		return "doubleValue";
-	if (value.contains("booleanValue"))
-		return "booleanValue";
-	if (value.contains("timestampValue"))
-		return "timestampValue";
-	if (value.contains("geoPointValue"))
-		return "geoPointValue";
-	if (value.contains("arrayValue"))
-		return "arrayValue";
-	if (IsFirestoreVector(value))
-		return "vectorValue";
-	if (value.contains("mapValue"))
-		return "mapValue";
-	if (value.contains("referenceValue"))
-		return "referenceValue";
-	if (value.contains("bytesValue"))
-		return "bytesValue";
-	if (value.contains("nullValue"))
-		return "nullValue";
-	return "unknown";
-}
-
 FirestoreMapEncoding ParseMapEncoding(const std::string &name) {
 	if (name == "wire") {
 		return FirestoreMapEncoding::WIRE;
@@ -1022,7 +953,7 @@ std::vector<InferredColumn> InferSchemaFromDocuments(const std::vector<json> &do
 			idx_t dimension = 0;
 			for (const auto &fields : document_fields) {
 				if (fields.contains(field_name) && IsFirestoreVector(fields[field_name])) {
-					dimension = GetVectorDimension(fields[field_name]);
+					dimension = FirestoreVectorDimension(fields[field_name]);
 					if (dimension > 0)
 						break;
 				}

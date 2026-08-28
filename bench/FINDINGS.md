@@ -240,7 +240,10 @@ order and schemas drift over time.
 | 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
 | 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
 | 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | **done** |
-| 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | open |
+| 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | **done** |
+| 9 | Paginate collection-group scans | correctness: silently truncated at 1000 documents | small | **done** |
+| 10 | Stream schema inference instead of buffering the sample | `schema_sample_size:=-1` held the whole collection at bind time | small | **done** |
+| 11 | Configurable + self-limiting page size (`page_size`, `firestore_page_byte_budget`) | a page of 1 MiB documents is ~1 GiB before parsing | small | **done** |
 
 ---
 
@@ -444,3 +447,91 @@ documents whatever `schema_sample_size` says. Documented.
   document `scan_limit` as an honoured fetch limit, so the fix brings the
   implementation in line with the existing text rather than changing it. No
   documentation edit needed; connection reuse is internal.
+
+---
+
+## 5. Implemented: #8, #9, #10, #11 — bounded memory on large collections
+
+### #9 — collection-group scans stopped at 1000 documents (correctness)
+
+`CollectionGroupQuery` issued one `:runQuery` with `limit` set to the page size
+and returned no continuation, and `InitGlobal` set `next_page_token = ""` with
+`uses_run_query` left false — so the scan loop took its "no page token, we're
+done" branch after the first page. `SELECT count(*)` over a collection group
+larger than one page returned 1000 and reported success.
+
+Measured against the mock, before and after:
+
+| collection group | before | after |
+|---|---|---|
+| 300 documents | 300 | 300 |
+| 2,000 documents | 1,000 | 2,000 |
+| 4,500 documents | **1,000** | **4,500** |
+
+Collection groups now go through the same cursor pagination the filter-pushdown
+path already used: the query is built with `__name__` appended to its ordering
+(making the order total, so a page boundary cannot drop or repeat a document),
+and each subsequent page resumes from a `startAt` cursor built from the last
+document. `count(DISTINCT __document_id)` equals `count(*)` across page
+boundaries.
+
+The same cursor path fixed collection-group *schema inference*, which was
+bounded by a single request: a field first appearing at document 1500 was
+invisible to `schema_sample_size:=-1` on a `~collection` scan, and is now
+found.
+
+### #10 — schema inference streamed
+
+`InferSchema` accumulated every sampled document into one vector before walking
+it, so `schema_sample_size:=-1` pulled an entire collection into memory *at
+bind time* — before any `LIMIT` or `WHERE` could reduce it. It now folds each
+page into a `FirestoreSchemaAccumulator` and releases it, so peak memory is one
+page whatever the sample depth. Inferred types are unchanged: first-seen type
+per field, array element type by majority with ties broken alphabetically,
+vector dimension from the first occurrence that carries one.
+
+### #11 — page size is configurable, and self-limiting
+
+The page size was hardcoded at 1000 in three places. It is now `page_size:=N`
+(named parameter) or `firestore_page_size` (setting), clamped to Firestore's
+1–1000 range, and it governs the bind-time sampling request as well — the
+request that runs first and cannot be reduced by a filter.
+
+`firestore_page_byte_budget` (default 64 MiB, 0 disables) covers the case where
+document sizes are not known in advance: after each page the scan compares the
+uncompressed body size against the budget and, if it is over, reduces the page
+size to roughly `budget / observed bytes per document`. Verified against the
+mock's `fat` shape — 20 KiB documents, 2 MiB budget:
+
+| request | documents asked for |
+|---|---|
+| schema sample | 10 |
+| first page | 1000 |
+| every page after | 156 |
+
+All 2,200 rows still arrive. The page size only decreases within a scan;
+growing it back would spend round trips rediscovering a limit already found.
+On ordinary collections no page approaches the budget, so nothing shrinks and
+no round trips are added — asserted by a test, so the guard cannot start
+costing round trips unnoticed.
+
+### #8 — per-row and per-page overhead
+
+`ParseDocument` took its JSON by const reference and deep-copied
+`doc_json["fields"]` while the parsed response was still alive, roughly
+doubling peak memory per page; it now takes an rvalue reference and moves.
+Field lookup in the scan loop did `contains()` then `operator[]` — two ordered
+probes per column per row — and now does one `find()`.
+
+### Testing
+
+The pure logic (paging policy, cursor construction, orderBy construction,
+schema accumulation, wire-format helpers) was moved into three DuckDB-free
+modules so it can be exercised directly: `scripts/run_unit_tests.sh` compiles
+them with `--coverage`, runs 58 cases, and enforces a per-file threshold.
+`test/integration/large_collections.py` covers the scanner and client glue
+through a real DuckDB against the mock, asserting on request counts and page
+sizes as well as rows. `scripts/run_coverage.sh` merges both runs and reports
+coverage of the lines this change adds or modifies — 98% at the time of
+writing; the remainder is `GetDocument`/`CreateDocument` (covered by the
+emulator suite, not the mock) and a `FunctionData::Equals` clause.

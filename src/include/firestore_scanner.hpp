@@ -4,6 +4,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
+#include "firestore_paging.hpp"
 #include <set>
 #include <vector>
 
@@ -25,6 +26,11 @@ struct FirestoreScanBindData : public TableFunctionData {
 
 	// Query options
 	std::optional<int64_t> limit;
+
+	// Documents requested per round trip. Unset means "use the
+	// firestore_page_size setting". Lower it for collections whose documents
+	// are large enough that a full 1000-document page will not fit in memory.
+	std::optional<int64_t> page_size;
 	std::optional<std::string> order_by;
 	std::vector<OrderByField> parsed_order_by; // Parsed from order_by string at bind time
 
@@ -114,7 +120,7 @@ struct FirestoreScanBindData : public TableFunctionData {
 		       is_collection_group == other.is_collection_group && show_missing == other.show_missing &&
 		       is_document_path == other.is_document_path && docpath_named_order == other.docpath_named_order &&
 		       credentials_equal && order_fields_equal(sql_pushed_order_by, other.sql_pushed_order_by) &&
-		       sql_pushed_limit == other.sql_pushed_limit;
+		       sql_pushed_limit == other.sql_pushed_limit && page_size == other.page_size;
 	}
 };
 
@@ -148,8 +154,15 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	// it would cut off rows before DuckDB's FILTER node runs.
 	bool pushdown_failed = false;
 
-	// Pagination optimization: track page size to detect end of results
-	int64_t query_page_size = 1000; // The page size used in the query
+	// Chooses the page size for each round trip and shrinks it when a page
+	// weighs more than the byte budget allows.
+	FirestorePageSizePolicy page_policy;
+
+	// Documents the *last* request actually asked for. The end-of-results
+	// check compares against this rather than the policy's current size:
+	// after a shrink those differ, and comparing against the new (smaller)
+	// size would read a full page as short and end the scan early.
+	int64_t query_page_size = FIRESTORE_DEFAULT_PAGE_SIZE;
 	bool last_page_was_full = true; // Whether last fetch returned a full page
 
 	FirestoreScanGlobalState() : current_index(0), finished(false) {

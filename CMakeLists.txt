@@ -28,6 +28,9 @@ set(EXTENSION_SOURCES
     src/firestore_client.cpp
     src/firestore_auth.cpp
     src/firestore_types.cpp
+    src/firestore_wire.cpp
+    src/firestore_paging.cpp
+    src/firestore_schema_accumulator.cpp
     src/firestore_path_utils.cpp
     src/firestore_scanner.cpp
     src/firestore_writer.cpp
@@ -40,6 +43,15 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# Instrument only this extension's sources for coverage, leaving DuckDB itself
+# uninstrumented -- rebuilding DuckDB with --coverage costs far more than it
+# tells us. Off by default; scripts/run_coverage.sh turns it on.
+option(FIRESTORE_COVERAGE "Instrument the extension sources for gcov coverage" OFF)
+if (FIRESTORE_COVERAGE)
+  target_compile_options(${EXTENSION_NAME} PRIVATE --coverage)
+  target_link_libraries(${EXTENSION_NAME} gcov)
+endif()
 
 # Set C++17 standard for our extension (required for std::optional)
 set_target_properties(${EXTENSION_NAME} PROPERTIES

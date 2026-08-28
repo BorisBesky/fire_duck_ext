@@ -6,6 +6,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "firestore_wire.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <string>
@@ -22,11 +23,7 @@ struct FirestoreIndexField {
 	enum class Mode { ASCENDING, DESCENDING, ARRAY_CONTAINS } mode;
 };
 
-// Parsed representation of a single order_by field (e.g. "score DESC" → {score, DESCENDING})
-struct OrderByField {
-	std::string field_path;
-	std::string direction; // "ASCENDING" or "DESCENDING"
-};
+// OrderByField is declared in firestore_wire.hpp, which this header includes.
 
 // Parse a comma-separated order_by string into structured fields
 // E.g., "score DESC, name ASC" -> [{score, DESCENDING}, {name, ASCENDING}]
