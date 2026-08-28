@@ -46,6 +46,7 @@ COVERED_SOURCES=(
 
 TEST_SOURCES=(
 	test/unit/test_main.cpp
+	test/unit/test_harness_self.cpp
 	test/unit/test_firestore_wire.cpp
 	test/unit/test_firestore_paging.cpp
 	test/unit/test_firestore_schema_accumulator.cpp

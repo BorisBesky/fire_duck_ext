@@ -10,8 +10,11 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <ostream>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace fdtest {
@@ -38,13 +41,28 @@ struct Registrar {
 	}
 };
 
+// Whether a value of type T can be written to an ostream.
+template <class T, class = void>
+struct IsStreamable : std::false_type {};
+
+template <class T>
+struct IsStreamable<T, std::void_t<decltype(std::declval<std::ostream &>() << std::declval<const T &>())>>
+    : std::true_type {};
+
 // Renders a value for a failure message. Falls back to a placeholder for
-// types with no stream operator so the harness never fails to compile.
+// types with no stream operator, so an assertion on any comparable type
+// compiles -- the failure branch that calls this has to compile even in the
+// tests that never take it.
 template <class T>
 std::string Describe(const T &value) {
-	std::ostringstream out;
-	out << value;
-	return out.str();
+	if constexpr (IsStreamable<T>::value) {
+		std::ostringstream out;
+		out << value;
+		return out.str();
+	} else {
+		(void)value;
+		return "<no operator<< for this type>";
+	}
 }
 inline std::string Describe(bool value) {
 	return value ? "true" : "false";
