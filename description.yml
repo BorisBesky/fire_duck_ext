@@ -61,9 +61,10 @@ docs:
     fetched only as DuckDB consumes the current one, so a collection of any
     size can be read without holding it in memory. Collection groups paginate
     by cursor rather than stopping at the first page. An unfiltered, unordered
-    scan of an ordinary collection with show_missing:=false is split into
+    scan of an ordinary collection with show_missing:=false can be split into
     document-key ranges and read by several threads at once
-    (firestore_max_threads, default 4). page_size (or the
+    (firestore_max_threads, off by default -- it pays off for Firestore auto-ids
+    and costs time for ids that cluster into one range). page_size (or the
     firestore_page_size setting) controls how many documents each round trip
     fetches, and firestore_page_byte_budget shrinks that automatically when a
     page turns out to weigh more than the budget allows -- which matters for

@@ -172,8 +172,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(FIRESTORE_DEFAULT_PAGE_BYTE_BUDGET),
 	                          FirestoreSettings::SetPageByteBudget);
 	config.AddExtensionOption("firestore_max_threads",
-	                          "Maximum threads one scan may split across, reading separate document-key ranges "
-	                          "(1 disables parallel scanning)",
+	                          "Maximum threads one scan may split across, reading separate document-key ranges. "
+	                          "1 (the default) disables parallel scanning; raise it for collections whose "
+	                          "document ids spread over the key space, such as Firestore auto-ids",
 	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultMaxThreads),
 	                          FirestoreSettings::SetMaxScanThreads);
 

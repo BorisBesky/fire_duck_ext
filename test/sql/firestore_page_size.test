@@ -90,11 +90,12 @@ SELECT current_setting('firestore_page_byte_budget');
 statement ok
 RESET firestore_page_byte_budget;
 
-# Thread cap for parallel scans.
+# Parallel scanning is opt-in: whether splitting a collection helps depends on
+# how its document ids are distributed, which the extension cannot know.
 query I
 SELECT current_setting('firestore_max_threads');
 ----
-4
+1
 
 # Fewer than one thread is not a scan.
 statement ok
@@ -209,6 +210,9 @@ SELECT count(late_field) FROM firestore_scan('~bench_late_1500_3000', schema_sam
 # documents a sequential scan does -- no gaps at the range boundaries, and no
 # document claimed by two ranges. The auto_ prefix gives the mock's documents
 # Firestore-style ids, which is what spreads them across ranges at all.
+statement ok
+SET firestore_max_threads=4;
+
 query II
 SELECT count(*), count(DISTINCT __document_id)
 FROM firestore_scan('auto_bench_flat_8_3000', show_missing:=false, schema_sample_size:=5);

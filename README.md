@@ -16,7 +16,7 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Streaming scans** that page through collections of any size, with a tunable page size for large documents
 - **Projection pushdown** so only the selected fields cross the wire
 - **Count pushdown** answering `COUNT(*)` from Firestore's aggregation API without reading documents
-- **Parallel scans** splitting a collection into document-key ranges read concurrently
+- **Parallel scans** (opt-in) splitting a collection into document-key ranges read concurrently
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -406,7 +406,7 @@ SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
 | `firestore_schema_sample_size` | `1000` | Documents sampled to infer a schema; `-1` samples every document. |
 | `firestore_page_size` | `1000` | Documents fetched per round trip, clamped to Firestore's 1-1000 range. |
 | `firestore_page_byte_budget` | `67108864` | Uncompressed bytes a page may weigh before the scan requests fewer documents; `0` disables the guard. See [Large Collections](#large-collections). |
-| `firestore_max_threads` | `4` | Threads one scan may split across, reading separate key ranges; `1` disables parallel scanning, and the value is capped at 64. |
+| `firestore_max_threads` | `1` | Threads one scan may split across, reading separate key ranges. `1` (the default) disables parallel scanning; raise it only for collections whose document ids spread over the key space. Capped at 64. See [Large Collections](#large-collections). |
 
 Sampling streams: each page is folded into the inferred schema and released, so
 `schema_sample_size:=-1` costs one page of memory rather than the whole
@@ -668,21 +668,33 @@ hidden. Ranges of the key space are independent, though, so the scan can cut
 the collection into ranges and read several at once:
 
 ```sql
--- Up to 4 threads by default; 1 disables parallel scanning
-SET firestore_max_threads = 8;
+-- Off by default; raise it to split the scan across threads
+SET firestore_max_threads = 4;
 SELECT * FROM firestore_scan('events', show_missing:=false);
 ```
 
 Each thread takes a range, pages through it with its own connection, and takes
-another when it finishes — so an uneven key distribution costs balance, not
-correctness. Measured against the mock at 50 ms simulated round-trip latency
-over 20,000 documents: 2.33 s on one thread, 1.23 s on four.
+another when it finishes.
 
-Balance does depend on the keys. Firestore auto-ids are 20 characters drawn
-uniformly from `[A-Za-z0-9]`, and the ranges are cut evenly over that space, so
-auto-ids spread well. Keys chosen by hand — e-mail addresses, timestamps,
-sequence numbers — will pile into one range: still correct, just no faster than
-a single thread.
+**Whether this helps depends entirely on your document ids, so it is off by
+default.** The ranges are cut evenly over Firestore's auto-id alphabet —
+20 characters drawn uniformly from `[A-Za-z0-9]` — so auto-ids spread across
+threads. Ids chosen by hand (e-mail addresses, timestamps, sequence numbers,
+slugs) pile into a single range, and then splitting is not merely no help but
+an active cost: every other range comes back empty, the work funnels through
+one thread regardless, and `runQuery` moves about 22% more bytes than
+`documents.list` because of its per-document envelope.
+
+Measured over 20,000 documents on loopback:
+
+| document ids | 1 thread | 4 threads | |
+|---|---|---|---|
+| Firestore auto-ids | 1.08 s | 0.67 s | 1.6x faster |
+| sequential (`doc00000001`, …) | 1.02 s | 2.05 s | **2.0x slower** |
+
+The win grows with round-trip latency, which is what the overlap hides: at
+50 ms simulated RTT the auto-id case goes from 2.33 s to 1.23 s. If you do not
+know how your ids are distributed, measure before turning this on.
 
 Parallel scanning applies only where a range split returns exactly the rows a
 sequential scan would, which means all of:

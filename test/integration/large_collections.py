@@ -690,8 +690,13 @@ def _():
 
 PARALLEL = "show_missing:=false, schema_sample_size:=5"
 
+# Parallel scanning is opt-in -- whether splitting a collection helps depends on
+# how its document ids are distributed, which the extension cannot know -- so
+# every test here that wants threads asks for them.
+THREADED = ["SET firestore_max_threads=4"]
 
-def scanned_rows(collection, extra="", settings=None):
+
+def scanned_rows(collection, extra="", settings=THREADED):
     """Row count via a query that actually reads documents.
 
     Deliberately not count(*): with show_missing:=false that is answered by an
@@ -707,7 +712,8 @@ def _():
     rows = run_sql(
         "SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan("
         + scan_args("auto_bench_flat_8_20000", PARALLEL)
-        + ");"
+        + ");",
+        THREADED,
     )
     # A range boundary that both neighbours claim would inflate the first
     # number; one that neither claims would deflate both.
@@ -718,7 +724,7 @@ def _():
 def _():
     # A checksum over ids and a field: same documents, same contents.
     query = "SELECT count(*), sum(hash(__document_id)), sum(hash(f0)), sum(hash(f5)) FROM firestore_scan({args});"
-    threaded = run_sql(query.format(args=scan_args("auto_bench_flat_8_20000", PARALLEL)))
+    threaded = run_sql(query.format(args=scan_args("auto_bench_flat_8_20000", PARALLEL)), THREADED)
     sequential = run_sql(
         query.format(args=scan_args("auto_bench_flat_8_20000", PARALLEL)), ["SET firestore_max_threads=1"]
     )
@@ -790,7 +796,8 @@ def _():
     rows = run_sql(
         "SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan("
         + scan_args("bench_flat_8_5000", PARALLEL)
-        + ");"
+        + ");",
+        THREADED,
     )
     assert_eq(rows[0], "5000,5000", "every document once, however the keys are distributed")
 
@@ -808,7 +815,8 @@ def _():
     rows = run_sql(
         "SELECT count(f0) FROM firestore_scan("
         + scan_args("auto_bench_wide_40_5000", PARALLEL + ", page_size:=250")
-        + ");"
+        + ");",
+        THREADED,
     )
     assert_eq(rows[0], "5000", "rows from a projected, small-paged parallel scan")
     counters = stats()
@@ -829,7 +837,9 @@ def _():
         collection = "auto_bench_flat_8_5000" if label != "a document path" else "users/user1"
         reset_stats()
         args = scan_args(collection, extra)
-        run_sql(sql.format(args=args) if sql else f"SELECT count(f0) FROM firestore_scan({args});", settings)
+        run_sql(
+            sql.format(args=args) if sql else f"SELECT count(f0) FROM firestore_scan({args});", settings or THREADED
+        )
         if stats()["max_concurrent_requests"] > 1:
             raise AssertionError(f"{label} must not be scanned in parallel")
 
@@ -840,7 +850,8 @@ def _():
     # __name__ for the range cursors. It uses runquery either way, so compare
     # rows rather than request shape.
     threaded = run_sql(
-        "SELECT count(*) FROM firestore_scan(" + scan_args("auto_bench_flat_8_5000", PARALLEL) + ") WHERE f3 = true;"
+        "SELECT count(*) FROM firestore_scan(" + scan_args("auto_bench_flat_8_5000", PARALLEL) + ") WHERE f3 = true;",
+        THREADED,
     )
     sequential = run_sql(
         "SELECT count(*) FROM firestore_scan(" + scan_args("auto_bench_flat_8_5000", PARALLEL) + ") WHERE f3 = true;",
@@ -866,7 +877,8 @@ def _():
     rows = run_sql(
         "SELECT count(*) FROM firestore_scan("
         + scan_args("auto_bench_late_1500_5000", "show_missing:=false, schema_sample_size:=5")
-        + ");"
+        + ");",
+        THREADED,
     )
     assert_eq(rows[0], "5000", "the scan completes with fields outside the schema")
 

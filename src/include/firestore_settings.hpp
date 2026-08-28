@@ -84,10 +84,19 @@ struct FirestoreSettings {
 	// Upper bound on threads a single scan may use.
 	//
 	// Firestore's REST pagination is sequential within a key range, so the only
-	// way to overlap round trips is to read several ranges at once. Four keeps
-	// a useful amount of overlap without opening a connection per core against
-	// a shared, rate-limited service. 1 disables parallel scanning.
-	static constexpr int64_t kDefaultMaxThreads = 4;
+	// way to overlap round trips is to read several ranges at once.
+	//
+	// Off by default, because whether that helps depends entirely on how the
+	// collection's document ids are distributed, and the extension cannot know
+	// that without paying to find out. Measured over 20,000 documents on
+	// loopback: Firestore auto-ids, which spread evenly over the key space, go
+	// from 1.08s to 0.67s on four threads; sequential ids, which all fall in
+	// one range, go from 1.02s to 2.05s -- every range but one comes back
+	// empty, the work funnels through a single thread anyway, and runQuery's
+	// per-document envelope moves about 22% more bytes than documents.list.
+	// Hand-chosen ids are common enough in Firestore that defaulting this on
+	// would regress more collections than it helped.
+	static constexpr int64_t kDefaultMaxThreads = 1;
 
 	static int64_t MaxScanThreads(const ClientContext &context) {
 		Value threads_value;
