@@ -1,5 +1,8 @@
 #include "firestore_paging.hpp"
 
+#include <exception>
+#include <string>
+
 namespace duckdb {
 
 int64_t ClampFirestorePageSize(int64_t requested) {
@@ -160,6 +163,63 @@ json BuildSelectClause(const FirestoreProjection &projection) {
 		}
 	}
 	return json {{"fields", fields}};
+}
+
+json BuildCountAggregationQuery(const std::string &collection_id, bool all_descendants, int64_t up_to) {
+	json structured_query;
+	structured_query["from"] = {{{"collectionId", collection_id}, {"allDescendants", all_descendants}}};
+
+	json count = json::object();
+	if (up_to > 0) {
+		// Int64 fields cross the Firestore wire as strings.
+		count["upTo"] = std::to_string(up_to);
+	}
+
+	return json {{"structuredAggregationQuery",
+	              {{"structuredQuery", structured_query},
+	               {"aggregations", json::array({json {{"alias", "count"}, {"count", count}}})}}}};
+}
+
+bool ParseCountAggregationResponse(const json &response, int64_t &count_out) {
+	// The response is an array of results, each carrying the aggregate fields
+	// under the aliases the request asked for.
+	const json *result = nullptr;
+	if (response.is_array()) {
+		for (const auto &entry : response) {
+			if (entry.is_object() && entry.contains("result")) {
+				result = &entry["result"];
+				break;
+			}
+		}
+	} else if (response.is_object() && response.contains("result")) {
+		result = &response["result"];
+	}
+
+	if (result == nullptr || !result->is_object() || !result->contains("aggregateFields")) {
+		return false;
+	}
+	const auto &aggregate_fields = (*result)["aggregateFields"];
+	if (!aggregate_fields.is_object() || !aggregate_fields.contains("count")) {
+		return false;
+	}
+	const auto &count_value = aggregate_fields["count"];
+	if (!count_value.is_object() || !count_value.contains("integerValue")) {
+		return false;
+	}
+
+	const auto &integer_value = count_value["integerValue"];
+	try {
+		if (integer_value.is_string()) {
+			count_out = std::stoll(integer_value.get<std::string>());
+		} else if (integer_value.is_number_integer()) {
+			count_out = integer_value.get<int64_t>();
+		} else {
+			return false;
+		}
+	} catch (const std::exception &) {
+		return false; // Out of range or not a number after all.
+	}
+	return count_out >= 0;
 }
 
 json BuildStartAtCursor(const json &structured_query, const std::string &last_document_name,

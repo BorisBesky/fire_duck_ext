@@ -121,6 +121,17 @@ struct FirestoreProjection {
 // fields becomes Firestore's documented keys-only form, select __name__.
 json BuildSelectClause(const FirestoreProjection &projection);
 
+// Build the body of a :runAggregationQuery that counts a collection.
+//
+// `up_to` bounds the count: Firestore stops once it reaches that many, which
+// is all a query under a LIMIT needs. Omit it to count everything.
+json BuildCountAggregationQuery(const std::string &collection_id, bool all_descendants, int64_t up_to = 0);
+
+// Read the count out of a :runAggregationQuery response. Returns false when
+// the response does not carry one, which the caller treats as "fall back to
+// scanning" rather than as an error.
+bool ParseCountAggregationResponse(const json &response, int64_t &count_out);
+
 // Build the `startAt` cursor that resumes a runQuery after `last_document`.
 //
 // The cursor must carry one value per orderBy entry, in order, or Firestore

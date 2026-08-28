@@ -15,6 +15,7 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Collection ID listings** by scanning a Firestore document path
 - **Streaming scans** that page through collections of any size, with a tunable page size for large documents
 - **Projection pushdown** so only the selected fields cross the wire
+- **Count pushdown** answering `COUNT(*)` from Firestore's aggregation API without reading documents
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -628,6 +629,34 @@ naming the new size. The page size only ever decreases within a scan: growing
 it back would spend round trips rediscovering a limit already found. Ordinary
 collections never come close to the budget, so nothing shrinks and no round
 trips are added.
+
+### Counting without reading
+
+A bare `COUNT(*)` reads none of its input's values, so the whole answer is how
+many rows there are. Where that is safe, the scan asks Firestore for the number
+with `:runAggregationQuery` and fetches no documents:
+
+```sql
+-- One request, no documents transferred
+SELECT count(*) FROM firestore_scan('events', show_missing:=false);
+```
+
+Measured against the mock over 200,000 documents: 200 requests and 84.24 MiB
+become 1 request and nothing.
+
+`show_missing:=false` is required on an ordinary collection, and is why the
+default does not take this path. Phantom documents — those that exist only to
+parent a subcollection — are returned as rows by a scan with `show_missing`
+(the default) but are never counted by an aggregation query, so the two would
+disagree. Collection-group scans never included phantom documents in the first
+place, so `firestore_scan('~events')` is counted server-side either way.
+
+The count is used only when nothing can read a value: no `WHERE`, no
+`GROUP BY`, no `DISTINCT`, no `LIMIT` between the count and the scan, and
+`count(<column>)` rather than `count(*)` does not qualify. `EXPLAIN` shows
+`Firestore Pushed Count` when it applies. If the endpoint is unavailable —
+older emulators, restricted credentials — the scan reads the documents
+instead, which is slower but never wrong.
 
 Reducing the transfer itself is usually better than paging around it:
 

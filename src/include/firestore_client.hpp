@@ -152,6 +152,13 @@ public:
 	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE,
 	            int64_t page_size = FIRESTORE_MAX_PAGE_SIZE);
 
+	// Count a collection's documents with :runAggregationQuery, without
+	// transferring any of them. `up_to` bounds the count (0 for no bound).
+	// Returns false when the service does not answer with a count -- older
+	// emulators do not implement the endpoint -- which the caller treats as
+	// "scan instead" rather than as an error.
+	bool CountDocuments(const std::string &collection, bool is_collection_group, int64_t up_to, int64_t &count_out);
+
 	// Run a StructuredQuery via :runQuery endpoint (supports WHERE filters)
 	FirestoreListResponse RunQuery(const std::string &collection, const json &structured_query,
 	                               bool is_collection_group = false);

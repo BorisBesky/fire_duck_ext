@@ -381,3 +381,101 @@ FD_TEST("select: an unmasked projection is never keys-only") {
 	FD_REQUIRE_FALSE(projection.masked);
 	FD_REQUIRE_FALSE(projection.KeysOnly());
 }
+
+// ---------------------------------------------------------------- count aggregation
+
+FD_TEST("count: the aggregation query targets the collection and asks for a count") {
+	json query = duckdb::BuildCountAggregationQuery("orders", false);
+	const auto &aggregation = query["structuredAggregationQuery"];
+	FD_REQUIRE_EQ(aggregation["structuredQuery"]["from"][0]["collectionId"].get<std::string>(), std::string("orders"));
+	FD_REQUIRE_FALSE(aggregation["structuredQuery"]["from"][0]["allDescendants"].get<bool>());
+	FD_REQUIRE_EQ(aggregation["aggregations"].size(), 1u);
+	FD_REQUIRE_EQ(aggregation["aggregations"][0]["alias"].get<std::string>(), std::string("count"));
+	FD_REQUIRE(aggregation["aggregations"][0]["count"].is_object());
+	// No bound asked for, so none is sent.
+	FD_REQUIRE_FALSE(aggregation["aggregations"][0]["count"].contains("upTo"));
+}
+
+FD_TEST("count: a collection group counts all descendants") {
+	json query = duckdb::BuildCountAggregationQuery("orders", true);
+	FD_REQUIRE(query["structuredAggregationQuery"]["structuredQuery"]["from"][0]["allDescendants"].get<bool>());
+}
+
+FD_TEST("count: a bound is sent as upTo, and int64 crosses the wire as a string") {
+	json query = duckdb::BuildCountAggregationQuery("orders", false, 500);
+	FD_REQUIRE_EQ(query["structuredAggregationQuery"]["aggregations"][0]["count"]["upTo"].get<std::string>(),
+	              std::string("500"));
+
+	// Zero and negative mean "no bound" rather than "count nothing".
+	FD_REQUIRE_FALSE(
+	    duckdb::BuildCountAggregationQuery("orders", false, 0)["structuredAggregationQuery"]["aggregations"][0]["count"]
+	        .contains("upTo"));
+	FD_REQUIRE_FALSE(duckdb::BuildCountAggregationQuery("orders", false,
+	                                                    -5)["structuredAggregationQuery"]["aggregations"][0]["count"]
+	                     .contains("upTo"));
+}
+
+FD_TEST("count: a well-formed response yields the count") {
+	json response = json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "4200"}}}}}}},
+	                                   {"readTime", "2026-01-01T00:00:00Z"}}});
+	int64_t count = -1;
+	FD_REQUIRE(duckdb::ParseCountAggregationResponse(response, count));
+	FD_REQUIRE_EQ(count, 4200);
+}
+
+FD_TEST("count: a numeric integerValue is accepted as well as a string one") {
+	// The wire format is a string, but an emulator or proxy may hand back a
+	// JSON number; refusing it would needlessly fall back to a full scan.
+	json response = json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", 17}}}}}}}}});
+	int64_t count = -1;
+	FD_REQUIRE(duckdb::ParseCountAggregationResponse(response, count));
+	FD_REQUIRE_EQ(count, 17);
+}
+
+FD_TEST("count: a bare object response is read as well as an array") {
+	json response = {{"result", {{"aggregateFields", {{"count", {{"integerValue", "9"}}}}}}}};
+	int64_t count = -1;
+	FD_REQUIRE(duckdb::ParseCountAggregationResponse(response, count));
+	FD_REQUIRE_EQ(count, 9);
+}
+
+FD_TEST("count: an entry with no result is skipped in favour of one that has it") {
+	// Firestore may emit a partial response before the result.
+	json response = json::array({json {{"readTime", "2026-01-01T00:00:00Z"}},
+	                             json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "3"}}}}}}}}});
+	int64_t count = -1;
+	FD_REQUIRE(duckdb::ParseCountAggregationResponse(response, count));
+	FD_REQUIRE_EQ(count, 3);
+}
+
+FD_TEST("count: a zero count is a valid answer, not a parse failure") {
+	json response = json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "0"}}}}}}}}});
+	int64_t count = -1;
+	FD_REQUIRE(duckdb::ParseCountAggregationResponse(response, count));
+	FD_REQUIRE_EQ(count, 0);
+}
+
+FD_TEST("count: malformed responses are refused rather than guessed at") {
+	// Every one of these has to fall back to scanning: a wrong count is worse
+	// than a slow one.
+	int64_t count = -1;
+	const json malformed[] = {
+	    json::array(),                                                           // empty
+	    json::array({json::object()}),                                           // no result
+	    json::array({json {{"result", "not-an-object"}}}),                       // result is not an object
+	    json::array({json {{"result", json::object()}}}),                        // no aggregateFields
+	    json::array({json {{"result", {{"aggregateFields", "nope"}}}}}),         // aggregateFields not an object
+	    json::array({json {{"result", {{"aggregateFields", json::object()}}}}}), // no count alias
+	    json::array({json {{"result", {{"aggregateFields", {{"count", 5}}}}}}}), // count is not an object
+	    json::array({json {{"result", {{"aggregateFields", {{"count", json::object()}}}}}}}), // no integerValue
+	    json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", true}}}}}}}}}),  // wrong type
+	    json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "abc"}}}}}}}}}), // not a number
+	    json::array(
+	        {json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "99999999999999999999"}}}}}}}}}),
+	    json::array({json {{"result", {{"aggregateFields", {{"count", {{"integerValue", "-1"}}}}}}}}}), // negative
+	    json("a string"), // not a container
+	};
+	for (const auto &response : malformed) {
+		FD_REQUIRE_FALSE(duckdb::ParseCountAggregationResponse(response, count));
+	}
+}

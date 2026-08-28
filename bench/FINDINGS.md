@@ -580,3 +580,46 @@ The mock now honours masks and `select` clauses, including unquoting backticks
 the way Firestore does — without that it would look for a key spelled with the
 backticks still on, and a quoting bug in the extension would show up as an
 empty column rather than a failure.
+
+---
+
+## 7. Implemented: count pushdown
+
+`SELECT count(*)` used to read every document to count them: projection
+pushdown meant DuckDB never converted the values, but all of them still
+crossed the wire. Firestore's `:runAggregationQuery` returns the number
+directly.
+
+200,000 documents, against the mock:
+
+| | requests | documents | transferred | time |
+|---|---|---|---|---|
+| before | 200 | 200,000 | 84.24 MiB | 11.25 s |
+| after | **1** | **0** | **0** | **0.018 s** |
+
+### Recognising the case
+
+The projection cannot reveal it. DuckDB does not ask a table function for zero
+columns; for `count(*)` it projects the first column, which here is
+`__document_id` — indistinguishable from someone selecting it. So the
+optimizer extension recognises the plan shape instead: a `LogicalAggregate`
+with no groups and exactly one `count_star` expression, no DISTINCT and no
+FILTER, above the scan with nothing but projections in between. A FILTER or
+LIMIT between the aggregate and the scan changes which rows are counted, so
+the flag stops there.
+
+### The phantom-document constraint
+
+Aggregation queries never count documents that exist only to parent a
+subcollection. A scan with `show_missing` (the default) returns them as rows.
+So on an ordinary collection the count is pushed only with
+`show_missing:=false` — otherwise the fast answer would quietly differ from
+the slow one. Collection groups never included phantom documents, so they are
+always eligible.
+
+`upTo` carries an effective `scan_limit` into the request so Firestore stops
+counting early, and the result is capped client-side regardless.
+
+A deployment without the endpoint (older emulators, restricted credentials)
+answers 501; the scan falls back to reading documents, which is slower and
+never wrong.

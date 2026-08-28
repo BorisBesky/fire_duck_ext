@@ -36,6 +36,9 @@ Control endpoints:
   POST /__fail_runquery?enabled=1
                          make :runQuery return HTTP 500, so the extension's
                          pushdown-failure fallback can be exercised
+  POST /__fail_aggregation?enabled=1
+                         make :runAggregationQuery return HTTP 501, standing in
+                         for a deployment that does not offer the endpoint
 """
 
 import gzip
@@ -115,7 +118,7 @@ class Stats:
 # Add a name here whenever a shape or control endpoint is added that tests
 # depend on.
 FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order", "odd_shape",
-            "field_mask", "runquery_select"}
+            "field_mask", "runquery_select", "aggregation_query", "fail_aggregation"}
 
 STATS = Stats()
 
@@ -123,6 +126,11 @@ STATS = Stats()
 # documents.list and let DuckDB apply the filters itself; this makes that
 # path reachable without breaking the server for every other test.
 FAIL_RUNQUERY = threading.Event()
+
+# When set, :runAggregationQuery answers 501. Older emulators and restricted
+# credentials do not offer the endpoint, and the extension is supposed to fall
+# back to scanning rather than fail the query.
+FAIL_AGGREGATION = threading.Event()
 
 # Per-connection request counter. One thread == one TCP connection under
 # ThreadingHTTPServer, so thread-local state is per-connection state.
@@ -510,6 +518,15 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
 
+        if path == "/__fail_aggregation":
+            enabled = parse_qs(u.query).get("enabled", ["1"])[0] == "1"
+            if enabled:
+                FAIL_AGGREGATION.set()
+            else:
+                FAIL_AGGREGATION.clear()
+            self._json({"fail_aggregation": enabled})
+            return
+
         if path == "/__fail_runquery":
             enabled = parse_qs(u.query).get("enabled", ["1"])[0] == "1"
             if enabled:
@@ -550,6 +567,38 @@ class Handler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
+
+        if path.endswith(":runAggregationQuery"):
+            if FAIL_AGGREGATION.is_set():
+                self._count("aggregation_failed")
+                self._error(501, "aggregation queries disabled for this test")
+                return
+            try:
+                req = json.loads(body)
+            except json.JSONDecodeError:
+                self._error(400, "bad json"); return
+
+            aggregation = req.get("structuredAggregationQuery", {})
+            sq = aggregation.get("structuredQuery", {})
+            frm = (sq.get("from") or [{}])[0]
+            collection = frm.get("collectionId", "")
+            parsed = parse_collection(collection)
+            if parsed is None:
+                self._count("aggregation_404")
+                self._error(404, f"Collection '{collection}' not found"); return
+
+            total = parsed[2]
+            for agg in aggregation.get("aggregations", []):
+                up_to = agg.get("count", {}).get("upTo")
+                if up_to is not None:
+                    total = min(total, int(up_to))
+
+            # Counting transfers no documents, which is the whole point; the
+            # docs_served counter must stay flat so a test can prove it.
+            self._count("aggregation")
+            self._json([{"result": {"aggregateFields": {"count": {"integerValue": str(total)}}},
+                         "readTime": "2026-01-01T00:00:00.000000Z"}])
+            return
 
         if path.endswith(":runQuery"):
             if FAIL_RUNQUERY.is_set():

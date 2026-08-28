@@ -628,6 +628,45 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	return std::move(result);
 }
 
+// Whether this scan can be answered by counting instead of by reading.
+//
+// When DuckDB asks the scan for no columns at all -- count(*), or anything
+// else that only needs to know how many rows there are -- the documents
+// themselves cannot influence the result, so the row count is the whole
+// answer and :runAggregationQuery can supply it in one request.
+//
+// The conditions are about the count meaning exactly what a scan would have
+// produced:
+//   - The scan feeds nothing but a bare COUNT(*), as recognised by the
+//     optimizer extension. Anything reading a value needs that value fetched.
+//   - No candidate filters. A filter would need its column projected (which
+//     the previous condition already rules out), but say so directly rather
+//     than lean on that.
+//   - Not a document-path scan, whose rows are subcollection ids rather than
+//     documents.
+//   - Phantom documents must not be at stake. Aggregation queries never count
+//     documents that exist only to parent a subcollection, whereas a scan with
+//     show_missing returns them as rows. Collection groups never included them
+//     in the first place, so they are always safe.
+static bool CanAnswerWithCount(const FirestoreScanBindData &bind_data, const FirestoreScanGlobalState &global_state) {
+	if (!bind_data.count_star_only) {
+		return false;
+	}
+	if (!bind_data.candidate_pushdown_filters.empty()) {
+		return false;
+	}
+	if (bind_data.is_document_path) {
+		return false;
+	}
+	if (bind_data.show_missing && !bind_data.is_collection_group) {
+		FS_LOG_DEBUG("Not counting server-side because show_missing includes documents an aggregation query would "
+		             "not count; pass show_missing:=false to allow it");
+		return false;
+	}
+	(void)global_state;
+	return true;
+}
+
 // Work out which document fields Firestore needs to send for this scan.
 //
 // __document_id needs no field: it comes from the document's resource name,
@@ -742,6 +781,9 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	global_state->page_policy =
 	    FirestorePageSizePolicy(configured_page_size, FirestoreSettings::PageByteBudget(context));
 	global_state->projection = ResolveProjection(bind_data);
+	FS_LOG_DEBUG("InitGlobal: " + std::to_string(global_state->projection.field_paths.size()) +
+	             " projected field(s), masked=" + std::to_string(global_state->projection.masked) +
+	             ", keys_only=" + std::to_string(global_state->projection.KeysOnly()));
 
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
@@ -804,6 +846,31 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	auto &effective_order_by =
 	    !bind_data.parsed_order_by.empty() ? bind_data.parsed_order_by : bind_data.sql_pushed_order_by;
 	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
+
+	// A scan that needs no columns is fully described by how many rows it has,
+	// so ask Firestore for that number instead of reading the collection.
+	if (CanAnswerWithCount(bind_data, *global_state)) {
+		const int64_t up_to = effective_limit.has_value() && effective_limit.value() > 0 ? effective_limit.value() : 0;
+		int64_t counted = 0;
+		try {
+			if (global_state->client->CountDocuments(bind_data.collection, bind_data.is_collection_group, up_to,
+			                                         counted)) {
+				if (up_to > 0 && counted > up_to) {
+					counted = up_to; // upTo is a hint; enforce the limit regardless.
+				}
+				global_state->counted_rows_remaining = counted;
+				global_state->finished = counted <= 0;
+				FS_LOG_DEBUG("Answered scan of '" + bind_data.collection + "' with a count of " +
+				             std::to_string(counted) + " documents, fetching none");
+				return std::move(global_state);
+			}
+		} catch (const std::exception &e) {
+			// Aggregation queries are not available everywhere (older
+			// emulators, restricted credentials). Reading the documents is
+			// slower but always works.
+			FS_LOG_DEBUG("Count query failed, scanning instead: " + std::string(e.what()));
+		}
+	}
 
 	// Build query and fetch initial documents
 	FirestoreListResponse response;
@@ -969,6 +1036,27 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 	if (global_state.finished) {
 		output.SetCardinality(0);
+		return;
+	}
+
+	// The scan was answered by a count: emit that many rows and no values.
+	// Nothing downstream can read a column, because none was projected.
+	if (global_state.counted_rows_remaining.has_value()) {
+		const int64_t remaining = global_state.counted_rows_remaining.value();
+		const auto emitted = MinValue<idx_t>(STANDARD_VECTOR_SIZE, static_cast<idx_t>(remaining));
+		// Only DuckDB's row marker can be present here, and its values are
+		// never read. Say NULL explicitly rather than leave whatever the
+		// vector happened to hold.
+		for (idx_t out_col = 0; out_col < output.ColumnCount(); out_col++) {
+			output.data[out_col].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(output.data[out_col], true);
+		}
+		global_state.counted_rows_remaining = remaining - static_cast<int64_t>(emitted);
+		global_state.rows_emitted += emitted;
+		if (global_state.counted_rows_remaining.value() <= 0) {
+			global_state.finished = true;
+		}
+		output.SetCardinality(emitted);
 		return;
 	}
 

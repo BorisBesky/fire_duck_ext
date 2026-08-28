@@ -46,6 +46,8 @@ REQUIRED_MOCK_FEATURES = {
     "odd_shape",
     "field_mask",
     "runquery_select",
+    "aggregation_query",
+    "fail_aggregation",
 }
 
 
@@ -73,6 +75,10 @@ def reset_stats():
 
 def set_runquery_failure(enabled):
     mock_post(f"/__fail_runquery?enabled={1 if enabled else 0}")
+
+
+def set_aggregation_failure(enabled):
+    mock_post(f"/__fail_aggregation?enabled={1 if enabled else 0}")
 
 
 def stats():
@@ -551,9 +557,115 @@ def _():
 
 @test("projection: collection groups project through select")
 def _():
+    # count(f0) rather than count(*): a bare count(*) is answered by an
+    # aggregation query these days and never reaches the scan at all.
     reset_stats()
-    assert_eq(count_rows("~bench_wide_40_2500", "schema_sample_size:=5"), 2500, "rows from a projected group scan")
+    rows = run_sql(
+        "SELECT count(f0) FROM firestore_scan(" + scan_args("~bench_wide_40_2500", "schema_sample_size:=5") + ");"
+    )
+    assert_eq(rows[0], "2500", "rows from a projected collection-group scan")
     assert_eq(stats()["requests_with_field_mask"] > 0, True, "collection-group requests carry a select clause")
+
+
+# ---- count pushdown ---------------------------------------------------------
+#
+# A bare COUNT(*) reads none of its input's values, so Firestore can answer it
+# with :runAggregationQuery and send no documents at all. The interesting part
+# is everything that must NOT take that path.
+
+
+def counted(collection, extra="", sql=None):
+    """Run a query and report (result, whether Firestore was asked to count)."""
+    reset_stats()
+    args = scan_args(collection, extra)
+    rows = run_sql(sql.format(args=args) if sql else f"SELECT count(*) FROM firestore_scan({args});")
+    return rows[0], "aggregation" in stats()["requests_by_op"]
+
+
+@test("count: a bare count(*) is answered without fetching documents")
+def _():
+    reset_stats()
+    assert_eq(
+        count_rows("bench_flat_8_200000", "show_missing:=false, columns:={'f0':'VARCHAR'}"),
+        200000,
+        "count over 200k documents",
+    )
+    counters = stats()
+    assert_eq(counters["requests_by_op"], {"aggregation": 1}, "exactly one request, and it is the count")
+    assert_eq(counters["docs_served"], 0, "no documents transferred")
+
+
+@test("count: a collection group counts without phantom-document ambiguity")
+def _():
+    # Aggregation queries never count documents that exist only to parent a
+    # subcollection -- and neither does a collection-group scan, so the two
+    # agree whatever show_missing says.
+    result, pushed = counted("~bench_flat_8_2000")
+    assert_eq(result, "2000", "collection group count")
+    assert_eq(pushed, True, "collection groups can always be counted server-side")
+
+
+@test("count: show_missing keeps the count on the scanning path")
+def _():
+    # With show_missing a scan returns phantom documents as rows and an
+    # aggregation query would not count them, so the two would disagree.
+    result, pushed = counted("bench_flat_8_2000")
+    assert_eq(result, "2000", "count still correct")
+    assert_eq(pushed, False, "show_missing must not be answered by a count")
+
+
+@test("count: anything that reads a value is not answered by a count")
+def _():
+    for label, sql in [
+        ("a filter", "SELECT count(*) FROM firestore_scan({args}) WHERE f3 = true;"),
+        ("count of a column", "SELECT count(f0) FROM firestore_scan({args});"),
+        ("count distinct", "SELECT count(DISTINCT f0) FROM firestore_scan({args});"),
+        ("grouped count", "SELECT count(*) FROM firestore_scan({args}) GROUP BY f3;"),
+        ("count over a limit", "SELECT count(*) FROM (SELECT * FROM firestore_scan({args}) LIMIT 50);"),
+        ("count of __document_id", "SELECT count(__document_id) FROM firestore_scan({args});"),
+        ("sum", "SELECT sum(f1) FROM firestore_scan({args});"),
+    ]:
+        _result, pushed = counted("bench_flat_8_2000", "show_missing:=false", sql)
+        if pushed:
+            raise AssertionError(f"{label} must not be answered by a count")
+
+
+@test("count: the counted rows are the rows the scan would have produced")
+def _():
+    # The scanning and counting paths must agree exactly.
+    scanned, scan_pushed = counted(
+        "bench_flat_8_2000", "show_missing:=false", "SELECT count(f0) FROM firestore_scan({args});"
+    )
+    assert_eq(scan_pushed, False, "count(f0) reads values, so it scans")
+    pushed_result, was_pushed = counted("bench_flat_8_2000", "show_missing:=false")
+    assert_eq(was_pushed, True, "count(*) is pushed")
+    assert_eq(pushed_result, scanned, "counting and scanning agree")
+
+
+@test("count: a limit bounds the counted rows")
+def _():
+    result, pushed = counted("bench_flat_8_2000", "show_missing:=false, scan_limit:=300")
+    assert_eq(result, "300", "scan_limit caps the count")
+    assert_eq(pushed, True, "a bounded count is still pushed")
+
+    # A LIMIT above the aggregate limits rows of output, not rows counted.
+    result, pushed = counted(
+        "bench_flat_8_2000", "show_missing:=false", "SELECT count(*) FROM firestore_scan({args}) LIMIT 5;"
+    )
+    assert_eq(result, "2000", "a limit above the aggregate does not change the count")
+
+
+@test("count: an unavailable aggregation endpoint falls back to scanning")
+def _():
+    # Older emulators and restricted credentials do not offer the endpoint. A
+    # slower answer is fine; a failed query is not.
+    set_aggregation_failure(True)
+    try:
+        result, _ = counted("bench_flat_8_2000", "show_missing:=false")
+        assert_eq(result, "2000", "the fallback still produces the right count")
+        assert_eq("list" in stats()["requests_by_op"], True, "the fallback read the documents")
+    finally:
+        set_aggregation_failure(False)
 
 
 # ---- regressions on the paths this change touched ---------------------------

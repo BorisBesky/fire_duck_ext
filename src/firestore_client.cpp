@@ -708,6 +708,36 @@ std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
 	return base;
 }
 
+bool FirestoreClient::CountDocuments(const std::string &collection, bool is_collection_group, int64_t up_to,
+                                     int64_t &count_out) {
+	// Same URL shape as runQuery: a nested subcollection is counted against
+	// its parent document path, with the final segment in collectionId.
+	std::string parent_path;
+	std::string collection_id;
+	SplitFirestoreCollectionPath(collection, is_collection_group, parent_path, collection_id);
+
+	std::string url = BuildBaseUrl();
+	if (!parent_path.empty()) {
+		url += "/" + parent_path;
+	}
+	url += ":runAggregationQuery" + credentials_->GetUrlSuffix();
+
+	FirestoreErrorContext ctx;
+	ctx.withOperation("count").withCollection(collection);
+
+	json body = BuildCountAggregationQuery(collection_id, is_collection_group, up_to);
+	FS_LOG_DEBUG("Counting documents in '" + collection + "' with :runAggregationQuery");
+
+	json response = MakeRequest("POST", url, body, ctx);
+	if (!ParseCountAggregationResponse(response, count_out)) {
+		FS_LOG_DEBUG("Aggregation response carried no count; falling back to scanning");
+		return false;
+	}
+
+	FS_LOG_DEBUG("Counted " + std::to_string(count_out) + " documents in '" + collection + "'");
+	return true;
+}
+
 FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, const json &structured_query,
                                                 bool is_collection_group) {
 	// Nested subcollections must run the query against their parent document path

@@ -52,7 +52,10 @@ docs:
     functions firestore_array_union(), firestore_array_remove(), and
     firestore_array_append(). WHERE filters, SQL ORDER BY / LIMIT, and the
     column projection are pushed down to Firestore where possible, so
-    unselected fields and non-matching rows never cross the wire.
+    unselected fields and non-matching rows never cross the wire. A bare
+    COUNT(*) is answered by Firestore's aggregation API without transferring
+    any documents (on an ordinary collection this needs show_missing:=false,
+    since a scan counts phantom documents and an aggregation query does not).
 
     Scans stream: one page of documents is held at a time and the next is
     fetched only as DuckDB consumes the current one, so a collection of any

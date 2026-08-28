@@ -24,6 +24,16 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Projection info - which columns to actually output
 	std::vector<idx_t> projected_columns; // Indices into column_names/column_types
 
+	// Set by the optimizer extension when this scan feeds nothing but a bare
+	// COUNT(*): the scan then has to produce the right *number* of rows, and
+	// nothing may read their values.
+	//
+	// The projection cannot reveal this. DuckDB does not ask a table function
+	// for zero columns; for count(*) it projects the first column, which here
+	// is __document_id -- indistinguishable from someone genuinely selecting
+	// it. Only the plan shape tells them apart.
+	bool count_star_only = false;
+
 	// Query options
 	std::optional<int64_t> limit;
 
@@ -161,6 +171,10 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	// Fields Firestore is asked to return, derived from DuckDB's projection.
 	// Unselected fields then never cross the wire.
 	FirestoreProjection projection;
+
+	// Rows still to emit when the scan was answered by a count rather than by
+	// fetching documents. Unset means this is an ordinary scan.
+	std::optional<int64_t> counted_rows_remaining;
 
 	// Documents the *last* request actually asked for. The end-of-results
 	// check compares against this rather than the policy's current size:
