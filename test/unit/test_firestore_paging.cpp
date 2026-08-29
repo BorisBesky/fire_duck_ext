@@ -724,3 +724,131 @@ FD_TEST("range query: paging within a range resumes from the last document") {
 	FD_REQUIRE_EQ(query["startAt"]["values"][0]["referenceValue"].get<std::string>(), std::string("prefix/150"));
 	FD_REQUIRE_EQ(query["endAt"]["values"][0]["referenceValue"].get<std::string>(), std::string("prefix/200"));
 }
+
+// ------------------------------------------------- projection widening for cursors
+
+FD_TEST("projection widening: ordering fields join the requested ones") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+
+	json order_by = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "ASCENDING"}},
+	                             {{"field", {{"fieldPath", "__name__"}}}, {"direction", "ASCENDING"}}});
+	duckdb::AddOrderByFieldsToProjection(order_by, projection);
+
+	// __name__ rides along on every document, so it is never requested.
+	FD_REQUIRE_EQ(projection.field_paths.size(), 2u);
+	FD_REQUIRE_EQ(projection.field_paths[0], std::string("f0"));
+	FD_REQUIRE_EQ(projection.field_paths[1], std::string("f1"));
+}
+
+FD_TEST("projection widening: an ordering field already projected is not repeated") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f1", "f0"};
+
+	json order_by = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "DESCENDING"}}});
+	duckdb::AddOrderByFieldsToProjection(order_by, projection);
+
+	FD_REQUIRE_EQ(projection.field_paths.size(), 2u);
+}
+
+FD_TEST("projection widening: an unmasked projection is left alone") {
+	// masked == false already asks for every field; adding paths to it would
+	// turn "everything" into a mask of exactly the ordering fields.
+	duckdb::FirestoreProjection projection;
+	json order_by = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "ASCENDING"}}});
+	duckdb::AddOrderByFieldsToProjection(order_by, projection);
+
+	FD_REQUIRE(projection.field_paths.empty());
+}
+
+FD_TEST("projection widening: malformed orderBy entries are skipped") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+
+	json order_by = json::array({
+	    json {{"direction", "ASCENDING"}},              // no field
+	    json {{"field", "f1"}},                         // field is not an object
+	    json {{"field", {{"direction", "ASCENDING"}}}}, // no fieldPath
+	    json {{"field", {{"fieldPath", 7}}}},           // fieldPath is not a string
+	    json {{"field", {{"fieldPath", ""}}}},          // empty fieldPath
+	    json {{"field", {{"fieldPath", "f2"}}}},        // the one usable entry
+	});
+	duckdb::AddOrderByFieldsToProjection(order_by, projection);
+
+	FD_REQUIRE_EQ(projection.field_paths.size(), 2u);
+	FD_REQUIRE_EQ(projection.field_paths[1], std::string("f2"));
+}
+
+FD_TEST("projection widening: a non-array orderBy adds nothing") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+	duckdb::AddOrderByFieldsToProjection(json("f1"), projection);
+	FD_REQUIRE_EQ(projection.field_paths.size(), 1u);
+}
+
+FD_TEST("apply projection: the select clause covers what the query orders by") {
+	json structured_query;
+	structured_query["orderBy"] = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "ASCENDING"}},
+	                                           {{"field", {{"fieldPath", "__name__"}}}, {"direction", "ASCENDING"}}});
+
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+	duckdb::ApplyProjectionToStructuredQuery(structured_query, projection);
+
+	FD_REQUIRE_EQ(structured_query["select"]["fields"].size(), 2u);
+	FD_REQUIRE_EQ(structured_query["select"]["fields"][0]["fieldPath"].get<std::string>(), std::string("f0"));
+	FD_REQUIRE_EQ(structured_query["select"]["fields"][1]["fieldPath"].get<std::string>(), std::string("f1"));
+
+	// The caller's projection still describes only the DuckDB columns.
+	FD_REQUIRE_EQ(projection.field_paths.size(), 1u);
+}
+
+FD_TEST("apply projection: a keys-only query ordered by a field still asks for it") {
+	// count(*) over an ordered scan projects nothing, but the cursor is still
+	// built from the ordering field, so the field has to come back.
+	json structured_query;
+	structured_query["orderBy"] = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "ASCENDING"}}});
+
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	duckdb::ApplyProjectionToStructuredQuery(structured_query, projection);
+
+	FD_REQUIRE_EQ(structured_query["select"]["fields"].size(), 1u);
+	FD_REQUIRE_EQ(structured_query["select"]["fields"][0]["fieldPath"].get<std::string>(), std::string("f1"));
+}
+
+FD_TEST("apply projection: an unmasked projection leaves the query without a select") {
+	json structured_query;
+	structured_query["orderBy"] = json::array({{{"field", {{"fieldPath", "f1"}}}, {"direction", "ASCENDING"}}});
+	duckdb::ApplyProjectionToStructuredQuery(structured_query, duckdb::FirestoreProjection {});
+	FD_REQUIRE_FALSE(structured_query.contains("select"));
+}
+
+FD_TEST("apply projection: an unordered query gets exactly the projected fields") {
+	json structured_query;
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+	duckdb::ApplyProjectionToStructuredQuery(structured_query, projection);
+
+	FD_REQUIRE_EQ(structured_query["select"]["fields"].size(), 1u);
+	FD_REQUIRE_EQ(structured_query["select"]["fields"][0]["fieldPath"].get<std::string>(), std::string("f0"));
+}
+
+FD_TEST("range query: an ordered range query selects the ordering field") {
+	duckdb::FirestoreProjection projection;
+	projection.masked = true;
+	projection.field_paths = {"f0"};
+	json query =
+	    duckdb::BuildKeyRangeStructuredQuery("orders", "prefix", duckdb::FirestoreKeyRange {}, 100, projection);
+
+	// Range queries order by __name__ alone, which is already on every
+	// document: the select clause stays as narrow as the caller asked.
+	FD_REQUIRE_EQ(query["select"]["fields"].size(), 1u);
+	FD_REQUIRE_EQ(query["select"]["fields"][0]["fieldPath"].get<std::string>(), std::string("f0"));
+}

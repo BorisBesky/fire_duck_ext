@@ -52,6 +52,7 @@ REQUIRED_MOCK_FEATURES = {
     "auto_ids",
     "concurrency_stats",
     "runtime_delay",
+    "cursor_validation",
 }
 
 
@@ -211,10 +212,42 @@ def _():
     assert_eq(distinct, "2500", "distinct document ids")
 
 
-@test("collection group: ordering is preserved across pages")
+def assert_cursors_aligned(counters, context):
+    """Every cursor the extension sent named a real position in the query.
+
+    The mock checks each cursor against the orderBy of the query carrying it,
+    which is how Firestore reads one. A mismatch means the next page starts
+    somewhere other than where the last one ended -- rows repeat, go missing,
+    or the scan restarts -- and the mock does not have to reproduce that
+    outcome for the cursor itself to be wrong.
+    """
+    if counters["cursor_mismatches"]:
+        raise AssertionError(
+            f"{context}: {counters['cursor_mismatches']} cursors did not match their orderBy: "
+            + "; ".join(counters["cursor_mismatch_samples"])
+        )
+
+
+@test("collection group: an ordered scan pages without repeating documents")
 def _():
-    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args("~bench_flat_4_2400", "order_by:='f1'") + ");")
-    assert_eq(int(rows[0]), 2400, "rows from an ordered collection group")
+    # order_by puts f1 ahead of __name__ in the query's ordering, so each
+    # page's cursor has to carry that document's f1 -- even though the query
+    # selects only f0. Asking Firestore for f0 alone leaves f1 out of the
+    # response and the cursor holds a null in its place.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(f0), count(DISTINCT __document_id) FROM firestore_scan("
+        + scan_args("~bench_flat_4_2400", "order_by:='f1'")
+        + ");"
+    )
+    total, distinct = rows[0].split(",")
+    assert_eq(total, "2400", "rows from an ordered collection group")
+    assert_eq(distinct, "2400", "distinct document ids")
+
+    counters = stats()
+    if counters["requests_by_op"].get("runquery", 0) < 3:
+        raise AssertionError("2400 documents at 1000 per page should have taken several cursor-paged requests")
+    assert_cursors_aligned(counters, "ordered collection-group scan")
 
 
 @test("collection group: scan_limit stops the scan early")
@@ -433,6 +466,44 @@ def _():
     assert_eq(fallback_total, int(rows[0]), "the fallback returns the same rows as pushdown")
     if fallback_total == 0:
         raise AssertionError("expected the filter to match something")
+
+
+@test("pushdown: an ordered filtered scan resumes from cursors that name a real position")
+def _():
+    # The filtered scan pages through runQuery cursors, and f1 leads the
+    # query's ordering, so every cursor must carry that document's f1 --
+    # even though the query selects only f0. Asking Firestore for f0 alone
+    # leaves f1 out of the response and the cursor holds a null instead,
+    # which is not where the previous page ended.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(f0), count(DISTINCT __document_id) FROM firestore_scan("
+        + scan_args("bench_flat_4_2400", "show_missing:=false, order_by:='f1'")
+        + ") WHERE f3 = true;"
+    )
+    total, distinct = rows[0].split(",")
+    assert_eq(total, "1200", "rows matching the pushed filter")
+    assert_eq(distinct, "1200", "distinct document ids")
+
+    counters = stats()
+    if counters["requests_by_op"].get("runquery", 0) < 2:
+        raise AssertionError("the filtered scan should have paged through more than one runQuery request")
+    assert_cursors_aligned(counters, "ordered filtered scan")
+
+
+@test("pushdown: an ordered filtered scan of no columns still asks for the ordering field")
+def _():
+    # count(*) projects nothing, so the request would be keys-only -- but the
+    # cursor is still built from f1, which a keys-only response does not carry.
+    # A pushed filter keeps this off the aggregation shortcut.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM firestore_scan("
+        + scan_args("bench_flat_4_2400", "show_missing:=false, order_by:='f1'")
+        + ") WHERE f3 = true;"
+    )
+    assert_eq(int(rows[0]), 1200, "rows matching the pushed filter")
+    assert_cursors_aligned(stats(), "keys-only ordered filtered scan")
 
 
 @test("pushdown: the collection-group fallback also pages")
@@ -662,6 +733,27 @@ def _():
         "bench_flat_8_2000", "show_missing:=false", "SELECT count(*) FROM firestore_scan({args}) LIMIT 5;"
     )
     assert_eq(result, "2000", "a limit above the aggregate does not change the count")
+
+
+@test("count: a zero limit is answered without asking Firestore anything")
+def _():
+    # Zero rows is the answer whatever the collection holds. It must not reach
+    # the aggregation query, where a zero upTo means "no bound" and would come
+    # back with the size of the whole collection.
+    # Columns are given so schema inference does not read the collection and
+    # the request counters describe the scan alone.
+    fixed = "show_missing:=false, columns:={'f0':'VARCHAR'}"
+    for label, limit in [("zero", 0), ("negative", -1)]:
+        result, pushed = counted("bench_flat_8_2000", f"{fixed}, scan_limit:={limit}")
+        assert_eq(result, "0", f"count(*) under a {label} scan_limit")
+        assert_eq(pushed, False, f"a {label} scan_limit needs no aggregation query")
+        assert_eq(stats()["requests_by_op"], {}, f"a {label} scan_limit sends no request at all")
+
+    # The scanning path has always agreed; keep the two answering alike.
+    scanned, _ = counted(
+        "bench_flat_8_2000", f"{fixed}, scan_limit:=0", "SELECT count(f0) FROM firestore_scan({args});"
+    )
+    assert_eq(scanned, "0", "count(f0) under a zero scan_limit")
 
 
 @test("count: an unavailable aggregation endpoint falls back to scanning")

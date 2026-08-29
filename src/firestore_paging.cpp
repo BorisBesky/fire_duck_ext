@@ -1,5 +1,6 @@
 #include "firestore_paging.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <string>
 #include <vector>
@@ -226,9 +227,7 @@ json BuildKeyRangeStructuredQuery(const std::string &collection_id, const std::s
 	structured_query["from"] = {{{"collectionId", collection_id}, {"allDescendants", false}}};
 	structured_query["orderBy"] = BuildOrderByArray({});
 	structured_query["limit"] = ClampFirestorePageSize(page_size);
-	if (projection.masked) {
-		structured_query["select"] = BuildSelectClause(projection);
-	}
+	ApplyProjectionToStructuredQuery(structured_query, projection);
 
 	// Cursors on __name__ take the document's full resource name.
 	//
@@ -250,6 +249,42 @@ json BuildKeyRangeStructuredQuery(const std::string &collection_id, const std::s
 		    {"before", true}};
 	}
 	return structured_query;
+}
+
+void AddOrderByFieldsToProjection(const json &order_by_array, FirestoreProjection &projection) {
+	if (!projection.masked || !order_by_array.is_array()) {
+		return; // An unmasked projection already asks for every field.
+	}
+	for (const auto &entry : order_by_array) {
+		auto field = entry.find("field");
+		if (field == entry.end() || !field->is_object()) {
+			continue;
+		}
+		auto path = field->find("fieldPath");
+		if (path == field->end() || !path->is_string()) {
+			continue;
+		}
+		const std::string field_path = path->get<std::string>();
+		if (field_path.empty() || field_path == "__name__") {
+			continue;
+		}
+		if (std::find(projection.field_paths.begin(), projection.field_paths.end(), field_path) ==
+		    projection.field_paths.end()) {
+			projection.field_paths.push_back(field_path);
+		}
+	}
+}
+
+void ApplyProjectionToStructuredQuery(json &structured_query, const FirestoreProjection &projection) {
+	if (!projection.masked) {
+		return;
+	}
+	FirestoreProjection widened = projection;
+	auto order_by = structured_query.find("orderBy");
+	if (order_by != structured_query.end()) {
+		AddOrderByFieldsToProjection(*order_by, widened);
+	}
+	structured_query["select"] = BuildSelectClause(widened);
 }
 
 json BuildCountAggregationQuery(const std::string &collection_id, bool all_descendants, int64_t up_to) {

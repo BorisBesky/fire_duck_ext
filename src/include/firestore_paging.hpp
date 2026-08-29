@@ -121,6 +121,25 @@ struct FirestoreProjection {
 // fields becomes Firestore's documented keys-only form, select __name__.
 json BuildSelectClause(const FirestoreProjection &projection);
 
+// Widen a projection to cover the fields a query orders by.
+//
+// Cursor pagination reads the next page's start position out of the last
+// document of the current one, one value per orderBy entry. If an ordering
+// field was not requested, that document comes back without it and the cursor
+// carries a null in its place -- which is not where the server left off, so
+// the following page can repeat rows, skip them, or restart the scan. The
+// fields are added to the request only; the scanner still writes just the
+// columns DuckDB projected.
+//
+// __name__ needs nothing added: it is the document's own resource name, which
+// every response carries.
+void AddOrderByFieldsToProjection(const json &order_by_array, FirestoreProjection &projection);
+
+// Attach a projection to a structured query as its `select` clause, widened to
+// cover whatever the query orders by. Call this after the query's orderBy is
+// final.
+void ApplyProjectionToStructuredQuery(json &structured_query, const FirestoreProjection &projection);
+
 // Build the body of a :runAggregationQuery that counts a collection.
 //
 // `up_to` bounds the count: Firestore stops once it reaches that many, which
