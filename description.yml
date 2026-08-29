@@ -28,9 +28,6 @@ docs:
     -- Read documents
     SELECT * FROM firestore_scan('users');
 
-    -- Read a collection of large documents in smaller pages
-    SELECT * FROM firestore_scan('scanned_documents', page_size:=50);
-
     -- Filter with SQL
     SELECT __document_id, name, email
     FROM firestore_scan('users')
@@ -44,38 +41,26 @@ docs:
 
   extended_description: |
     fire_duck_ext lets you work with Google Cloud Firestore directly from DuckDB
-    using SQL. Scan collections with firestore_scan(), including collection-group
+    using SQL. Read with firestore_scan(), which also covers collection-group
     queries (firestore_scan('~collection')) and subcollection-ID discovery
     (firestore_scan('collection/doc_id')). Write with firestore_insert(),
     firestore_update(), firestore_delete(), their batch counterparts
     (firestore_update_batch(), firestore_delete_batch()), and the array-transform
     functions firestore_array_union(), firestore_array_remove(), and
-    firestore_array_append(). WHERE filters, SQL ORDER BY / LIMIT, and the
-    column projection are pushed down to Firestore where possible, so
-    unselected fields and non-matching rows never cross the wire. A bare
-    COUNT(*) is answered by Firestore's aggregation API without transferring
-    any documents (on an ordinary collection this needs show_missing:=false,
-    since a scan counts phantom documents and an aggregation query does not).
+    firestore_array_append().
 
-    Scans stream: one page of documents is held at a time and the next is
-    fetched only as DuckDB consumes the current one, so a collection of any
-    size can be read without holding it in memory. Collection groups paginate
-    by cursor rather than stopping at the first page. An unfiltered, unordered
-    scan of an ordinary collection with show_missing:=false can be split into
-    document-key ranges and read by several threads at once
-    (firestore_max_threads, off by default -- it pays off for Firestore auto-ids
-    and costs time for ids that cluster into one range). page_size (or the
-    firestore_page_size setting) controls how many documents each round trip
-    fetches, and firestore_page_byte_budget shrinks that automatically when a
-    page turns out to weigh more than the budget allows -- which matters for
-    collections whose documents approach Firestore's 1 MiB limit.
+    WHERE filters, SQL ORDER BY / LIMIT, the column projection, and a bare
+    COUNT(*) are pushed down to Firestore where possible, so rows, fields, and
+    whole documents a query does not need never cross the wire.
+
+    Scans stream a page at a time, so a collection of any size can be read
+    without holding it in memory, and the page size adapts when documents turn
+    out to be unusually large. Settings cover paging, schema sampling, and
+    optional parallel scanning.
 
     Firestore's schemaless documents are mapped to typed DuckDB columns
-    automatically, with configurable handling for nested maps (map_encoding)
-    and fields that only appear in some documents (schema_sample_size,
-    unmapped_column, columns). Schema inference streams too, so sampling every
-    document of a large collection costs one page of memory rather than the
-    whole collection.
+    automatically, with configurable handling for nested maps and for fields
+    that appear in only some documents.
 
     Secrets require PROJECT_ID and one of: a service-account key **file path**
     (SERVICE_ACCOUNT_JSON, admin access, bypasses Security Rules via IAM,
@@ -89,5 +74,5 @@ docs:
     The extension also builds and runs under DuckDB-WASM using API-key or
     Firebase-user auth (service-account auth needs OpenSSL and is native-only).
 
-    See the project README for the full parameter reference, type mapping,
-    pushdown semantics, and platform notes.
+    See the project README for the parameter and settings reference, type
+    mapping, pushdown semantics, and platform notes.
