@@ -50,8 +50,9 @@ docs:
     firestore_array_append().
 
     WHERE filters, SQL ORDER BY / LIMIT, the column projection, and a bare
-    COUNT(*) are pushed down to Firestore where possible, so rows, fields, and
-    whole documents a query does not need never cross the wire.
+    COUNT(*) are pushed down to Firestore where possible. A query then
+    transfers only what it uses: matching rows, selected fields, and for a
+    count, no documents at all.
 
     Scans stream a page at a time, so a collection of any size can be read
     without holding it in memory, and the page size adapts when documents turn
