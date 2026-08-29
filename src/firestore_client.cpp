@@ -1,4 +1,6 @@
 #include "firestore_client.hpp"
+#include "firestore_paging.hpp"
+#include "firestore_schema_accumulator.hpp"
 #include "firestore_index.hpp"
 #include "firestore_types.hpp"
 #include "firestore_path_utils.hpp"
@@ -21,6 +23,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <chrono>
+#include <algorithm>
 
 namespace duckdb {
 
@@ -131,7 +134,7 @@ std::string FirestoreClient::BuildUrl(const std::string &path) const {
 }
 
 json FirestoreClient::MakeRequest(const std::string &method, const std::string &url, const json &body,
-                                  const FirestoreErrorContext &ctx) {
+                                  const FirestoreErrorContext &ctx, int64_t *response_bytes_out) {
 	auto start_time = std::chrono::high_resolution_clock::now();
 
 	FS_LOG_DEBUG("Making " + method + " request to: " + url);
@@ -250,6 +253,12 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 
 	error_ctx.withStatus(http_code);
 
+	if (response_bytes_out != nullptr) {
+		// Uncompressed: gzip is inflated by the transport before this point,
+		// and it is the inflated bytes the JSON DOM is built from.
+		*response_bytes_out = static_cast<int64_t>(response_data.size());
+	}
+
 	// Parse response
 	json response;
 	if (!response_data.empty()) {
@@ -318,7 +327,7 @@ std::string FirestoreClient::ExtractDocumentId(const std::string &path) {
 	return path.substr(last_slash + 1);
 }
 
-FirestoreDocument FirestoreClient::ParseDocument(const json &doc_json) {
+FirestoreDocument FirestoreClient::ParseDocument(json &&doc_json) {
 	FirestoreDocument doc;
 
 	if (doc_json.contains("name")) {
@@ -327,7 +336,19 @@ FirestoreDocument FirestoreClient::ParseDocument(const json &doc_json) {
 	}
 
 	if (doc_json.contains("fields")) {
-		doc.fields = doc_json["fields"];
+		// Moved, not copied: a page holds up to 1000 of these, and copying
+		// them while the parsed response is still alive roughly doubles peak
+		// memory for the page.
+		//
+		// This is a trade, not a free win. Measured against the branch point
+		// over 20,000 documents carrying 64-element arrays, `count(*)` costs
+		// 1.408s copying and 1.652s moving -- about 17% -- with byte-identical
+		// wire traffic; scalar-field collections show no difference. The
+		// likely mechanism is locality: a copy produces a fresh compact
+		// subtree and frees the parsed response as a block, while a move
+		// leaves these fields pointing into nodes scattered through the
+		// response's allocations. See bench/FINDINGS.md section 9.
+		doc.fields = std::move(doc_json["fields"]);
 	}
 
 	if (doc_json.contains("createTime")) {
@@ -353,7 +374,7 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 		has_params = true;
 	};
 
-	add_param("pageSize", std::to_string(query.page_size));
+	add_param("pageSize", std::to_string(ClampFirestorePageSize(query.page_size)));
 
 	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
 	// Only send showMissing=true when talking to production Firestore.
@@ -379,16 +400,26 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 		add_param("orderBy", query.order_by.value());
 	}
 
+	// Ask only for the fields the query projects, so the rest never crosses
+	// the wire. A keys-only projection cannot be expressed here -- an absent
+	// mask parameter means "every field", and there is no way to spell an
+	// empty one in a URL -- so that case sends no mask and pays for the
+	// fields it will ignore.
+	if (query.projection.masked && !query.projection.KeysOnly()) {
+		for (const auto &field_path : query.projection.field_paths) {
+			add_param("mask.fieldPaths", UrlEncodeQueryValue(QuoteFirestoreFieldPath(field_path)));
+		}
+	}
+
 	FirestoreErrorContext ctx;
 	ctx.withOperation("list").withCollection(collection);
 
-	json response = MakeRequest("GET", url, {}, ctx);
-
 	FirestoreListResponse result;
+	json response = MakeRequest("GET", url, {}, ctx, &result.response_bytes);
 
 	if (response.contains("documents")) {
 		for (auto &doc_json : response["documents"]) {
-			result.documents.push_back(ParseDocument(doc_json));
+			result.documents.push_back(ParseDocument(std::move(doc_json)));
 		}
 	}
 
@@ -461,7 +492,7 @@ FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, co
 	ctx.withOperation("get").withCollection(collection).withDocument(document_id);
 
 	json response = MakeRequest("GET", url, {}, ctx);
-	return ParseDocument(response);
+	return ParseDocument(std::move(response));
 }
 
 FirestoreDocument FirestoreClient::CreateDocument(const std::string &collection, const json &fields,
@@ -484,7 +515,7 @@ FirestoreDocument FirestoreClient::CreateDocument(const std::string &collection,
 
 	json body = {{"fields", fields}};
 	json response = MakeRequest("POST", url, body, ctx);
-	return ParseDocument(response);
+	return ParseDocument(std::move(response));
 }
 
 void FirestoreClient::UpdateDocument(const std::string &collection, const std::string &document_id,
@@ -615,25 +646,23 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
                                                             const FirestoreQuery &query) {
 	FS_LOG_DEBUG("Executing collection group query for: " + collection_id);
 
-	// Collection group queries use the runQuery endpoint
-	// This queries all collections/subcollections with the given collection ID
+	// Collection group queries use the runQuery endpoint, which has no page
+	// tokens -- pagination is by cursor, which is why the query is always
+	// ordered (BuildCollectionGroupStructuredQuery appends __name__).
 	std::string url = BuildBaseUrl() + ":runQuery" + credentials_->GetUrlSuffix();
 
-	// Build structured query for collection group
-	json structured_query = {
-	    {"from",
-	     {{
-	         {"collectionId", collection_id}, {"allDescendants", true} // This makes it a collection group query
-	     }}},
-	    {"limit", query.page_size}};
-
+	std::vector<OrderByField> order_by;
 	if (query.order_by.has_value()) {
-		auto parsed = ParseOrderByString(query.order_by.value());
-		json order_by_arr = json::array();
-		for (auto &ob : parsed) {
-			order_by_arr.push_back({{"field", {{"fieldPath", ob.field_path}}}, {"direction", ob.direction}});
-		}
-		structured_query["orderBy"] = order_by_arr;
+		order_by = ParseOrderByString(query.order_by.value());
+	}
+
+	const int64_t page_size = ClampFirestorePageSize(query.page_size);
+	json structured_query = BuildCollectionGroupStructuredQuery(collection_id, order_by, page_size);
+	if (query.projection.masked) {
+		structured_query["select"] = BuildSelectClause(query.projection);
+	}
+	if (!query.start_at.is_null()) {
+		structured_query["startAt"] = query.start_at;
 	}
 
 	FirestoreErrorContext ctx;
@@ -641,17 +670,25 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 
 	json body = {{"structuredQuery", structured_query}};
 
-	json response = MakeRequest("POST", url, body, ctx);
-
 	FirestoreListResponse result;
+	json response = MakeRequest("POST", url, body, ctx, &result.response_bytes);
 
 	// Response is an array of results, each containing a "document" field
 	if (response.is_array()) {
 		for (auto &item : response) {
 			if (item.contains("document")) {
-				result.documents.push_back(ParseDocument(item["document"]));
+				result.documents.push_back(ParseDocument(std::move(item["document"])));
 			}
 		}
+	}
+
+	// A short page means the collection group is exhausted. A page that came
+	// back full may or may not be the last one, so hand back a cursor and let
+	// the next request settle it: one wasted round trip at worst, against
+	// silently dropping every document past the first page.
+	if (!result.documents.empty() && static_cast<int64_t>(result.documents.size()) >= page_size) {
+		const auto &last_document = result.documents.back();
+		result.next_start_at = BuildStartAtCursor(structured_query, last_document.name, last_document.fields);
 	}
 
 	FS_LOG_DEBUG("Collection group query returned " + std::to_string(result.documents.size()) + " documents");
@@ -681,6 +718,41 @@ std::string FirestoreClient::BuildAdminUrl(const std::string &path) const {
 	return base;
 }
 
+std::string FirestoreClient::CollectionResourceName(const std::string &collection) const {
+	return "projects/" + credentials_->project_id + "/databases/" + credentials_->database_id + "/documents/" +
+	       collection;
+}
+
+bool FirestoreClient::CountDocuments(const std::string &collection, bool is_collection_group, int64_t up_to,
+                                     int64_t &count_out) {
+	// Same URL shape as runQuery: a nested subcollection is counted against
+	// its parent document path, with the final segment in collectionId.
+	std::string parent_path;
+	std::string collection_id;
+	SplitFirestoreCollectionPath(collection, is_collection_group, parent_path, collection_id);
+
+	std::string url = BuildBaseUrl();
+	if (!parent_path.empty()) {
+		url += "/" + parent_path;
+	}
+	url += ":runAggregationQuery" + credentials_->GetUrlSuffix();
+
+	FirestoreErrorContext ctx;
+	ctx.withOperation("count").withCollection(collection);
+
+	json body = BuildCountAggregationQuery(collection_id, is_collection_group, up_to);
+	FS_LOG_DEBUG("Counting documents in '" + collection + "' with :runAggregationQuery");
+
+	json response = MakeRequest("POST", url, body, ctx);
+	if (!ParseCountAggregationResponse(response, count_out)) {
+		FS_LOG_DEBUG("Aggregation response carried no count; falling back to scanning");
+		return false;
+	}
+
+	FS_LOG_DEBUG("Counted " + std::to_string(count_out) + " documents in '" + collection + "'");
+	return true;
+}
+
 FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, const json &structured_query,
                                                 bool is_collection_group) {
 	// Nested subcollections must run the query against their parent document path
@@ -707,14 +779,13 @@ FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, c
 
 	FS_LOG_DEBUG("StructuredQuery: " + structured_query.dump());
 
-	json response = MakeRequest("POST", url, body, ctx);
-
 	FirestoreListResponse result;
+	json response = MakeRequest("POST", url, body, ctx, &result.response_bytes);
 
 	if (response.is_array()) {
 		for (auto &item : response) {
 			if (item.contains("document")) {
-				result.documents.push_back(ParseDocument(item["document"]));
+				result.documents.push_back(ParseDocument(std::move(item["document"])));
 			}
 		}
 	}
@@ -830,139 +901,95 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 
 std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
                                                                               int64_t sample_size, bool show_missing,
-                                                                              FirestoreMapEncoding map_encoding) {
+                                                                              FirestoreMapEncoding map_encoding,
+                                                                              int64_t page_size) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
-	// sample_size <= 0 means "every document".
-	const bool sample_all = sample_size <= 0;
-	const int64_t kMaxPageSize = 1000; // Firestore's per-page cap
+	const bool is_collection_group = !collection.empty() && collection[0] == '~';
 
-	FirestoreListResponse response;
+	// Each page is folded into the accumulator and then released, so peak
+	// memory is one page however deep the sample goes. Retaining every sampled
+	// document is what made `schema_sample_size := -1` unusable on a large
+	// collection: it pulled the whole thing into memory at bind time, before
+	// any LIMIT or filter could reduce it.
+	FirestoreSchemaAccumulator accumulator(sample_size);
 
-	if (!collection.empty() && collection[0] == '~') {
-		// Collection group: runQuery has no page-token pagination, so the whole
-		// sample must come from a single request bounded by `limit`.
+	std::string page_token; // documents.list pagination
+	json start_at;          // runQuery (collection group) cursor pagination
+	bool has_more_pages = true;
+
+	while (has_more_pages && !accumulator.IsFull()) {
 		FirestoreQuery query;
 		query.show_missing = show_missing;
-		query.page_size = sample_all ? kMaxPageSize : std::min(sample_size, kMaxPageSize);
-		response = CollectionGroupQuery(collection.substr(1), query);
-	} else {
-		// Page until we have enough documents or the collection runs out.
-		// Previously this issued exactly one request, so any sample_size above
-		// the page size silently sampled only the first page.
-		std::optional<std::string> page_token;
-		do {
-			FirestoreQuery query;
-			query.show_missing = show_missing;
-			query.page_token = page_token;
-			if (sample_all) {
-				query.page_size = kMaxPageSize;
-			} else {
-				int64_t remaining = sample_size - static_cast<int64_t>(response.documents.size());
-				query.page_size = std::min(remaining, kMaxPageSize);
-			}
+		const int64_t per_request = ClampFirestorePageSize(page_size);
+		const int64_t remaining = accumulator.RemainingSample();
+		query.page_size = remaining < 0 ? per_request : std::min(remaining, per_request);
 
-			auto page = ListDocuments(collection, query);
-			if (page.documents.empty()) {
-				break;
+		FirestoreListResponse page;
+		if (is_collection_group) {
+			// Collection groups paginate by cursor; before this they issued a
+			// single request, so any sample above one page silently stopped
+			// there.
+			query.start_at = start_at;
+			page = CollectionGroupQuery(collection.substr(1), query);
+		} else {
+			if (!page_token.empty()) {
+				query.page_token = page_token;
 			}
-			response.documents.insert(response.documents.end(), std::make_move_iterator(page.documents.begin()),
-			                          std::make_move_iterator(page.documents.end()));
+			page = ListDocuments(collection, query);
+		}
 
-			page_token = page.next_page_token.empty() ? std::nullopt : std::optional<std::string>(page.next_page_token);
-		} while (page_token.has_value() &&
-		         (sample_all || static_cast<int64_t>(response.documents.size()) < sample_size));
+		if (page.documents.empty()) {
+			break;
+		}
+		for (const auto &document : page.documents) {
+			accumulator.AddDocument(document.fields);
+		}
+
+		page_token = page.next_page_token;
+		start_at = page.next_start_at;
+		has_more_pages = page.HasMorePages();
 	}
 
-	// Collect all field names and their types
-	std::map<std::string, std::string> field_types;
-	// For array fields, collect element types
-	std::map<std::string, std::map<std::string, int64_t>> array_element_types;
-	// For vector fields, track dimension from first non-null vector
-	std::map<std::string, idx_t> vector_dimensions;
-
-	for (const auto &doc : response.documents) {
-		// Skip phantom/missing documents (no fields) during schema inference
-		if (doc.fields.empty() || doc.fields.is_null()) {
-			continue;
-		}
-		for (auto it = doc.fields.begin(); it != doc.fields.end(); ++it) {
-			const std::string &field_name = it.key();
-			const json &field_value = it.value();
-
-			// Use the centralized type detection function
-			std::string type_name = GetFirestoreTypeName(field_value);
-
-			// For array fields, sample element types
-			if (type_name == "arrayValue" && field_value["arrayValue"].contains("values")) {
-				for (const auto &elem : field_value["arrayValue"]["values"]) {
-					std::string elem_type = GetFirestoreTypeName(elem);
-					if (elem_type != "nullValue") {
-						array_element_types[field_name][elem_type]++;
-					}
-				}
-			}
-
-			// For vector fields, record dimension from first occurrence
-			if (type_name == "vectorValue" && vector_dimensions.find(field_name) == vector_dimensions.end()) {
-				const auto &arr = field_value["mapValue"]["fields"]["value"]["arrayValue"];
-				if (arr.contains("values")) {
-					vector_dimensions[field_name] = arr["values"].size();
-				}
-			}
-
-			// Store first seen type (could be improved to handle type conflicts)
-			if (field_types.find(field_name) == field_types.end()) {
-				field_types[field_name] = type_name;
-			}
-		}
-	}
-
-	// Convert to vector with proper LogicalTypes
+	// Convert the summary to DuckDB types.
 	std::vector<std::pair<std::string, LogicalType>> result;
-	for (const auto &[name, type] : field_types) {
-		if (type == "arrayValue") {
-			// Determine element type from sampled elements
+	for (const auto &entry : accumulator.Fields()) {
+		const std::string &name = entry.first;
+		const auto &summary = entry.second;
+
+		if (summary.type_name == "arrayValue") {
+			// Element type by majority of the elements actually sampled.
 			LogicalType element_type = LogicalType::VARCHAR; // Default
-			if (array_element_types.count(name)) {
-				std::string best_elem_type = "stringValue";
-				int64_t best_count = 0;
-				for (const auto &[elem_type, cnt] : array_element_types[name]) {
-					if (cnt > best_count) {
-						best_count = cnt;
-						best_elem_type = elem_type;
-					}
-				}
-				if (best_elem_type == "integerValue")
-					element_type = LogicalType::BIGINT;
-				else if (best_elem_type == "doubleValue")
-					element_type = LogicalType::DOUBLE;
-				else if (best_elem_type == "booleanValue")
-					element_type = LogicalType::BOOLEAN;
-				else if (best_elem_type == "timestampValue")
-					element_type = LogicalType::TIMESTAMP;
-				// else keep VARCHAR
-			}
+			const std::string best_element_type =
+			    FirestoreSchemaAccumulator::MajorityElementType(summary.array_element_types);
+			if (best_element_type == "integerValue")
+				element_type = LogicalType::BIGINT;
+			else if (best_element_type == "doubleValue")
+				element_type = LogicalType::DOUBLE;
+			else if (best_element_type == "booleanValue")
+				element_type = LogicalType::BOOLEAN;
+			else if (best_element_type == "timestampValue")
+				element_type = LogicalType::TIMESTAMP;
+			// else keep VARCHAR
 			result.emplace_back(name, LogicalType::LIST(element_type));
 			FS_LOG_DEBUG("Array field '" + name + "' inferred element type: " + element_type.ToString());
-		} else if (type == "vectorValue") {
-			// Use the dimension from the first vector found
-			if (vector_dimensions.count(name) && vector_dimensions[name] > 0) {
-				result.emplace_back(name, LogicalType::ARRAY(LogicalType::DOUBLE, vector_dimensions[name]));
+		} else if (summary.type_name == "vectorValue") {
+			if (summary.vector_dimension > 0) {
+				result.emplace_back(name, LogicalType::ARRAY(LogicalType::DOUBLE, summary.vector_dimension));
 				FS_LOG_DEBUG("Vector field '" + name +
-				             "' inferred dimension: " + std::to_string(vector_dimensions[name]));
+				             "' inferred dimension: " + std::to_string(summary.vector_dimension));
 			} else {
-				// Fallback if no dimension could be determined
+				// No occurrence told us the dimension.
 				result.emplace_back(name, LogicalType::LIST(LogicalType::DOUBLE));
 				FS_LOG_DEBUG("Vector field '" + name + "' could not determine dimension, using LIST(DOUBLE)");
 			}
 		} else {
-			result.emplace_back(name, FirestoreTypeToDuckDB(type, map_encoding));
+			result.emplace_back(name, FirestoreTypeToDuckDB(summary.type_name, map_encoding));
 		}
 	}
 
 	FS_LOG_DEBUG("Inferred " + std::to_string(result.size()) + " fields from " +
-	             std::to_string(response.documents.size()) + " documents");
+	             std::to_string(accumulator.DocumentsSeen()) + " documents");
 	return result;
 }
 

@@ -161,6 +161,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Documents sampled to infer a collection's schema (-1 samples every document)",
 	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultSchemaSampleSize),
 	                          FirestoreSettings::SetSchemaSampleSize);
+	config.AddExtensionOption("firestore_page_size",
+	                          "Documents requested per Firestore round trip (1-1000; lower it for collections of "
+	                          "large documents)",
+	                          LogicalType::BIGINT, Value::BIGINT(FIRESTORE_DEFAULT_PAGE_SIZE),
+	                          FirestoreSettings::SetPageSize);
+	config.AddExtensionOption("firestore_page_byte_budget",
+	                          "Uncompressed bytes one page may weigh before the scan requests fewer documents per "
+	                          "round trip (0 disables the guard)",
+	                          LogicalType::BIGINT, Value::BIGINT(FIRESTORE_DEFAULT_PAGE_BYTE_BUDGET),
+	                          FirestoreSettings::SetPageByteBudget);
+	config.AddExtensionOption("firestore_max_threads",
+	                          "Maximum threads one scan may split across, reading separate document-key ranges. "
+	                          "1 (the default) disables parallel scanning; raise it for collections whose "
+	                          "document ids spread over the key space, such as Firestore auto-ids",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultMaxThreads),
+	                          FirestoreSettings::SetMaxScanThreads);
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);

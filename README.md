@@ -13,6 +13,10 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Filter pushdown** sends supported WHERE clauses to Firestore for faster queries
 - **SQL ORDER BY / LIMIT pushdown** for faster top-N and sorted scans
 - **Collection ID listings** by scanning a Firestore document path
+- **Streaming scans** that page through collections of any size, with a tunable page size for large documents
+- **Projection pushdown** so only the selected fields cross the wire
+- **Count pushdown** answering `COUNT(*)` from Firestore's aggregation API without reading documents
+- **Parallel scans** (opt-in) splitting a collection into document-key ranges read concurrently
 - **Vector embedding support** with Firestore vector fields mapped to `ARRAY(DOUBLE, N)`
 - **DuckDB secret management** for secure credential storage
 
@@ -288,6 +292,7 @@ SELECT * FROM firestore_scan('users', database:='my-other-db');
 | `schema_sample_size` | BIGINT | Documents sampled to infer the schema. Default `1000`; `-1` samples every document. Overrides the `firestore_schema_sample_size` setting. See [Schema Inference](#schema-inference-and-unmapped-fields). |
 | `unmapped_column` | BOOLEAN | Append a `__unmapped` column carrying any field not present in the inferred schema. Default: `false`. |
 | `columns` | STRUCT | Declare the schema explicitly (e.g. `columns:={'id':'VARCHAR','score':'BIGINT'}`), skipping inference and its sampling request entirely. |
+| `page_size` | BIGINT | Documents fetched per Firestore round trip, 1-1000 (values outside that range are clamped). Default `1000`; overrides the `firestore_page_size` setting. Lower it for collections of large documents. See [Large Collections](#large-collections). |
 
 ```sql
 -- Fetch only the top 10 documents ordered by score
@@ -298,6 +303,9 @@ SELECT * FROM firestore_scan('leaderboard', order_by:='category, score DESC');
 
 -- Exclude phantom/missing documents
 SELECT * FROM firestore_scan('users', show_missing:=false);
+
+-- Smaller pages for a collection of large documents
+SELECT * FROM firestore_scan('scanned_documents', page_size:=50);
 ```
 
 ### Insert Parameters
@@ -390,9 +398,20 @@ The sample size can also be set globally:
 SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
 ```
 
-Note: collection-group scans (`~` prefix) run through `runQuery`, which has no
-page-token pagination, so their sample is always bounded by a single request of
-at most 1000 documents regardless of `schema_sample_size`.
+### Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `firestore_schema_cache_ttl` | `3600` | Seconds an inferred schema is cached; `0` disables caching. |
+| `firestore_schema_sample_size` | `1000` | Documents sampled to infer a schema; `-1` samples every document. |
+| `firestore_page_size` | `1000` | Documents fetched per round trip, clamped to Firestore's 1-1000 range. |
+| `firestore_page_byte_budget` | `67108864` | Uncompressed bytes a page may weigh before the scan requests fewer documents; `0` disables the guard. See [Large Collections](#large-collections). |
+| `firestore_max_threads` | `1` | Threads one scan may split across, reading separate key ranges. `1` (the default) disables parallel scanning; raise it only for collections whose document ids spread over the key space. Capped at 64. See [Large Collections](#large-collections). |
+
+Sampling streams: each page is folded into the inferred schema and released, so
+`schema_sample_size:=-1` costs one page of memory rather than the whole
+collection. Collection-group scans (`~` prefix) sample through cursor
+pagination and so honour `schema_sample_size` like any other scan.
 
 ### Map Encoding
 
@@ -540,6 +559,9 @@ FROM firestore_scan('~orders')
 WHERE status = 'shipped';
 ```
 
+Collection-group scans paginate with a `__name__` cursor, so they read the
+whole collection group rather than stopping at the first page.
+
 Composite-index detection for multi-field `ORDER BY` on a collection group requires service-account auth — see [Admin-only features](#admin-only-features-index-metadata).
 
 ## Collection ID Listings
@@ -575,6 +597,141 @@ FROM firestore_scan('users/user1')
 ORDER BY __document_id DESC
 LIMIT 5;
 ```
+
+## Large Collections
+
+A scan streams: the extension holds one page of documents at a time and asks
+for the next only as DuckDB consumes the current one, so memory does not grow
+with the size of the collection.
+
+Two knobs control what a page costs.
+
+```sql
+-- Documents per round trip (1-1000, default 1000)
+SET firestore_page_size = 100;
+SELECT * FROM firestore_scan('scanned_documents', page_size:=50);  -- per query
+
+-- Uncompressed bytes a page may weigh before the scan asks for fewer
+-- documents per request (default 64 MiB; 0 disables the guard)
+SET firestore_page_byte_budget = 16777216;
+```
+
+`page_size` matters when documents are large. Firestore allows a document to be
+1 MiB, so a full 1000-document page can be ~1 GiB of JSON before it is parsed.
+The default suits ordinary collections; lower it when documents are big enough
+that a full page will not fit comfortably in memory. It applies to the
+bind-time schema-sampling request too, which is the first request a query
+makes and runs before any `WHERE` or `LIMIT` can reduce it.
+
+`firestore_page_byte_budget` is a safety net for when you do not know the
+document sizes in advance. If a page comes back heavier than the budget, the
+scan reduces the page size for the rest of that query — roughly to what the
+budget divided by the observed per-document size allows — and logs a warning
+naming the new size. The page size only ever decreases within a scan: growing
+it back would spend round trips rediscovering a limit already found. Ordinary
+collections never come close to the budget, so nothing shrinks and no round
+trips are added.
+
+### Counting without reading
+
+A bare `COUNT(*)` reads none of its input's values, so the whole answer is how
+many rows there are. Where that is safe, the scan asks Firestore for the number
+with `:runAggregationQuery` and fetches no documents:
+
+```sql
+-- One request, no documents transferred
+SELECT count(*) FROM firestore_scan('events', show_missing:=false);
+```
+
+Measured against the mock over 200,000 documents: 200 requests and 84.24 MiB
+become 1 request and nothing.
+
+`show_missing:=false` is required on an ordinary collection, and is why the
+default does not take this path. Phantom documents — those that exist only to
+parent a subcollection — are returned as rows by a scan with `show_missing`
+(the default) but are never counted by an aggregation query, so the two would
+disagree. Collection-group scans never included phantom documents in the first
+place, so `firestore_scan('~events')` is counted server-side either way.
+
+The count is used only when nothing can read a value: no `WHERE`, no
+`GROUP BY`, no `DISTINCT`, no `LIMIT` between the count and the scan, and
+`count(<column>)` rather than `count(*)` does not qualify. `EXPLAIN` shows
+`Firestore Pushed Count` when it applies. If the endpoint is unavailable —
+older emulators, restricted credentials — the scan reads the documents
+instead, which is slower but never wrong.
+
+### Reading a collection with several threads
+
+Firestore's REST pagination is sequential: the next page needs the previous
+one's cursor, so a large scan is a chain of round trips whose latency cannot be
+hidden. Ranges of the key space are independent, though, so the scan can cut
+the collection into ranges and read several at once:
+
+```sql
+-- Off by default; raise it to split the scan across threads
+SET firestore_max_threads = 4;
+SELECT * FROM firestore_scan('events', show_missing:=false);
+```
+
+Each thread takes a range, pages through it with its own connection, and takes
+another when it finishes.
+
+**Whether this helps depends entirely on your document ids, so it is off by
+default.** The ranges are cut evenly over Firestore's auto-id alphabet —
+20 characters drawn uniformly from `[A-Za-z0-9]` — so auto-ids spread across
+threads. Ids chosen by hand (e-mail addresses, timestamps, sequence numbers,
+slugs) pile into a single range, and then splitting is not merely no help but
+an active cost: every other range comes back empty, the work funnels through
+one thread regardless, and `runQuery` moves about 22% more bytes than
+`documents.list` because of its per-document envelope.
+
+Measured over 20,000 documents on loopback:
+
+| document ids | 1 thread | 4 threads | |
+|---|---|---|---|
+| Firestore auto-ids | 1.08 s | 0.67 s | 1.6x faster |
+| sequential (`doc00000001`, …) | 1.02 s | 2.05 s | **2.0x slower** |
+
+The win grows with round-trip latency, which is what the overlap hides: at
+50 ms simulated RTT the auto-id case goes from 2.33 s to 1.23 s. If you do not
+know how your ids are distributed, measure before turning this on.
+
+Parallel scanning applies only where a range split returns exactly the rows a
+sequential scan would, which means all of:
+
+- `show_missing:=false`. Ranges are cursors, which only `runQuery` supports,
+  and `runQuery` never returns phantom documents while a `show_missing` scan
+  does.
+- No `ORDER BY`, no `LIMIT`, and no `WHERE` that reaches Firestore. Ordering is
+  undone by reading ranges concurrently, a limit cannot be enforced per range,
+  and a pushed filter needs its own ordering, which conflicts with ordering by
+  `__name__`.
+- An ordinary collection — not a collection group (whose names span parent
+  paths) and not a document path.
+
+Anything else scans sequentially, exactly as before.
+
+Reducing the transfer itself is usually better than paging around it:
+
+- Only the columns a query selects are requested. The scan sends Firestore a
+  `mask.fieldPaths` (or `select.fields` on a collection group) built from the
+  projection, so unselected fields never cross the wire — selecting 1 of 40
+  columns from 5,000 documents moves 1.11 MiB instead of 7.03 MiB. Two cases
+  opt out: `unmapped_column:=true`, which is defined as everything the schema
+  does not cover, and a query needing no fields at all, which the
+  `documents.list` URL has no way to express (`runQuery` uses Firestore's
+  keys-only `select __name__`).
+- `WHERE` clauses that Firestore can serve are pushed down, so filtered rows
+  never cross the wire — see [Filter Pushdown](#filter-pushdown).
+- `scan_limit:=` and SQL `LIMIT` bound how much is fetched — see
+  [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown).
+- `columns:={...}` skips schema inference and its sampling request entirely.
+
+If a query still fails on memory after the scan is bounded, the pressure is
+likely above the scan rather than in it: a `GROUP BY`, `ORDER BY`, or join
+holding results that the scan is only feeding. Those are DuckDB's own
+operators, so `SET memory_limit` and a writable `SET temp_directory` are what
+let them spill to disk.
 
 ## Missing Documents
 

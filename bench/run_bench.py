@@ -24,7 +24,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DUCKDB = os.path.join(ROOT, "build", "release", "duckdb")
+# Overridable so one harness can measure two builds -- the point of an A/B.
+DUCKDB = os.environ.get("DUCKDB_BIN") or os.path.join(ROOT, "build", "release", "duckdb")
 PORT = int(os.environ.get("MOCK_PORT", "8099"))
 BASE = f"http://127.0.0.1:{PORT}"
 REPEATS = int(os.environ.get("BENCH_REPEATS", "3"))
@@ -41,6 +42,18 @@ def mock_get(path):
 
 def mock_post(path):
     req = urllib.request.Request(BASE + path, data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def set_delay(milliseconds):
+    """Per-request latency on the mock.
+
+    Loopback has none, which hides the whole point of overlapping requests: a
+    scan that issues them one at a time and one that issues four at a time cost
+    the same when each costs nothing.
+    """
+    req = urllib.request.Request(f"{BASE}/__delay?ms={milliseconds}", data=b"", method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
@@ -68,14 +81,17 @@ def wait_for_mock(timeout=20):
 
 # `.timer on` goes AFTER the LOAD so extension loading is not itself timed --
 # otherwise times[0] is the LOAD and every measurement is off by one.
-PREAMBLE = """LOAD fire_duck_ext;
-.timer on
-"""
+# `.timer on` goes AFTER the LOAD so extension loading is not itself timed, and
+# after any setup statements so those are not timed either -- measure() counts
+# the timings it gets back, and a stray one would throw the accounting off.
+PREAMBLE = "LOAD fire_duck_ext;\n"
+TIMER_ON = ".timer on\n"
 
 
 def shape_columns(collection):
     """Data columns a synthetic collection exposes (mirrors mock_firestore)."""
-    _prefix, shape, param, _count = collection.split("_")
+    name = collection[len("auto_"):] if collection.startswith("auto_") else collection
+    _prefix, shape, param, _count = name.split("_")
     param = int(param)
     if shape in ("flat", "wide", "mixed"):
         return [f"f{j}" for j in range(param)]
@@ -85,10 +101,18 @@ def shape_columns(collection):
         return ["doc_no", "payload"]
     if shape == "arr":
         return ["doc_no", "tags"]
-    if shape == "arrint":
+    if shape in ("arrint", "arrdbl"):
         return ["doc_no", "nums"]
+    if shape == "arrbool":
+        return ["doc_no", "flags"]
+    if shape == "arrts":
+        return ["doc_no", "stamps"]
     if shape == "vec":
         return ["doc_no", "embedding"]
+    if shape == "fat":
+        return ["doc_no", "blob"]
+    if shape == "odd":
+        return ["plain"] + ["a.b", "with space", "2digit", "back`tick"][:param]
     raise ValueError(shape)
 
 
@@ -121,9 +145,19 @@ def scan(collection, cols="*", extra="", where="", limit_clause=""):
     return q
 
 
-def run_sql(statements, timeout=1200):
-    """Run statements in one duckdb session; return (stdout, [run_times])."""
-    script = PREAMBLE + "\n".join(s.rstrip(";") + ";" for s in statements) + "\n"
+def run_sql(statements, timeout=1200, setup=None):
+    """Run statements in one duckdb session; return (stdout, [run_times]).
+
+    `setup` runs untimed before them. A build that does not know a setting
+    named in `setup` prints a message and carries on, which is deliberate: it
+    lets one scenario measure a baseline on a binary that lacks the feature and
+    the feature on one that has it.
+    """
+    script = PREAMBLE
+    for statement in setup or []:
+        script += statement.rstrip(";") + ";\n"
+    script += TIMER_ON
+    script += "\n".join(s.rstrip(";") + ";" for s in statements) + "\n"
     env = dict(os.environ)
     env["FIRESTORE_EMULATOR_HOST"] = f"127.0.0.1:{PORT}"
     # Feed the script on stdin rather than -c: the CLI only honours dot-commands
@@ -141,7 +175,7 @@ def run_sql(statements, timeout=1200):
 COLLECTION_IN_QUERY = re.compile(r"firestore_scan\('([^']+)'")
 
 
-def measure(label, query, repeats=REPEATS, warmup=True, group=""):
+def measure(label, query, repeats=REPEATS, warmup=True, group="", setup=None):
     """
     Time `query`. A warmup run populates the extension's schema cache so the
     measured runs reflect steady-state scanning rather than one-off schema
@@ -162,7 +196,7 @@ def measure(label, query, repeats=REPEATS, warmup=True, group=""):
     stmts += [query] * repeats
 
     # Timed runs (schema cache warm after the first statement).
-    out, times, rc = run_sql(stmts)
+    out, times, rc = run_sql(stmts, setup=setup)
     if rc != 0 or len(times) < (1 + repeats if warmup else repeats):
         return {"label": label, "group": group, "error": _first_error(out),
                 "raw": out[-1500:]}
@@ -173,7 +207,7 @@ def measure(label, query, repeats=REPEATS, warmup=True, group=""):
     # schema cache lives in the extension process, which restarts here, so this
     # run includes schema inference -- reported separately as bind_requests.
     mock_post("/__reset")
-    out2, times2, rc2 = run_sql([query])
+    out2, times2, rc2 = run_sql([query], setup=setup)
     stats = mock_get("/__stats")
 
     return {
@@ -288,6 +322,62 @@ def group_projection():
     ]
 
 
+def group_count():
+    """Is a bare COUNT(*) answered without transferring the documents?"""
+    n = 200000
+    coll = f"bench_flat_8_{n}"
+    args = ("project_id:='bench-project', api_key:='benchkey', "
+            "columns:={'f0':'VARCHAR'}")
+    return [
+        # show_missing:=false is what makes a count eligible: an aggregation
+        # query never counts phantom documents, while a show_missing scan
+        # returns them as rows.
+        measure("flat8 200k: count(*) show_missing=false",
+                f"SELECT count(*) FROM firestore_scan('{coll}', {args}, show_missing:=false)",
+                group="count"),
+        measure("flat8 200k: count(*) default",
+                f"SELECT count(*) FROM firestore_scan('{coll}', {args})",
+                group="count"),
+        # Reads a value, so it can never be answered by a count -- the control.
+        measure("flat8 200k: count(f0) show_missing=false",
+                f"SELECT count(f0) FROM firestore_scan('{coll}', {args}, show_missing:=false)",
+                group="count"),
+    ]
+
+
+def group_parallel():
+    """Does splitting a collection across threads pay, and when?
+
+    Two things decide it, so both are varied: latency, which is the cost that
+    overlapping requests hides, and how the document ids are distributed. The
+    `auto_` collection carries Firestore-shaped auto-ids, which spread evenly
+    over the key space; sequential doc00000000 ids all sort into a single
+    range, so every other range comes back empty and the work funnels through
+    one thread anyway.
+
+    The thread count is set explicitly rather than left to the default, so the
+    same scenarios measure a build that has no such setting (it says so and
+    scans sequentially) and one that does.
+    """
+    n = 20000
+    args = "project_id:='bench-project', api_key:='benchkey', show_missing:=false, schema_sample_size:=5"
+    rows = []
+    for delay in (0, 20):
+        set_delay(delay)
+        try:
+            for coll in (f"auto_bench_flat_8_{n}", f"bench_flat_8_{n}"):
+                shape = "auto-ids" if coll.startswith("auto_") else "sequential ids"
+                for threads in (1, 4):
+                    rows.append(measure(
+                        f"flat8 20k {shape}: {threads}t @{delay}ms",
+                        f"SELECT count(f0) FROM firestore_scan('{coll}', {args})",
+                        setup=[f"SET firestore_max_threads={threads}"],
+                        group="parallel"))
+        finally:
+            set_delay(0)
+    return rows
+
+
 def group_limit():
     """Is scan_limit honoured, and does it stop fetching early?"""
     rows = []
@@ -368,6 +458,8 @@ GROUPS = {
     "limit": group_limit,
     "sql-limit": group_sql_limit,
     "wire": group_wire,
+    "count": group_count,
+    "parallel": group_parallel,
 }
 
 
@@ -413,6 +505,7 @@ def main():
     if not wait_for_mock():
         sys.exit(f"mock firestore not reachable at {BASE} -- start bench/mock_firestore.py")
 
+    print(f"# duckdb: {DUCKDB}", file=sys.stderr, flush=True)
     selected = args or list(GROUPS)
     rows = []
     for name in selected:

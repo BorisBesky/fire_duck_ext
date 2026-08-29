@@ -96,7 +96,7 @@ static const char *GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 // Firestore scope
 static const char *FIRESTORE_SCOPE = "https://www.googleapis.com/auth/datastore";
 
-bool FirestoreCredentials::IsTokenValid() const {
+bool FirestoreCredentials::IsTokenValidUnlocked() const {
 	if (type == FirestoreAuthType::API_KEY) {
 		return true; // API keys don't expire
 	}
@@ -107,10 +107,16 @@ bool FirestoreCredentials::IsTokenValid() const {
 	return now < (token_expiry - std::chrono::seconds(TOKEN_REFRESH_BUFFER_SECONDS));
 }
 
+bool FirestoreCredentials::IsTokenValid() const {
+	std::lock_guard<std::mutex> lock(token_mutex);
+	return IsTokenValidUnlocked();
+}
+
 std::string FirestoreCredentials::GetAuthHeader() const {
 	if (type == FirestoreAuthType::API_KEY) {
 		return ""; // API key goes in URL, not header
 	}
+	std::lock_guard<std::mutex> lock(token_mutex);
 	return "Bearer " + access_token;
 }
 
@@ -544,8 +550,14 @@ void FirestoreAuthManager::RefreshTokenIfNeeded(FirestoreCredentials &creds, Dat
 		return; // API keys don't expire and carry no token
 	}
 
-	if (creds.IsTokenValid()) {
-		return; // Token still valid
+	// Held for the whole check-and-refresh: two threads finding the token
+	// expired at once must not both refresh it, and neither may read it while
+	// the other is writing. The refresh's own HTTP calls do not come back
+	// through here, so holding the lock across them is safe.
+	std::lock_guard<std::mutex> lock(creds.token_mutex);
+
+	if (creds.IsTokenValidUnlocked()) {
+		return; // Token still valid, refreshed by another thread or still fresh
 	}
 
 	if (creds.type == FirestoreAuthType::SERVICE_ACCOUNT) {

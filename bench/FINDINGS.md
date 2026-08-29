@@ -236,11 +236,15 @@ order and schemas drift over time.
 | 1 | Reuse one `httplib::Client` per host, stored on `FirestoreClient` | 2.7x on WAN A/B | small | **done** |
 | 2 | Enable gzip (`CPPHTTPLIB_ZLIB_SUPPORT` + zlib in `vcpkg.json`) | 13.5x fewer bytes | small | **done** |
 | 4 | Fix `scan_limit` with a running-total counter | correctness: 200x over-read | trivial | **done** |
-| 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | open |
-| 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | open |
+| 3 | Send `mask.fieldPaths` / `select.fields` for projected columns | 28.24 MiB → ~0.9 MiB at 1-of-40 | medium | **done** |
+| 5 | Prefetch page N+1 while converting page N | remaining 1.5 s of RTT | medium | **superseded by #12** |
 | 6 | Decode `mapValue` — `map_encoding` = wire / json / variant | dot access, types preserved, +7% scan | medium | **done (prototype)** |
 | 7 | Raise/expose the inference sample; warn on unsampled fields | silent loss of a field on 75% of docs | small | **done** |
-| 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | open |
+| 8 | Single `find()` per field; `std::move` document fields | ~2 map probes/field/row; ~2x page memory | trivial | **done** |
+| 9 | Paginate collection-group scans | correctness: silently truncated at 1000 documents | small | **done** |
+| 10 | Stream schema inference instead of buffering the sample | `schema_sample_size:=-1` held the whole collection at bind time | small | **done** |
+| 11 | Configurable + self-limiting page size (`page_size`, `firestore_page_byte_budget`) | a page of 1 MiB documents is ~1 GiB before parsing | small | **done** |
+| 12 | Parallel scan by `__name__` range | 2.33 s -> 1.23 s at 50 ms RTT, 20k documents | large | **done** |
 
 ---
 
@@ -444,3 +448,354 @@ documents whatever `schema_sample_size` says. Documented.
   document `scan_limit` as an honoured fetch limit, so the fix brings the
   implementation in line with the existing text rather than changing it. No
   documentation edit needed; connection reuse is internal.
+
+---
+
+## 5. Implemented: #8, #9, #10, #11 — bounded memory on large collections
+
+### #9 — collection-group scans stopped at 1000 documents (correctness)
+
+`CollectionGroupQuery` issued one `:runQuery` with `limit` set to the page size
+and returned no continuation, and `InitGlobal` set `next_page_token = ""` with
+`uses_run_query` left false — so the scan loop took its "no page token, we're
+done" branch after the first page. `SELECT count(*)` over a collection group
+larger than one page returned 1000 and reported success.
+
+Measured against the mock, before and after:
+
+| collection group | before | after |
+|---|---|---|
+| 300 documents | 300 | 300 |
+| 2,000 documents | 1,000 | 2,000 |
+| 4,500 documents | **1,000** | **4,500** |
+
+Collection groups now go through the same cursor pagination the filter-pushdown
+path already used: the query is built with `__name__` appended to its ordering
+(making the order total, so a page boundary cannot drop or repeat a document),
+and each subsequent page resumes from a `startAt` cursor built from the last
+document. `count(DISTINCT __document_id)` equals `count(*)` across page
+boundaries.
+
+The same cursor path fixed collection-group *schema inference*, which was
+bounded by a single request: a field first appearing at document 1500 was
+invisible to `schema_sample_size:=-1` on a `~collection` scan, and is now
+found.
+
+### #10 — schema inference streamed
+
+`InferSchema` accumulated every sampled document into one vector before walking
+it, so `schema_sample_size:=-1` pulled an entire collection into memory *at
+bind time* — before any `LIMIT` or `WHERE` could reduce it. It now folds each
+page into a `FirestoreSchemaAccumulator` and releases it, so peak memory is one
+page whatever the sample depth. Inferred types are unchanged: first-seen type
+per field, array element type by majority with ties broken alphabetically,
+vector dimension from the first occurrence that carries one.
+
+### #11 — page size is configurable, and self-limiting
+
+The page size was hardcoded at 1000 in three places. It is now `page_size:=N`
+(named parameter) or `firestore_page_size` (setting), clamped to Firestore's
+1–1000 range, and it governs the bind-time sampling request as well — the
+request that runs first and cannot be reduced by a filter.
+
+`firestore_page_byte_budget` (default 64 MiB, 0 disables) covers the case where
+document sizes are not known in advance: after each page the scan compares the
+uncompressed body size against the budget and, if it is over, reduces the page
+size to roughly `budget / observed bytes per document`. Verified against the
+mock's `fat` shape — 20 KiB documents, 2 MiB budget:
+
+| request | documents asked for |
+|---|---|
+| schema sample | 10 |
+| first page | 1000 |
+| every page after | 156 |
+
+All 2,200 rows still arrive. The page size only decreases within a scan;
+growing it back would spend round trips rediscovering a limit already found.
+On ordinary collections no page approaches the budget, so nothing shrinks and
+no round trips are added — asserted by a test, so the guard cannot start
+costing round trips unnoticed.
+
+### #8 — per-row and per-page overhead
+
+`ParseDocument` took its JSON by const reference and deep-copied
+`doc_json["fields"]` while the parsed response was still alive, roughly
+doubling peak memory per page; it now takes an rvalue reference and moves.
+Field lookup in the scan loop did `contains()` then `operator[]` — two ordered
+probes per column per row — and now does one `find()`.
+
+### Testing
+
+The pure logic (paging policy, cursor construction, orderBy construction,
+schema accumulation, wire-format helpers) was moved into three DuckDB-free
+modules so it can be exercised directly: `scripts/run_unit_tests.sh` compiles
+them with `--coverage`, runs 58 cases, and enforces a per-file threshold.
+`test/integration/large_collections.py` covers the scanner and client glue
+through a real DuckDB against the mock, asserting on request counts and page
+sizes as well as rows. `scripts/run_coverage.sh` merges both runs and reports
+coverage of the lines this change adds or modifies — 98% at the time of
+writing; the remainder is `GetDocument`/`CreateDocument` (covered by the
+emulator suite, not the mock) and a `FunctionData::Equals` clause.
+
+---
+
+## 6. Implemented: #3 — projection reaches the wire
+
+`projection_pushdown = true` was set, so DuckDB skipped converting unselected
+columns, but no mask was ever sent: every field of every document was
+transferred regardless of what the query asked for.
+
+The scan now builds a `FirestoreProjection` from `bind_data.projected_columns`
+and sends it as `mask.fieldPaths` on `documents.list` and `select.fields` on
+`runQuery`. Measured against the mock, 5,000 documents of 40 fields, with the
+schema sample held at 5 documents so the unmasked bind-time request does not
+dominate:
+
+| query | transferred |
+|---|---|
+| `count(*)` over `SELECT *` (40 columns) | 7.03 MiB |
+| `count(f0)` (1 column) | **1.11 MiB** |
+| `count(f0..f3)` (4 columns) | 1.52 MiB |
+
+6.3x on a 1-of-40 projection. The floor is document names and timestamps,
+which a mask cannot remove.
+
+Three details the implementation has to get right:
+
+- **Field names are not identifiers.** A Firestore field may be called `a.b`,
+  and a field path is dot-separated, so unquoted it addresses `b` inside a map
+  called `a` — the column would come back empty rather than wrong. Names that
+  are not simple identifiers are backtick-quoted (escaping backticks and
+  backslashes) and percent-encoded into the query string. Names beginning
+  `__` are quoted too: unquoted, `__name__` means the document's resource
+  name, not a field of that name.
+- **`unmapped_column:=true` cannot be masked** — that column is defined as
+  every field the schema does not cover, so a mask would empty it by
+  construction. The projection is dropped entirely in that case.
+- **Keys-only is not expressible on `documents.list`.** An absent mask means
+  "all fields" and a URL cannot carry an empty repeated parameter, so a query
+  needing no fields sends no mask there. `runQuery` has the documented
+  keys-only form (`select __name__`) and uses it.
+
+The mock now honours masks and `select` clauses, including unquoting backticks
+the way Firestore does — without that it would look for a key spelled with the
+backticks still on, and a quoting bug in the extension would show up as an
+empty column rather than a failure.
+
+---
+
+## 7. Implemented: count pushdown
+
+`SELECT count(*)` used to read every document to count them: projection
+pushdown meant DuckDB never converted the values, but all of them still
+crossed the wire. Firestore's `:runAggregationQuery` returns the number
+directly.
+
+200,000 documents, against the mock:
+
+| | requests | documents | transferred | time |
+|---|---|---|---|---|
+| before | 200 | 200,000 | 84.24 MiB | 11.25 s |
+| after | **1** | **0** | **0** | **0.018 s** |
+
+### Recognising the case
+
+The projection cannot reveal it. DuckDB does not ask a table function for zero
+columns; for `count(*)` it projects the first column, which here is
+`__document_id` — indistinguishable from someone selecting it. So the
+optimizer extension recognises the plan shape instead: a `LogicalAggregate`
+with no groups and exactly one `count_star` expression, no DISTINCT and no
+FILTER, above the scan with nothing but projections in between. A FILTER or
+LIMIT between the aggregate and the scan changes which rows are counted, so
+the flag stops there.
+
+### The phantom-document constraint
+
+Aggregation queries never count documents that exist only to parent a
+subcollection. A scan with `show_missing` (the default) returns them as rows.
+So on an ordinary collection the count is pushed only with
+`show_missing:=false` — otherwise the fast answer would quietly differ from
+the slow one. Collection groups never included phantom documents, so they are
+always eligible.
+
+`upTo` carries an effective `scan_limit` into the request so Firestore stops
+counting early, and the result is capped client-side regardless.
+
+A deployment without the endpoint (older emulators, restricted credentials)
+answers 501; the scan falls back to reading documents, which is slower and
+never wrong.
+
+---
+
+## 8. Implemented: #12 — parallel scan by key range
+
+Firestore's REST pagination is sequential by construction: the next page needs
+the previous page's cursor. `MaxThreads()` returned 1 and pages were fetched
+inline on the execution thread, so a large scan was a chain of round trips with
+nothing overlapping them.
+
+Ranges of the key space are independent, so the scan now cuts the collection
+into ranges and reads several at once. Each thread claims a range, pages
+through it with its own client and its own paging policy, and claims another
+when it finishes. There are four times as many ranges as threads, so a thread
+that draws a light range takes the next one instead of idling.
+
+20,000 documents against the mock with 50 ms per request and 80 ms per
+connection:
+
+| threads | time |
+|---|---|
+| 1 | 2.33 s |
+| 2 | 1.57 s |
+| 4 | 1.23 s |
+| 8 | 1.18 s |
+
+Real speedup is bounded here by the mock itself (single Python process), and
+the flattening past four threads is partly that. Parallel scanning also issues
+*more* requests than sequential — 32 against 21 for 20,000 documents — because
+each range's last page is partial; it wins by overlapping them, not by making
+fewer.
+
+### Where the correctness sits
+
+- **Boundary ownership.** Firestore's cursor `before` flag means opposite
+  things on a start and an end cursor. The range's lower bound is `startAt`
+  (`before: true`, inclusive) and its upper bound `endBefore` (`before: true`,
+  exclusive), so a document whose id is exactly a boundary is read by the range
+  starting there and skipped by the one ending there. Both flags the same and
+  the document is either read twice or lost — the first draft had this wrong.
+- **Coverage.** The first range has no lower bound and the last no upper one,
+  so every id lands somewhere whatever characters it uses. A unit test asserts
+  exactly-one-range membership over ids spanning the whole byte ordering, at
+  several partition counts.
+- **Balance, separately.** Boundaries are cut evenly over Firestore's auto-id
+  alphabet. Hand-chosen keys pile into one range: still correct, just not
+  faster.
+
+### Where it does not apply
+
+`show_missing:=false` is required, because ranges are cursors and only
+`runQuery` supports those, and `runQuery` never returns phantom documents while
+a `show_missing` scan does. Also excluded: an ORDER BY (undone by reading
+ranges concurrently), a LIMIT (not enforceable per range), a pushed filter
+(needs its own ordering, which conflicts with ordering by `__name__`),
+collection groups (names span parent paths) and document paths. Everything else
+scans sequentially exactly as before.
+
+### Prerequisite: credentials were not thread-safe
+
+`RefreshTokenIfNeeded` mutated the shared `FirestoreCredentials` with no lock,
+and every client built from a secret shares one. Sequentially that never
+mattered; with one client per thread, an expiring service-account or Firebase
+token would be read while another thread rewrote it. The cached token is now
+guarded by a mutex held across the refresh, so one thread refreshes and the
+rest wake to a valid token.
+
+### On the mock
+
+Its cursor handling was an approximation — it recovered an offset by parsing a
+`/docNNNNNNNN` suffix. It now holds each collection's ids in sorted order and
+resolves `startAt`/`endAt` by bisecting them, honouring `before` on both sides;
+otherwise it could not have caught the boundary bug above. Collections may also
+be prefixed `auto_` to give documents Firestore-shaped auto-ids, since
+sequential `doc00000000` keys all sort into a single range.
+
+---
+
+## 9. A/B against the pre-change binary
+
+Everything above was measured while the work was being done, mostly by turning
+a feature off and on within one build. That controls for machine and compiler
+but is not an old-commit-vs-new-commit comparison, and none of it came from the
+benchmark harness -- which was not run at all, so nothing checked whether the
+untouched paths had got slower.
+
+This section is the real thing: `bench/run_bench.py` run twice against the same
+mock, once with a binary built from `072e51e` (the branch point) and once from
+the branch, with `DUCKDB_BIN` selecting between them. Scenarios use only syntax
+both builds understand, so the contrast comes from the binary rather than from
+different SQL.
+
+```bash
+python3 bench/mock_firestore.py 8099 &
+git checkout main && make release && cp build/release/duckdb /tmp/duckdb-base
+git checkout - && make release
+DUCKDB_BIN=/tmp/duckdb-base python3 bench/run_bench.py --json before.json
+python3 bench/run_bench.py --json after.json
+python3 bench/compare_ab.py before.json after.json
+```
+
+The `MiB` column is bytes on the wire, i.e. after gzip. Elsewhere in this
+document the figures quoted from the mock's own counters are uncompressed;
+they measure different things and are not comparable to each other.
+
+### What got faster
+
+| scenario | before | after | |
+|---|---|---|---|
+| `count(*)` over 200k documents, `show_missing:=false` | 11.117 s, 200 requests, 200,000 documents | **0.002 s, 1 request, 0 documents** | the aggregation query |
+| 1 of 40 columns, 20k documents | 3.18 MiB | **0.31 MiB** | 10.3x fewer bytes |
+| all 40 columns, 20k documents | 1.319 s | 1.045 s | 1.26x |
+| scan of 20k auto-id documents @20 ms RTT | 1.446 s | 0.808 s | 1.79x, opt-in |
+
+`count(*)` with the default `show_missing` is unchanged at ~11 s, which is the
+intended behaviour: a scan returns phantom documents that an aggregation query
+would not count, so it stays on the reading path.
+
+### What the A/B caught
+
+**Parallel scanning regressed clustered keys by 2x**, and was on by default.
+Measured over 20,000 documents on loopback: auto-ids 1.08 s -> 0.67 s on four
+threads, but sequential ids 1.02 s -> **2.05 s**. Every range but one comes
+back empty, the work funnels through one thread regardless, and runQuery's
+per-document envelope costs about 22% more bytes than documents.list (5.44 MiB
+against 4.41 MiB uncompressed). The default is now 1, and the README no longer
+claims clustered keys are merely "no faster".
+
+**`ParseDocument`'s `std::move` costs about 17% on array-heavy documents.**
+Introduced to avoid deep-copying a page's fields while the parsed response is
+still alive -- roughly halving peak memory per page -- it turns out to cost
+real time on documents with large JSON structures, and nothing on scalar ones:
+
+| `count(*)` over 20k documents | median | vs branch point |
+|---|---|---|
+| `072e51e` (copies) | 1.408 s | 1.00x |
+| branch HEAD (moves) | 1.652 s | **1.17x slower** |
+| HEAD with only that line reverted | 1.362 s | 0.97x |
+
+Localised by interleaved measurement (base and branch alternating, 7-9 pairs,
+median, run-to-run spread 3-6%): the gap is in the scan, not in schema
+inference -- binding alone is 0.79x, i.e. faster -- and the wire traffic is
+byte-identical, 21 requests and 39.78 MiB uncompressed either way. Inlining the
+wire-format helpers that the same commit moved into their own translation unit
+does not recover it, so cross-translation-unit call overhead is not the cause.
+The likely mechanism is locality: copying produces a fresh compact subtree and
+frees the parsed response as a block, while moving leaves each document's
+fields pointing into nodes scattered through the response's allocations.
+
+This is a genuine trade-off -- roughly 2x peak page memory against ~17% CPU on
+array-heavy scans -- and it is left as it is for now, because bounding memory
+is what this branch set out to do and the page-byte budget only shrinks a page
+after it has already been held. Reproduce with:
+
+```sql
+SELECT count(*) FROM firestore_scan('bench_arr_64_20000',
+    project_id:='bench-project', api_key:='benchkey');
+```
+
+### Regression check
+
+Every other group is unchanged within noise. Re-measured at 5 repeats after the
+first sweep at 1 repeat showed wobbles: map depths 1-8, array widths 1-64, the
+nested-shape set, `scaling` at 1k/10k/50k/200k documents, both limit groups and
+the wire group all come out `=`. So the row-emission refactor into shared
+helpers, and the change from `contains()` plus `operator[]` to a single
+`find()` per field, cost nothing measurable -- and a projected scalar scan
+(`count(f0)` over flat8) is 15% *faster* thanks to the field mask.
+
+One measurement lesson worth recording: at one repeat the sweep reported
+`map depth 16` and `array 64 elems [no materialize]` as 1.28x and 1.39x slower,
+and `map depth 16` as *faster* than `map depth 8` on the base binary, which is
+impossible. Single-run medians on a shared container are not trustworthy at
+this effect size; the numbers above come from interleaved runs with the spread
+reported alongside.

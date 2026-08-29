@@ -1,0 +1,249 @@
+# name: test/sql/firestore_page_size.test
+# description: Page size settings, clamping, and large-collection paging
+# group: [sql]
+
+require fire_duck_ext
+
+# ============================================
+# Settings: defaults and clamping
+# These need no Firestore at all -- they are about how the settings normalize.
+# ============================================
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+1000
+
+query I
+SELECT current_setting('firestore_page_byte_budget');
+----
+67108864
+
+# Firestore caps a page at 1000 documents; asking for more is truncated
+# server-side rather than rejected, so the setting clamps instead.
+statement ok
+SET firestore_page_size=100000;
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+1000
+
+# A page size of zero would fetch nothing and stall the scan.
+statement ok
+SET firestore_page_size=0;
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+1
+
+statement ok
+SET firestore_page_size=-42;
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+1
+
+statement ok
+SET firestore_page_size=250;
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+250
+
+statement ok
+RESET firestore_page_size;
+
+query I
+SELECT current_setting('firestore_page_size');
+----
+1000
+
+# A negative byte budget means the same as disabled.
+statement ok
+SET firestore_page_byte_budget=-1;
+
+query I
+SELECT current_setting('firestore_page_byte_budget');
+----
+0
+
+statement ok
+SET firestore_page_byte_budget=0;
+
+query I
+SELECT current_setting('firestore_page_byte_budget');
+----
+0
+
+statement ok
+SET firestore_page_byte_budget=2097152;
+
+query I
+SELECT current_setting('firestore_page_byte_budget');
+----
+2097152
+
+statement ok
+RESET firestore_page_byte_budget;
+
+# Parallel scanning is opt-in: whether splitting a collection helps depends on
+# how its document ids are distributed, which the extension cannot know.
+query I
+SELECT current_setting('firestore_max_threads');
+----
+1
+
+# Fewer than one thread is not a scan.
+statement ok
+SET firestore_max_threads=0;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+1
+
+statement ok
+SET firestore_max_threads=-9;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+1
+
+# Capped, so a stray setting cannot open an unbounded number of connections
+# against a shared, rate-limited service.
+statement ok
+SET firestore_max_threads=100000;
+
+query I
+SELECT current_setting('firestore_max_threads');
+----
+64
+
+statement ok
+RESET firestore_max_threads;
+
+# The page_size named parameter must be accepted by the binder. Credentials
+# are resolved before the collection is contacted, so this reports the
+# credential error rather than a binder error about an unknown parameter.
+statement error
+SELECT * FROM firestore_scan('users', page_size:=100);
+----
+No Firestore credentials found
+
+statement error
+SELECT * FROM firestore_scan('users', page_size:=100000);
+----
+No Firestore credentials found
+
+# ============================================
+# Paging against a live Firestore-compatible endpoint.
+# Skipped unless FIRESTORE_EMULATOR_HOST points at one; the mock in
+# bench/mock_firestore.py serves the bench_<shape>_<param>_<count>
+# collections these use. See test/integration/large_collections.py for the
+# same behaviour asserted at the request level.
+# ============================================
+
+require-env FIRESTORE_EMULATOR_HOST
+
+require-env FIRESTORE_MOCK_COLLECTIONS
+
+statement ok
+CREATE SECRET page_size_test (TYPE firestore, PROJECT_ID 'bench-project', API_KEY 'benchkey');
+
+# A collection group larger than one page used to stop at 1000 documents
+# and report success.
+query I
+SELECT count(*) FROM firestore_scan('~bench_flat_4_4500');
+----
+4500
+
+# Cursor pagination has to leave no gaps and no repeats at page boundaries.
+query II
+SELECT count(*), count(DISTINCT __document_id) FROM firestore_scan('~bench_flat_4_2500');
+----
+2500	2500
+
+# An exact multiple of the page size: the last full page looks like one with
+# more behind it, so the scan must ask once more and see an empty answer.
+query I
+SELECT count(*) FROM firestore_scan('~bench_flat_4_2000');
+----
+2000
+
+query I
+SELECT count(*) FROM firestore_scan('~bench_flat_4_1500', page_size:=100);
+----
+1500
+
+# Ordinary collections keep working at a reduced page size.
+query I
+SELECT count(*) FROM firestore_scan('bench_flat_4_2500', page_size:=250);
+----
+2500
+
+# Clamped up to one document per request, which is why this uses a tiny
+# collection: at that page size every document costs its own round trip.
+query I
+SELECT count(*) FROM firestore_scan('bench_flat_4_20', page_size:=0);
+----
+20
+
+# Sampling every document no longer holds the collection in memory, and still
+# finds a field that first appears at document 1500.
+query I
+SELECT count(late_field) FROM firestore_scan('bench_late_1500_3000', schema_sample_size:=-1);
+----
+1500
+
+# Collection-group sampling paginates too, so the same late field is found.
+query I
+SELECT count(late_field) FROM firestore_scan('~bench_late_1500_3000', schema_sample_size:=-1);
+----
+1500
+
+# A collection split across threads by document-key range returns exactly the
+# documents a sequential scan does -- no gaps at the range boundaries, and no
+# document claimed by two ranges. The auto_ prefix gives the mock's documents
+# Firestore-style ids, which is what spreads them across ranges at all.
+statement ok
+SET firestore_max_threads=4;
+
+query II
+SELECT count(*), count(DISTINCT __document_id)
+FROM firestore_scan('auto_bench_flat_8_3000', show_missing:=false, schema_sample_size:=5);
+----
+3000	3000
+
+# The same scan with parallelism off must agree.
+statement ok
+SET firestore_max_threads=1;
+
+query II
+SELECT count(*), count(DISTINCT __document_id)
+FROM firestore_scan('auto_bench_flat_8_3000', show_missing:=false, schema_sample_size:=5);
+----
+3000	3000
+
+statement ok
+RESET firestore_max_threads;
+
+# A page heavier than the byte budget shrinks later requests; every row still
+# arrives.
+statement ok
+SET firestore_page_byte_budget=2097152;
+
+query I
+SELECT count(*) FROM firestore_scan('bench_fat_20_2200', schema_sample_size:=10);
+----
+2200
+
+statement ok
+RESET firestore_page_byte_budget;
+
+statement ok
+DROP SECRET page_size_test;

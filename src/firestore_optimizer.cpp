@@ -7,10 +7,38 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
 
 namespace duckdb {
+
+// True when this aggregate is nothing but a bare COUNT(*) -- no grouping, no
+// DISTINCT, no FILTER, no arguments. Such an aggregate reads none of its
+// input's values, so the scan below it only has to produce the right number of
+// rows, and Firestore can supply that number without sending any documents.
+static bool IsBareCountStar(const LogicalAggregate &aggregate) {
+	if (!aggregate.groups.empty() || aggregate.grouping_sets.size() > 1) {
+		return false;
+	}
+	if (aggregate.expressions.size() != 1) {
+		return false;
+	}
+	auto &expression = *aggregate.expressions[0];
+	if (expression.expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &aggregate_expression = expression.Cast<BoundAggregateExpression>();
+	if (aggregate_expression.function.name != "count_star") {
+		return false;
+	}
+	// count(DISTINCT x) and count(*) FILTER (WHERE ...) both depend on values.
+	if (aggregate_expression.IsDistinct() || aggregate_expression.filter != nullptr) {
+		return false;
+	}
+	return aggregate_expression.children.empty();
+}
 
 // Returns true if this operator type blocks ORDER BY / LIMIT from applying to child scans.
 // These operators transform result cardinality, ordering, or semantics in ways that make
@@ -192,8 +220,14 @@ static bool TryExtractLimit(LogicalTopN &topn_op, FirestoreScanBindData &bind_da
 // LogicalOrder, LogicalLimit, and LogicalProjection ancestors. When we find
 // a LogicalGet for firestore_scan, inject the extracted ORDER BY / LIMIT
 // into bind_data.
+//
+// `under_count_star` says the scan below feeds nothing but a bare COUNT(*),
+// so its row count is the whole answer. It survives projections and stops at
+// anything else -- a FILTER or LIMIT between the aggregate and the scan
+// changes which rows are counted, so the scan has to read them after all.
 static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, LogicalLimit *current_limit,
-                         LogicalTopN *current_topn, std::vector<LogicalProjection *> &projections) {
+                         LogicalTopN *current_topn, std::vector<LogicalProjection *> &projections,
+                         bool under_count_star = false) {
 	// Save the current projection stack size so we can restore it when unwinding
 	auto saved_projection_size = projections.size();
 
@@ -224,6 +258,20 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 		projections.push_back(&op.Cast<LogicalProjection>());
 	}
 
+	// Track whether everything between a bare COUNT(*) and the scan is
+	// value-neutral. Projections are; anything else is not.
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		under_count_star = IsBareCountStar(op.Cast<LogicalAggregate>());
+		break;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_GET:
+		break; // carry the flag through
+	default:
+		under_count_star = false;
+		break;
+	}
+
 	// Check if this is a firestore_scan LogicalGet
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
@@ -231,6 +279,14 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 			auto &bind_data = get.bind_data->CastNoConst<FirestoreScanBindData>();
 			bind_data.sql_pushed_order_by.clear();
 			bind_data.sql_pushed_limit.reset();
+			bind_data.count_star_only = under_count_star;
+			if (under_count_star) {
+				auto &existing = get.extra_info.file_filters;
+				if (!existing.empty()) {
+					existing += " | ";
+				}
+				existing += "Firestore Pushed Count";
+			}
 
 			// Document-path scans return virtual rows derived from listCollectionIds,
 			// not Firestore documents. Extract ORDER BY / LIMIT into docpath-specific fields.
@@ -331,7 +387,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 
 	// Recurse into children
 	for (auto &child : op.children) {
-		WalkPlanTree(*child, current_order, current_limit, current_topn, projections);
+		WalkPlanTree(*child, current_order, current_limit, current_topn, projections, under_count_star);
 	}
 
 	// Restore the projection stack to its previous size for the caller

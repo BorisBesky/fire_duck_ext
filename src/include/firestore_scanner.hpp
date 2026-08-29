@@ -4,6 +4,9 @@
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
 #include "firestore_index.hpp"
+#include "firestore_paging.hpp"
+#include <memory>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -23,8 +26,23 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Projection info - which columns to actually output
 	std::vector<idx_t> projected_columns; // Indices into column_names/column_types
 
+	// Set by the optimizer extension when this scan feeds nothing but a bare
+	// COUNT(*): the scan then has to produce the right *number* of rows, and
+	// nothing may read their values.
+	//
+	// The projection cannot reveal this. DuckDB does not ask a table function
+	// for zero columns; for count(*) it projects the first column, which here
+	// is __document_id -- indistinguishable from someone genuinely selecting
+	// it. Only the plan shape tells them apart.
+	bool count_star_only = false;
+
 	// Query options
 	std::optional<int64_t> limit;
+
+	// Documents requested per round trip. Unset means "use the
+	// firestore_page_size setting". Lower it for collections whose documents
+	// are large enough that a full 1000-document page will not fit in memory.
+	std::optional<int64_t> page_size;
 	std::optional<std::string> order_by;
 	std::vector<OrderByField> parsed_order_by; // Parsed from order_by string at bind time
 
@@ -114,7 +132,7 @@ struct FirestoreScanBindData : public TableFunctionData {
 		       is_collection_group == other.is_collection_group && show_missing == other.show_missing &&
 		       is_document_path == other.is_document_path && docpath_named_order == other.docpath_named_order &&
 		       credentials_equal && order_fields_equal(sql_pushed_order_by, other.sql_pushed_order_by) &&
-		       sql_pushed_limit == other.sql_pushed_limit;
+		       sql_pushed_limit == other.sql_pushed_limit && page_size == other.page_size;
 	}
 };
 
@@ -148,21 +166,76 @@ struct FirestoreScanGlobalState : public GlobalTableFunctionState {
 	// it would cut off rows before DuckDB's FILTER node runs.
 	bool pushdown_failed = false;
 
-	// Pagination optimization: track page size to detect end of results
-	int64_t query_page_size = 1000; // The page size used in the query
+	// Chooses the page size for each round trip and shrinks it when a page
+	// weighs more than the byte budget allows.
+	FirestorePageSizePolicy page_policy;
+
+	// Fields Firestore is asked to return, derived from DuckDB's projection.
+	// Unselected fields then never cross the wire.
+	FirestoreProjection projection;
+
+	// Rows still to emit when the scan was answered by a count rather than by
+	// fetching documents. Unset means this is an ordinary scan.
+	std::optional<int64_t> counted_rows_remaining;
+
+	// Documents the *last* request actually asked for. The end-of-results
+	// check compares against this rather than the policy's current size:
+	// after a shrink those differ, and comparing against the new (smaller)
+	// size would read a full page as short and end the scan early.
+	int64_t query_page_size = FIRESTORE_DEFAULT_PAGE_SIZE;
 	bool last_page_was_full = true; // Whether last fetch returned a full page
 
 	FirestoreScanGlobalState() : current_index(0), finished(false) {
 	}
 
+	// ---- parallel scanning -------------------------------------------------
+	//
+	// A collection can be read by several threads at once by cutting its
+	// document-name space into ranges and giving each thread a range to page
+	// through. Firestore's REST pagination is sequential *within* a range, but
+	// the ranges are independent, so the round trips overlap.
+	//
+	// There are more ranges than threads: key distributions are rarely even,
+	// and a thread that finishes a light range takes the next one rather than
+	// idling while another grinds through a heavy one.
+
+	// Ranges not yet claimed. Empty when the scan is sequential.
+	std::vector<FirestoreKeyRange> key_range_partitions;
+	idx_t next_partition = 0;
+	std::mutex partition_mutex;
+
+	// Collection identity in the form range cursors need:
+	// projects/P/databases/D/documents/<collection>, and the final segment.
+	std::string document_path_prefix;
+	std::string collection_id;
+
+	// Threads to ask DuckDB for. 1 means this scan runs sequentially.
+	idx_t scan_threads = 1;
+
+	// Guards reported_unmapped, which every thread adds to.
+	std::mutex unmapped_mutex;
+
 	idx_t MaxThreads() const override {
-		return 1;
-	} // REST API is sequential
+		return scan_threads;
+	}
 };
 
-// Local state - per-thread state (minimal for single-threaded)
+// Local state - one per thread.
+//
+// In a parallel scan each thread owns its key range, its HTTP client (httplib
+// clients are not shareable across threads), its page of documents and its own
+// paging policy. In a sequential scan none of this is used and the state below
+// stays empty.
 struct FirestoreScanLocalState : public LocalTableFunctionState {
-	// Single-threaded, no local state needed
+	std::unique_ptr<FirestoreClient> client;
+	std::vector<FirestoreDocument> documents;
+	idx_t current_index = 0;
+
+	bool has_partition = false;
+	FirestoreKeyRange partition;
+	json structured_query;
+	bool last_page_was_full = true;
+	FirestorePageSizePolicy page_policy;
 };
 
 // Register the firestore_scan function

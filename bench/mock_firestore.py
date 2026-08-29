@@ -13,24 +13,48 @@ Why a mock instead of the Firebase emulator:
     connections it opens, how many requests ride each connection, whether it
     advertises Accept-Encoding, and whether it sends mask.fieldPaths.
 
-Collection naming grammar:  bench_<shape>_<param>_<count>
+Collection naming grammar:  [auto_]bench_<shape>_<param>_<count>
+
+An `auto_` prefix gives documents Firestore-style auto-ids -- 20 characters
+drawn from [0-9A-Za-z], spread evenly -- instead of the sequential doc00000000
+form. Range-partitioned parallel scans cut the key space evenly, so only
+auto-id-shaped keys land in more than one partition.
+
   flat     <n_fields>   n scalar fields (string/int/double/bool, round robin)
   wide     <n_fields>   same as flat; used for projection experiments
   map      <depth>      one mapValue nested <depth> levels, 4 scalar leaves
   mapwide  <n_leaves>   one mapValue, depth 1, <n_leaves> scalar leaves
   arr      <n_elems>    one arrayValue of <n_elems> strings
   arrint   <n_elems>    one arrayValue of <n_elems> integers
+  arrdbl   <n_elems>    one arrayValue of <n_elems> doubles
+  arrbool  <n_elems>    one arrayValue of <n_elems> booleans
+  arrts    <n_elems>    one arrayValue of <n_elems> timestamps
   vec      <n_dims>     one Firestore vector (__vector__) of <n_dims> doubles
   mixed    <n_fields>   scalar fields whose TYPE varies per document
   late     <from_idx>   3 base fields; `late_field` appears from document <from_idx>
+  fat      <kib>        one string field of <kib> KiB, for page-weight limits
+  odd      <n_fields>   field names needing backtick quoting in a field path
 
 Control endpoints:
-  GET  /__stats   instrumentation counters as JSON
-  POST /__reset   zero the counters
-  GET  /__health  readiness probe
+  GET  /__stats          instrumentation counters as JSON
+  POST /__reset          zero the counters
+  GET  /__health         readiness probe
+  POST /__fail_runquery?enabled=1
+                         make :runQuery return HTTP 500, so the extension's
+                         pushdown-failure fallback can be exercised
+  POST /__fail_aggregation?enabled=1
+                         make :runAggregationQuery return HTTP 501, standing in
+                         for a deployment that does not offer the endpoint
+  POST /__delay?ms=N     set the per-request delay at runtime, overriding
+                         MOCK_DELAY_MS. Latency is what makes concurrency
+                         observable: without it requests finish too quickly to
+                         overlap, whether or not the client is issuing them in
+                         parallel.
 """
 
+import bisect
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -46,6 +70,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 # becomes visible. Applied per *connection setup* and per *request* separately
 # so keep-alive reuse can be distinguished from raw request count.
 CONNECT_DELAY_MS = float(os.environ.get("MOCK_CONNECT_DELAY_MS", "0"))
+
+# Mutable so a test can introduce latency for one scenario without needing its
+# own server. Read under no lock: a float assignment is atomic enough here, and
+# a request landing either side of a change is fine.
 REQUEST_DELAY_MS = float(os.environ.get("MOCK_DELAY_MS", "0"))
 
 # Link bandwidth in megabits/sec, applied to bytes actually put on the wire.
@@ -73,11 +101,14 @@ class Stats:
         self.connections = 0
         self.requests_by_op = {}
         self.page_sizes = []
+        self.page_sizes_in_order = []
         self.accept_encoding_requests = 0
         self.gzip_responses = 0
         self.mask_requests = 0
         self.max_requests_on_one_conn = 0
         self.docs_served = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def snapshot(self):
         with self.lock:
@@ -95,13 +126,35 @@ class Stats:
                 "docs_served": self.docs_served,
                 "requests_by_op": dict(self.requests_by_op),
                 "page_sizes_requested": sorted(set(self.page_sizes)),
+                "page_sizes_in_order": list(self.page_sizes_in_order),
                 "requests_advertising_gzip": self.accept_encoding_requests,
                 "responses_gzipped": self.gzip_responses,
                 "requests_with_field_mask": self.mask_requests,
+                # Peak number of requests being served at once. A sequential
+                # scan never exceeds 1; anything above that is the extension
+                # genuinely overlapping round trips.
+                "max_concurrent_requests": self.max_in_flight,
             }
 
 
+# Capabilities a caller can require before reusing an already-running mock.
+# Add a name here whenever a shape or control endpoint is added that tests
+# depend on.
+FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order", "odd_shape",
+            "field_mask", "runquery_select", "aggregation_query", "fail_aggregation",
+            "key_range_cursors", "auto_ids", "concurrency_stats", "runtime_delay"}
+
 STATS = Stats()
+
+# When set, :runQuery answers 500. The extension is supposed to fall back to
+# documents.list and let DuckDB apply the filters itself; this makes that
+# path reachable without breaking the server for every other test.
+FAIL_RUNQUERY = threading.Event()
+
+# When set, :runAggregationQuery answers 501. Older emulators and restricted
+# credentials do not offer the endpoint, and the extension is supposed to fall
+# back to scanning rather than fail the query.
+FAIL_AGGREGATION = threading.Event()
 
 # Per-connection request counter. One thread == one TCP connection under
 # ThreadingHTTPServer, so thread-local state is per-connection state.
@@ -111,7 +164,10 @@ CONN_LOCAL = threading.local()
 # Synthetic document generation
 # --------------------------------------------------------------------------
 
-COLLECTION_RE = re.compile(r"^bench_([a-z]+)_(\d+)_(\d+)$")
+COLLECTION_RE = re.compile(r"^(auto_)?bench_([a-z]+)_(\d+)_(\d+)$")
+
+# Firestore's auto-id alphabet, in the byte order Firestore sorts by.
+ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 _WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
           "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa"]
@@ -174,6 +230,30 @@ def make_fields(shape, param, i):
             ]}},
         }
 
+    if shape == "arrdbl":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "nums": {"arrayValue": {"values": [
+                {"doubleValue": ((i + k) % 1000) / 8.0} for k in range(param)
+            ]}},
+        }
+
+    if shape == "arrbool":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "flags": {"arrayValue": {"values": [
+                {"booleanValue": (i + k) % 2 == 0} for k in range(param)
+            ]}},
+        }
+
+    if shape == "arrts":
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "stamps": {"arrayValue": {"values": [
+                {"timestampValue": f"2026-01-{(k % 28) + 1:02d}T00:00:00.000000Z"} for k in range(param)
+            ]}},
+        }
+
     if shape == "vec":
         return {
             "doc_no": {"integerValue": str(i)},
@@ -194,6 +274,26 @@ def make_fields(shape, param, i):
             out["late_field"] = {"stringValue": f"late-{i}"}
         return out
 
+    if shape == "fat":
+        # One large string field. Firestore allows documents up to 1 MiB, so a
+        # full 1000-document page can weigh far more than a process can hold --
+        # this shape makes that regime reachable in a test.
+        filler = _WORDS[i % len(_WORDS)] * (param * 1024 // 8 + 1)
+        return {
+            "doc_no": {"integerValue": str(i)},
+            "blob": {"stringValue": filler[: param * 1024]},
+        }
+
+    if shape == "odd":
+        # Names a Firestore field path cannot carry unquoted: a dot would read
+        # as a path into a nested map, a space and a leading digit are not
+        # valid identifier characters.
+        out = {"plain": _scalar(0, i, 0)}
+        names = ["a.b", "with space", "2digit", "back`tick"]
+        for j in range(min(param, len(names))):
+            out[names[j]] = _scalar(j % 4, i, j + 1)
+        return out
+
     if shape == "mixed":
         # Field type cycles with the document index, so a schema inferred from
         # the first page is wrong for most later documents.
@@ -205,11 +305,88 @@ def make_fields(shape, param, i):
     raise ValueError(f"unknown shape {shape!r}")
 
 
+def unquote_field_path(field_path):
+    """Undo the backtick quoting Firestore requires for awkward field names.
+
+    A mask or select arrives as `a.b` for a field literally named "a.b";
+    without unquoting here the mock would look for a key that includes the
+    backticks and quietly return nothing, which would let a quoting bug in the
+    extension pass as an empty column.
+    """
+    if len(field_path) >= 2 and field_path.startswith("`") and field_path.endswith("`"):
+        inner = field_path[1:-1]
+        out, escaped = [], False
+        for ch in inner:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            else:
+                out.append(ch)
+        return "".join(out)
+    return field_path
+
+
 def parse_collection(name):
     m = COLLECTION_RE.match(name)
     if not m:
         return None
-    return m.group(1), int(m.group(2)), int(m.group(3))
+    return m.group(2), int(m.group(3)), int(m.group(4)), bool(m.group(1))
+
+
+def _auto_id(i):
+    """A deterministic stand-in for a Firestore auto-id: 20 chars, spread evenly."""
+    digest = hashlib.sha1(str(i).encode()).digest()
+    return "".join(ID_ALPHABET[b % len(ID_ALPHABET)] for b in digest[:20])
+
+
+DOCUMENT_IDS = {}
+DOCUMENT_IDS_LOCK = threading.Lock()
+
+
+def document_ids(collection):
+    """Document ids in the order Firestore returns them: sorted by name.
+
+    Held as one sorted list per collection so a key range can be resolved by
+    bisecting it, which is what makes the mock's cursor handling exact rather
+    than an approximation of Firestore's.
+    """
+    with DOCUMENT_IDS_LOCK:
+        hit = DOCUMENT_IDS.get(collection)
+    if hit is not None:
+        return hit
+
+    parsed = parse_collection(collection)
+    if parsed is None:
+        return None
+    _shape, _param, total, auto = parsed
+
+    if auto:
+        ids = sorted(_auto_id(i) for i in range(total))
+    else:
+        # Zero-padded, so lexicographic order is numeric order.
+        ids = [f"doc{i:08d}" for i in range(total)]
+
+    with DOCUMENT_IDS_LOCK:
+        DOCUMENT_IDS[collection] = ids
+    return ids
+
+
+def cursor_document_id(cursor):
+    """The document id a cursor's __name__ value points at, or None.
+
+    A cursor carries one value per orderBy entry, so the reference is only the
+    first value when the query orders by __name__ alone. Ordering by a field
+    puts that field's value first and the reference last -- reading values[0]
+    blindly yields no reference at all, which resolves to the start of the
+    collection and makes pagination loop forever.
+    """
+    for value in cursor.get("values", []):
+        reference = value.get("referenceValue")
+        if reference:
+            return reference.rsplit("/", 1)[-1]
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -231,16 +408,18 @@ def build_page(collection, offset, page_size, mask=None):
     parsed = parse_collection(collection)
     if parsed is None:
         return None
-    shape, param, total = parsed
+    shape, param, total, _auto = parsed
+    ids = document_ids(collection)
 
     end = min(offset + page_size, total)
+    wanted = {unquote_field_path(f) for f in mask} if mask else None
     docs = []
     for i in range(offset, end):
         fields = make_fields(shape, param, i)
-        if mask:
-            fields = {k: v for k, v in fields.items() if k in mask}
+        if wanted is not None:
+            fields = {k: v for k, v in fields.items() if k in wanted}
         docs.append({
-            "name": f"{DB_PREFIX}/{collection}/doc{i:08d}",
+            "name": f"{DB_PREFIX}/{collection}/{ids[i]}",
             "fields": fields,
             "createTime": "2026-01-01T00:00:00.000000Z",
             "updateTime": "2026-01-01T00:00:00.000000Z",
@@ -257,8 +436,8 @@ def build_page(collection, offset, page_size, mask=None):
     return result
 
 
-def build_runquery_page(collection, offset, limit):
-    key = ("__rq__", collection, offset, limit)
+def build_runquery_page(collection, offset, limit, select=None, stop=None):
+    key = ("__rq__", collection, offset, limit, tuple(select) if select is not None else None, stop)
     with PAGE_CACHE_LOCK:
         hit = PAGE_CACHE.get(key)
     if hit is not None:
@@ -267,15 +446,23 @@ def build_runquery_page(collection, offset, limit):
     parsed = parse_collection(collection)
     if parsed is None:
         return None
-    shape, param, total = parsed
+    shape, param, total, _auto = parsed
+    ids = document_ids(collection)
 
-    end = min(offset + limit, total)
+    end = min(offset + limit, total if stop is None else stop)
+    wanted = None
+    if select is not None:
+        # select __name__ is Firestore's keys-only projection: names, no fields.
+        wanted = {unquote_field_path(f) for f in select if f != "__name__"}
     out = []
     for i in range(offset, end):
+        fields = make_fields(shape, param, i)
+        if wanted is not None:
+            fields = {k: v for k, v in fields.items() if k in wanted}
         out.append({
             "document": {
-                "name": f"{DB_PREFIX}/{collection}/doc{i:08d}",
-                "fields": make_fields(shape, param, i),
+                "name": f"{DB_PREFIX}/{collection}/{ids[i]}",
+                "fields": fields,
                 "createTime": "2026-01-01T00:00:00.000000Z",
                 "updateTime": "2026-01-01T00:00:00.000000Z",
             },
@@ -313,6 +500,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS.docs_served += docs
             if page_size is not None:
                 STATS.page_sizes.append(page_size)
+                STATS.page_sizes_in_order.append(page_size)
             if mask:
                 STATS.mask_requests += 1
             # ThreadingHTTPServer handles each TCP connection on exactly one
@@ -325,8 +513,18 @@ class Handler(BaseHTTPRequestHandler):
                 STATS.max_requests_on_one_conn = CONN_LOCAL.n
 
     def _send(self, payload, status=200, ctype="application/json"):
-        if REQUEST_DELAY_MS:
-            time.sleep(REQUEST_DELAY_MS / 1000.0)
+        # The delay stands in for network latency, so it is also the window in
+        # which concurrency is observable.
+        with STATS.lock:
+            STATS.in_flight += 1
+            if STATS.in_flight > STATS.max_in_flight:
+                STATS.max_in_flight = STATS.in_flight
+        try:
+            if REQUEST_DELAY_MS:
+                time.sleep(REQUEST_DELAY_MS / 1000.0)
+        finally:
+            with STATS.lock:
+                STATS.in_flight -= 1
         uncompressed = len(payload)
         accepts_gzip = (not DISABLE_GZIP) and \
             "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
@@ -375,7 +573,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__stats":
             self._json(STATS.snapshot()); return
         if path == "/__health":
-            self._json({"ok": True}); return
+            # `features` lets a caller that finds a server already on the port
+            # tell whether it is this version of the mock. Reusing an older one
+            # fails in confusing ways -- a missing shape 404s, a missing control
+            # endpoint is silently ignored -- so callers check before reusing.
+            self._json({"ok": True, "features": sorted(FEATURES)}); return
 
         # Admin API: indexes. Report none so the extension takes its documented
         # "assume default single-field indexes" path.
@@ -409,6 +611,30 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
 
+        if path == "/__delay":
+            global REQUEST_DELAY_MS
+            REQUEST_DELAY_MS = float(parse_qs(u.query).get("ms", ["0"])[0])
+            self._json({"delay_ms": REQUEST_DELAY_MS})
+            return
+
+        if path == "/__fail_aggregation":
+            enabled = parse_qs(u.query).get("enabled", ["1"])[0] == "1"
+            if enabled:
+                FAIL_AGGREGATION.set()
+            else:
+                FAIL_AGGREGATION.clear()
+            self._json({"fail_aggregation": enabled})
+            return
+
+        if path == "/__fail_runquery":
+            enabled = parse_qs(u.query).get("enabled", ["1"])[0] == "1"
+            if enabled:
+                FAIL_RUNQUERY.set()
+            else:
+                FAIL_RUNQUERY.clear()
+            self._json({"fail_runquery": enabled})
+            return
+
         if path == "/__reset":
             with STATS.lock:
                 STATS.reset()
@@ -441,7 +667,43 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
 
+        if path.endswith(":runAggregationQuery"):
+            if FAIL_AGGREGATION.is_set():
+                self._count("aggregation_failed")
+                self._error(501, "aggregation queries disabled for this test")
+                return
+            try:
+                req = json.loads(body)
+            except json.JSONDecodeError:
+                self._error(400, "bad json"); return
+
+            aggregation = req.get("structuredAggregationQuery", {})
+            sq = aggregation.get("structuredQuery", {})
+            frm = (sq.get("from") or [{}])[0]
+            collection = frm.get("collectionId", "")
+            parsed = parse_collection(collection)
+            if parsed is None:
+                self._count("aggregation_404")
+                self._error(404, f"Collection '{collection}' not found"); return
+
+            total = parsed[2]
+            for agg in aggregation.get("aggregations", []):
+                up_to = agg.get("count", {}).get("upTo")
+                if up_to is not None:
+                    total = min(total, int(up_to))
+
+            # Counting transfers no documents, which is the whole point; the
+            # docs_served counter must stay flat so a test can prove it.
+            self._count("aggregation")
+            self._json([{"result": {"aggregateFields": {"count": {"integerValue": str(total)}}},
+                         "readTime": "2026-01-01T00:00:00.000000Z"}])
+            return
+
         if path.endswith(":runQuery"):
+            if FAIL_RUNQUERY.is_set():
+                self._count("runquery_failed")
+                self._error(500, "runQuery disabled for this test")
+                return
             try:
                 req = json.loads(body)
             except json.JSONDecodeError:
@@ -452,23 +714,46 @@ class Handler(BaseHTTPRequestHandler):
             collection = frm.get("collectionId", "")
             limit = int(sq.get("limit", 1000))
 
+            # Resolve the cursors the way Firestore does, by position in the
+            # collection's name ordering. `before` says which side of the given
+            # position the cursor sits on, and it means opposite things on a
+            # start and an end cursor -- getting that wrong here would hide the
+            # same mistake in the extension.
+            ids = document_ids(collection)
+            if ids is None:
+                self._count("runquery_404")
+                self._error(404, f"Collection '{collection}' not found"); return
+
             offset = 0
             start_at = sq.get("startAt")
             if start_at:
-                for v in start_at.get("values", []):
-                    ref = v.get("referenceValue")
-                    if ref and "/doc" in ref:
-                        try:
-                            offset = int(ref.rsplit("/doc", 1)[1]) + 1
-                        except ValueError:
-                            pass
+                start_id = cursor_document_id(start_at)
+                if start_id is not None:
+                    if start_at.get("before"):
+                        offset = bisect.bisect_left(ids, start_id)   # startAt: inclusive
+                    else:
+                        offset = bisect.bisect_right(ids, start_id)  # startAfter: exclusive
 
-            page = build_runquery_page(collection, offset, limit)
+            stop = None
+            end_at = sq.get("endAt")
+            if end_at:
+                end_id = cursor_document_id(end_at)
+                if end_id is not None:
+                    if end_at.get("before"):
+                        stop = bisect.bisect_left(ids, end_id)       # endBefore: exclusive
+                    else:
+                        stop = bisect.bisect_right(ids, end_id)      # endAt: inclusive
+
+            select = None
+            if "select" in sq:
+                select = [f.get("fieldPath", "") for f in sq["select"].get("fields", [])]
+
+            page = build_runquery_page(collection, offset, limit, select, stop)
             if page is None:
                 self._count("runquery_404")
                 self._error(404, f"Collection '{collection}' not found"); return
             raw, ndocs = page
-            self._count("runquery", docs=ndocs, page_size=limit)
+            self._count("runquery", docs=ndocs, page_size=limit, mask=select is not None)
             self._send(raw); return
 
         if path.endswith(":listCollectionIds"):
