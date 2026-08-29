@@ -757,9 +757,7 @@ static FirestoreListResponse StartUnfilteredScan(FirestoreScanBindData &bind_dat
 		const std::string collection_id = bind_data.collection.substr(1);
 		const std::vector<OrderByField> server_order_by = can_order ? order_by : std::vector<OrderByField>();
 		json structured_query = BuildCollectionGroupStructuredQuery(collection_id, server_order_by, page_size);
-		if (global_state.projection.masked) {
-			structured_query["select"] = BuildSelectClause(global_state.projection);
-		}
+		ApplyProjectionToStructuredQuery(structured_query, global_state.projection);
 
 		global_state.structured_query = structured_query;
 		global_state.uses_run_query = true;
@@ -882,6 +880,18 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	    !bind_data.parsed_order_by.empty() ? bind_data.parsed_order_by : bind_data.sql_pushed_order_by;
 	auto effective_limit = bind_data.limit.has_value() ? bind_data.limit : bind_data.sql_pushed_limit;
 
+	// A limit of zero (or below) asks for no rows, which no request to
+	// Firestore is needed to answer. Settle it here so the paths below never
+	// see one: the count pushdown in particular passes the limit on as the
+	// aggregation's `upTo`, where zero means "no bound" and would count the
+	// whole collection.
+	if (effective_limit.has_value() && effective_limit.value() <= 0) {
+		global_state->finished = true;
+		FS_LOG_DEBUG("Scan of '" + bind_data.collection + "' is limited to " + std::to_string(effective_limit.value()) +
+		             " rows; returning none without querying Firestore");
+		return std::move(global_state);
+	}
+
 	// Split the collection across threads when that is exact. Each thread pages
 	// through its own key range, so the round trips overlap.
 	const idx_t max_threads = static_cast<idx_t>(FirestoreSettings::MaxScanThreads(context));
@@ -904,7 +914,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	// A scan that needs no columns is fully described by how many rows it has,
 	// so ask Firestore for that number instead of reading the collection.
 	if (CanAnswerWithCount(bind_data, *global_state)) {
-		const int64_t up_to = effective_limit.has_value() && effective_limit.value() > 0 ? effective_limit.value() : 0;
+		// Zero limits were settled above, so a limit here is always positive.
+		const int64_t up_to = effective_limit.has_value() ? effective_limit.value() : 0;
 		int64_t counted = 0;
 		try {
 			if (global_state->client->CountDocuments(bind_data.collection, bind_data.is_collection_group, up_to,
@@ -940,13 +951,6 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 		json sq;
 		sq["from"] = {{{"collectionId", collection_id}, {"allDescendants", bind_data.is_collection_group}}};
-
-		// Ask only for the projected fields. The WHERE clause is evaluated
-		// server-side against the whole document, so a filter on a field the
-		// query does not select still works.
-		if (global_state->projection.masked) {
-			sq["select"] = BuildSelectClause(global_state->projection);
-		}
 
 		// Add WHERE clause
 		sq["where"] = BuildWhereClause(global_state->pushdown_result.pushed_filters);
@@ -1015,6 +1019,12 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 
 			sq["orderBy"] = order_by_arr;
 		}
+
+		// Ask only for the projected fields, widened to cover the orderBy the
+		// cursor is rebuilt from. The WHERE clause is evaluated server-side
+		// against the whole document, so a filter on a field the query does not
+		// select still works.
+		ApplyProjectionToStructuredQuery(sq, global_state->projection);
 
 		global_state->structured_query = sq;
 		global_state->uses_run_query = true;

@@ -658,9 +658,7 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 
 	const int64_t page_size = ClampFirestorePageSize(query.page_size);
 	json structured_query = BuildCollectionGroupStructuredQuery(collection_id, order_by, page_size);
-	if (query.projection.masked) {
-		structured_query["select"] = BuildSelectClause(query.projection);
-	}
+	ApplyProjectionToStructuredQuery(structured_query, query.projection);
 	if (!query.start_at.is_null()) {
 		structured_query["startAt"] = query.start_at;
 	}

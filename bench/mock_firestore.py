@@ -109,6 +109,8 @@ class Stats:
         self.docs_served = 0
         self.in_flight = 0
         self.max_in_flight = 0
+        self.cursor_mismatches = 0
+        self.cursor_mismatch_samples = []
 
     def snapshot(self):
         with self.lock:
@@ -134,6 +136,13 @@ class Stats:
                 # scan never exceeds 1; anything above that is the extension
                 # genuinely overlapping round trips.
                 "max_concurrent_requests": self.max_in_flight,
+                # Cursors whose values do not line up with the query's own
+                # orderBy. Firestore reads a cursor positionally, so such a
+                # cursor points somewhere other than where the last page
+                # ended: the next page can repeat rows, skip them, or restart
+                # the scan. Must stay at zero.
+                "cursor_mismatches": self.cursor_mismatches,
+                "cursor_mismatch_samples": list(self.cursor_mismatch_samples),
             }
 
 
@@ -142,7 +151,8 @@ class Stats:
 # depend on.
 FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order", "odd_shape",
             "field_mask", "runquery_select", "aggregation_query", "fail_aggregation",
-            "key_range_cursors", "auto_ids", "concurrency_stats", "runtime_delay"}
+            "key_range_cursors", "auto_ids", "concurrency_stats", "runtime_delay",
+            "cursor_validation"}
 
 STATS = Stats()
 
@@ -387,6 +397,37 @@ def cursor_document_id(cursor):
         if reference:
             return reference.rsplit("/", 1)[-1]
     return None
+
+
+def cursor_alignment_errors(cursor, order_by):
+    """Describe every way a cursor fails to line up with a query's orderBy.
+
+    Firestore reads a cursor positionally: values[i] is the value orderBy[i]'s
+    field held in the document the next page starts at. A cursor that is
+    shorter than the orderBy, or that carries a null where a real field value
+    belongs, does not name that position -- the page after it can repeat rows,
+    skip them, or start the scan over.
+
+    None of the generated collections stores a null field, so a nullValue
+    against a field-ordered position was substituted by the client, which is
+    what happens when the query never asked the server for that field.
+    """
+    if not isinstance(cursor, dict) or not isinstance(order_by, list) or not order_by:
+        return []
+    values = cursor.get("values")
+    if not isinstance(values, list):
+        return ["cursor has no values"]
+    errors = []
+    if len(values) != len(order_by):
+        errors.append(f"cursor has {len(values)} values for {len(order_by)} orderBy fields")
+    for i, entry in enumerate(order_by):
+        field_path = (entry.get("field") or {}).get("fieldPath", "")
+        if field_path == "__name__" or i >= len(values):
+            continue
+        value = values[i]
+        if not isinstance(value, dict) or "nullValue" in value:
+            errors.append(f"orderBy[{i}] on '{field_path}' has no value in the cursor")
+    return errors
 
 
 # --------------------------------------------------------------------------
@@ -723,6 +764,17 @@ class Handler(BaseHTTPRequestHandler):
             if ids is None:
                 self._count("runquery_404")
                 self._error(404, f"Collection '{collection}' not found"); return
+
+            order_by = sq.get("orderBy") if isinstance(sq.get("orderBy"), list) else []
+            cursor_errors = []
+            for name in ("startAt", "endAt"):
+                for message in cursor_alignment_errors(sq.get(name), order_by):
+                    cursor_errors.append(f"{collection} {name}: {message}")
+            if cursor_errors:
+                with STATS.lock:
+                    STATS.cursor_mismatches += len(cursor_errors)
+                    room = 5 - len(STATS.cursor_mismatch_samples)
+                    STATS.cursor_mismatch_samples.extend(cursor_errors[:max(0, room)])
 
             offset = 0
             start_at = sq.get("startAt")
