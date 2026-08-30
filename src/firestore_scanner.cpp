@@ -349,6 +349,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["scan_limit"] = LogicalType::BIGINT;
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
+	scan_func.named_parameters["orderby_pushdown"] = LogicalType::BOOLEAN;
 	scan_func.named_parameters["map_encoding"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["schema_sample_size"] = LogicalType::BIGINT;
 	scan_func.named_parameters["unmapped_column"] = LogicalType::BOOLEAN;
@@ -397,6 +398,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->parsed_order_by = ParseOrderByString(result->order_by.value());
 		} else if (kv.first == "show_missing") {
 			result->show_missing = kv.second.GetValue<bool>();
+		} else if (kv.first == "orderby_pushdown") {
+			result->orderby_pushdown = kv.second.GetValue<bool>();
 		} else if (kv.first == "map_encoding") {
 			result->map_encoding = ParseMapEncoding(StringUtil::Lower(kv.second.GetValue<string>()));
 		} else if (kv.first == "schema_sample_size") {

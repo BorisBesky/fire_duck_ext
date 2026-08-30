@@ -59,11 +59,20 @@ public:
 		return fields_;
 	}
 
-	// Element type to use for an array field, by majority of sampled
-	// elements. Ties break toward the alphabetically first type name, and an
-	// empty count map yields "stringValue" -- the safest rendering for an
+	// Element type to use for an array field: the one type its elements have,
+	// or the narrowest type that can hold all of them.
+	//
+	// Firestore arrays are heterogeneous by design, so an element type has to
+	// be chosen that every element fits. Picking the most common one instead
+	// left the rest to fail: a list of an integer and a string became BIGINT
+	// and the scan threw on the string, failing the whole query over data
+	// Firestore accepts. Integers and doubles widen to double, since that is
+	// what a number column does; any other mix widens to string, which is
+	// what a scalar field holding several types already does.
+	//
+	// An empty count map yields "stringValue" -- the safest rendering for an
 	// element type nothing was learned about.
-	static std::string MajorityElementType(const std::map<std::string, int64_t> &element_types);
+	static std::string WidenElementTypes(const std::map<std::string, int64_t> &element_types);
 
 private:
 	int64_t sample_size_; // <= 0 means unlimited

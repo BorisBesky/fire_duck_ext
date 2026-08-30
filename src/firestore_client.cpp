@@ -958,10 +958,10 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		const auto &summary = entry.second;
 
 		if (summary.type_name == "arrayValue") {
-			// Element type by majority of the elements actually sampled.
+			// The narrowest element type every sampled element fits into.
 			LogicalType element_type = LogicalType::VARCHAR; // Default
 			const std::string best_element_type =
-			    FirestoreSchemaAccumulator::MajorityElementType(summary.array_element_types);
+			    FirestoreSchemaAccumulator::WidenElementTypes(summary.array_element_types);
 			if (best_element_type == "integerValue")
 				element_type = LogicalType::BIGINT;
 			else if (best_element_type == "doubleValue")

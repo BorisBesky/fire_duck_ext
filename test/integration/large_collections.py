@@ -1010,6 +1010,55 @@ def _():
     assert_eq(int(rows[0]), 700, "rows from ORDER BY with LIMIT")
 
 
+@test("orderby pushdown: off by default, the whole collection is read and sorted here")
+def _():
+    # Firestore omits documents that lack the ordering field and sorts by its
+    # own rules, so by default the sort stays in DuckDB -- which means the
+    # limit cannot go to the server either, and every document is fetched.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_3000")
+        + ") ORDER BY f1 LIMIT 700);"
+    )
+    assert_eq(int(rows[0]), 700, "the query still returns 700 rows")
+    served = stats()["docs_served"]
+    if served < 3000:
+        raise AssertionError(f"expected the whole collection to be read, got {served} documents")
+
+
+@test("orderby pushdown: turning it on bounds what is fetched")
+def _():
+    # The round trips the setting exists to save: with the ordering sent to
+    # Firestore the limit goes with it, so the scan stops after 700 documents
+    # instead of reading 3000.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_3000")
+        + ") ORDER BY f1 LIMIT 700);",
+        ["SET firestore_orderby_pushdown=true"],
+    )
+    assert_eq(int(rows[0]), 700, "the query still returns 700 rows")
+    served = stats()["docs_served"]
+    if served >= 3000:
+        raise AssertionError(f"expected the limit to bound the fetch, got {served} documents")
+
+
+@test("orderby pushdown: the scan parameter overrides the setting")
+def _():
+    reset_stats()
+    run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_3000", "orderby_pushdown:=false")
+        + ") ORDER BY f1 LIMIT 700);",
+        ["SET firestore_orderby_pushdown=true"],
+    )
+    served = stats()["docs_served"]
+    if served < 3000:
+        raise AssertionError(f"the scan parameter should have kept the sort local, got {served} documents")
+
+
 @test("regression: projected columns still materialise across page boundaries")
 def _():
     rows = run_sql(

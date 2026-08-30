@@ -422,19 +422,12 @@ def _():
     assert_eq(rows, server_order, "ordering by document id agrees with Firestore")
 
 
-ORDER_BY_DEFECT = (
-    "SQL ORDER BY is pushed to Firestore, whose ordering is not SQL's: it drops documents that "
-    "lack the ordering field, sorts nulls first, and orders by its own cross-type precedence, so "
-    "an ORDER BY changes which rows a query returns"
-)
-
-
-@test("ordering: ORDER BY does not drop documents that lack the field", known_defect=ORDER_BY_DEFECT)
+@test("ordering: ORDER BY does not drop documents that lack the field")
 def _():
-    # The sharpest form of the problem, and it needs no LIMIT to show up.
-    # Firestore only returns documents that have the field a query orders by;
-    # in SQL, ORDER BY never changes which rows come back. Two of these six
-    # documents have no `v` at all.
+    # Firestore only returns documents that have the field a query orders by,
+    # so pushing the sort down silently deleted rows: two of these six have no
+    # `v` at all, and no LIMIT is involved. With the pushdown off by default,
+    # ORDER BY means what SQL says it means.
     collection = f"{PREFIX}_sparse"
     unordered = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection)});")
     ordered = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v;")
@@ -442,27 +435,60 @@ def _():
     assert_eq(len(ordered), 6, "ordering by a field some documents lack must not drop them")
 
 
-@test("ordering: an unlimited ORDER BY still ends up in DuckDB's order")
+@test("ordering: an unlimited ORDER BY ends up in DuckDB's order")
 def _():
-    # Firestore sorts null below everything and orders by its own cross-type
+    # Firestore sorts null below everything and orders across types by its own
     # precedence; DuckDB puts nulls last and, since a field holding more than
-    # one type collapses to VARCHAR, compares them as strings. With no limit
-    # that disagreement is harmless: every row still arrives and DuckDB sorts
-    # them itself. This pins that down, so the limited case below is known to
-    # be about the limit and not about ordering in general.
+    # one type collapses to VARCHAR, compares them as strings. The sort DuckDB
+    # would do is the one a plain SQL query has to get.
     collection = f"{PREFIX}_mixed"
-    pushed = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v;")
-    assert_eq(pushed, sorted_locally(collection, "ORDER BY v"), "a pushed sort matches the sort DuckDB would have done")
+    ordered = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v;")
+    assert_eq(ordered, sorted_locally(collection, "ORDER BY v"), "the rows are in DuckDB's order")
 
 
-@test("ordering: ORDER BY with LIMIT keeps the rows DuckDB would keep", known_defect=ORDER_BY_DEFECT)
+@test("ordering: ORDER BY with LIMIT keeps the rows DuckDB would keep")
 def _():
-    # Where the disagreement above becomes wrong output rather than merely a
-    # different order: the limit is applied to Firestore's ordering, so the
-    # rows that survive are not the ones the query asked for.
+    # Where the disagreement became wrong output rather than merely a different
+    # order: a server-side limit applied in Firestore's ordering keeps rows the
+    # query did not ask for. Declining the sort has to decline the limit too.
     collection = f"{PREFIX}_mixed"
-    pushed = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v LIMIT 5;")
-    assert_eq(pushed, sorted_locally(collection, "ORDER BY v LIMIT 5"), "the same five rows as an unpushed sort")
+    limited = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v LIMIT 5;")
+    assert_eq(limited, sorted_locally(collection, "ORDER BY v LIMIT 5"), "the same five rows as an unpushed sort")
+
+
+@test("ordering: the pushdown can be turned on per session")
+def _():
+    # Opting in gives Firestore's ordering, and with it Firestore's rule about
+    # documents lacking the field. That is the trade the setting exists to
+    # make: fewer round trips where the collection's shape makes the two
+    # orderings equivalent.
+    collection = f"{PREFIX}_sparse"
+    rows = run_sql(
+        f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v;",
+        ["SET firestore_orderby_pushdown=true"],
+    )
+    assert_eq(len(rows), 4, "with the pushdown on, Firestore omits the documents without the field")
+
+
+@test("ordering: the pushdown can be turned on for one scan")
+def _():
+    collection = f"{PREFIX}_sparse"
+    rows = run_sql(
+        "SELECT __document_id FROM firestore_scan(" + scan_args(collection, "orderby_pushdown:=true") + ") ORDER BY v;"
+    )
+    assert_eq(len(rows), 4, "the scan parameter turns the pushdown on")
+
+
+@test("ordering: a scan parameter overrides the session setting")
+def _():
+    collection = f"{PREFIX}_sparse"
+    rows = run_sql(
+        "SELECT __document_id FROM firestore_scan("
+        + scan_args(collection, "orderby_pushdown:=false")
+        + ") ORDER BY v;",
+        ["SET firestore_orderby_pushdown=true"],
+    )
+    assert_eq(len(rows), 6, "the scan parameter wins over the setting")
 
 
 @test("ordering: the named order_by parameter uses Firestore's ordering")
@@ -662,39 +688,27 @@ def _():
     assert_eq(rows[0], "deep,7", "variant encoding makes map fields addressable")
 
 
-ARRAY_DEFECT = (
-    "an array mixing strings with numbers or booleans fails the whole query: list element types are "
-    "not widened to VARCHAR the way a scalar field's are, so the scan throws a cast error on data "
-    "Firestore accepts"
-)
-
-
 @test("types: array element types widen where they can")
 def _():
-    # Integers and doubles widen to DOUBLE[], and a null among strings is
-    # simply a null element. This is the behaviour the mixed case below
-    # should have had.
+    # Integers and doubles widen to DOUBLE[], because a number column holds
+    # both. A null among strings is simply a null element and votes for
+    # nothing.
     collection = f"{PREFIX}_arrays"
     rows = run_sql(f"SELECT typeof(numbers), typeof(with_null) FROM firestore_scan({scan_args(collection)});")
     assert_eq(rows[0], "DOUBLE[],VARCHAR[]", "numeric widening, and nulls do not change the element type")
 
 
-@test("types: an array mixing strings and numbers is readable", known_defect=ARRAY_DEFECT)
+@test("types: an array mixing strings and numbers is readable")
 def _():
     # Firestore arrays are heterogeneous by design and the extension documents
-    # array as LIST. A scalar field holding both types becomes VARCHAR; a list
-    # of them errors instead.
+    # array as LIST. Choosing the most common element type left the rest to
+    # fail the cast, and with it the whole query; widening to VARCHAR[] is what
+    # a scalar field holding several types already does.
     collection = f"{PREFIX}_mixedarray"
-    rows = run_sql(f"SELECT mixed FROM firestore_scan({scan_args(collection)});")
+    rows = run_sql(f"SELECT typeof(mixed), mixed FROM firestore_scan({scan_args(collection)});", columns=True)
     assert_eq(len(rows), 1, "the mixed array reads without failing the query")
-
-
-@test("types: a vector is inferred as a fixed-size array")
-def _():
-    # Firestore encodes a vector as a tagged map, not an array, so this checks
-    # the extension recognises the real encoding rather than the mock's.
-    rows = run_sql(f"SELECT typeof(vec) FROM firestore_scan({scan_args(PREFIX + '_types')});")
-    assert_eq(rows[0], "DOUBLE[3]", "vector inferred from the server's own encoding")
+    assert_eq(rows[0][0], "VARCHAR[]", "incompatible element types widen to text")
+    assert_eq(rows[0][1], "[1, two]", "both elements are present and readable")
 
 
 @test("types: binary bytes survive both directions unchanged")

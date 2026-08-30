@@ -52,6 +52,11 @@ struct FirestoreScanBindData : public TableFunctionData {
 	// Show missing/phantom documents (documents with no fields, only subcollections)
 	bool show_missing = true;
 
+	// Whether a SQL ORDER BY may be sent to Firestore for this scan. Unset
+	// follows the firestore_orderby_pushdown setting; see FirestoreSettings
+	// for why the default is off.
+	std::optional<bool> orderby_pushdown;
+
 	// How mapValue fields are surfaced. Defaults to WIRE so existing queries
 	// that reach into $.x.mapValue.fields.y keep working.
 	FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE;

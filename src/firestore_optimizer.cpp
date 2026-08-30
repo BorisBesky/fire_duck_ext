@@ -1,6 +1,7 @@
 #include "firestore_optimizer.hpp"
 #include "firestore_path_utils.hpp"
 #include "firestore_scanner.hpp"
+#include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -227,7 +228,7 @@ static bool TryExtractLimit(LogicalTopN &topn_op, FirestoreScanBindData &bind_da
 // changes which rows are counted, so the scan has to read them after all.
 static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, LogicalLimit *current_limit,
                          LogicalTopN *current_topn, std::vector<LogicalProjection *> &projections,
-                         bool under_count_star = false) {
+                         bool setting_allows_orderby_pushdown, bool under_count_star = false) {
 	// Save the current projection stack size so we can restore it when unwinding
 	auto saved_projection_size = projections.size();
 
@@ -277,6 +278,10 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 		auto &get = op.Cast<LogicalGet>();
 		if (get.function.name == "firestore_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->CastNoConst<FirestoreScanBindData>();
+			// The scan's own parameter wins over the session setting.
+			const bool orderby_pushdown_allowed = bind_data.orderby_pushdown.has_value()
+			                                          ? bind_data.orderby_pushdown.value()
+			                                          : setting_allows_orderby_pushdown;
 			bind_data.sql_pushed_order_by.clear();
 			bind_data.sql_pushed_limit.reset();
 			bind_data.count_star_only = under_count_star;
@@ -334,10 +339,16 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 				return;
 			}
 
-			// Only inject ORDER BY if named param was not already set
+			// Only inject ORDER BY if named param was not already set, and only
+			// where the caller has asked for Firestore's ordering. Sending the
+			// sort to the server changes which rows come back -- Firestore
+			// omits documents lacking the ordering field -- so by default the
+			// sort stays in DuckDB. Declining it also stops the LIMIT going
+			// down, via sql_order_blocks_limit below: a server-side limit
+			// applied in the wrong order would cut the wrong rows.
 			const auto *order_nodes =
 			    current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
-			if (bind_data.parsed_order_by.empty() && order_nodes) {
+			if (bind_data.parsed_order_by.empty() && order_nodes && orderby_pushdown_allowed) {
 				if (TryExtractOrderBy(get, *order_nodes, bind_data, projections)) {
 					// Build EXPLAIN info
 					std::string info;
@@ -387,7 +398,8 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 
 	// Recurse into children
 	for (auto &child : op.children) {
-		WalkPlanTree(*child, current_order, current_limit, current_topn, projections, under_count_star);
+		WalkPlanTree(*child, current_order, current_limit, current_topn, projections, setting_allows_orderby_pushdown,
+		             under_count_star);
 	}
 
 	// Restore the projection stack to its previous size for the caller
@@ -396,7 +408,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 
 void FirestorePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	std::vector<LogicalProjection *> projections;
-	WalkPlanTree(*plan, nullptr, nullptr, nullptr, projections);
+	WalkPlanTree(*plan, nullptr, nullptr, nullptr, projections, FirestoreSettings::OrderByPushdown(input.context));
 }
 
 } // namespace duckdb

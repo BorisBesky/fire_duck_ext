@@ -125,7 +125,8 @@ FD_TEST("accumulator: array element types are counted across documents") {
 	const auto &counts = accumulator.Fields().at("tags").array_element_types;
 	FD_REQUIRE_EQ(counts.at("integerValue"), 2);
 	FD_REQUIRE_EQ(counts.at("stringValue"), 1);
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("integerValue"));
+	// Integers outnumber the string, but the string still has to be readable.
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("stringValue"));
 }
 
 FD_TEST("accumulator: explicit nulls do not vote for an element type") {
@@ -136,7 +137,7 @@ FD_TEST("accumulator: explicit nulls do not vote for an element type") {
 
 	const auto &counts = accumulator.Fields().at("tags").array_element_types;
 	FD_REQUIRE_EQ(counts.size(), 1u);
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("doubleValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("doubleValue"));
 }
 
 FD_TEST("accumulator: an arrayValue with no values array is still typed as an array") {
@@ -146,15 +147,42 @@ FD_TEST("accumulator: an arrayValue with no values array is still typed as an ar
 	FD_REQUIRE(accumulator.Fields().at("tags").array_element_types.empty());
 }
 
-FD_TEST("accumulator: majority element type falls back to string when nothing was learned") {
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType({}), std::string("stringValue"));
+FD_TEST("accumulator: an element type falls back to string when nothing was learned") {
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({}), std::string("stringValue"));
 }
 
-FD_TEST("accumulator: an element type tie resolves to the alphabetically first name") {
-	// Deterministic beats arbitrary: the same collection must infer the same
-	// schema on every bind, cache hit or not.
-	std::map<std::string, int64_t> counts {{"stringValue", 3}, {"integerValue", 3}};
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("integerValue"));
+FD_TEST("accumulator: one element type is used as it is") {
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"integerValue", 4}}), std::string("integerValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"booleanValue", 1}}), std::string("booleanValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"timestampValue", 2}}),
+	              std::string("timestampValue"));
+}
+
+FD_TEST("accumulator: integers and doubles widen to double") {
+	// A number column holds both, so this mix does not have to become text.
+	std::map<std::string, int64_t> counts {{"integerValue", 9}, {"doubleValue", 1}};
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("doubleValue"));
+}
+
+FD_TEST("accumulator: any other mix widens to string") {
+	// Whichever type is more common, the others still have to be readable:
+	// choosing one of them made the scan throw on every element of the rest.
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"integerValue", 3}, {"stringValue", 3}}),
+	              std::string("stringValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"booleanValue", 99}, {"integerValue", 1}}),
+	              std::string("stringValue"));
+	FD_REQUIRE_EQ(
+	    FirestoreSchemaAccumulator::WidenElementTypes({{"doubleValue", 1}, {"integerValue", 1}, {"stringValue", 1}}),
+	    std::string("stringValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"mapValue", 2}, {"stringValue", 1}}),
+	              std::string("stringValue"));
+}
+
+FD_TEST("accumulator: a type counted zero times is not a type that was seen") {
+	// An entry can exist with a zero count; treating it as present would widen
+	// a perfectly uniform list to string for no reason.
+	std::map<std::string, int64_t> counts {{"integerValue", 5}, {"stringValue", 0}};
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("integerValue"));
 }
 
 // ---------------------------------------------------------------- vectors
