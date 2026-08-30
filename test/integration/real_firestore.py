@@ -65,7 +65,7 @@ def secret_statement():
     raise AssertionError("no endpoint configured")
 
 
-def run_sql(sql, settings=None, timeout=600):
+def run_sql(sql, settings=None, timeout=600, columns=False):
     # CSV mode is set before the secret so its own success row is a bare
     # `true` rather than a boxed table, and can be stripped below.
     script = "LOAD fire_duck_ext;\n.mode csv\n.headers off\n" + secret_statement() + ";\n"
@@ -96,7 +96,13 @@ def run_sql(sql, settings=None, timeout=600):
     lines = [line for line in completed.stdout.strip().splitlines() if line]
     if lines and lines[0] == "true":
         lines = lines[1:]
-    return [",".join(row) for row in csv.reader(lines)]
+    rows = list(csv.reader(lines))
+    if columns:
+        return rows
+    # Most tests compare a whole row, so the default is one string per row.
+    # Rejoining is lossy where a value contains a comma -- pass columns=True
+    # for those.
+    return [",".join(row) for row in rows]
 
 
 def scan_args(collection, extra=""):
@@ -166,10 +172,10 @@ TYPE_DOCUMENT = {
     "b": fx.boolean(True),
     "n": fx.null(),
     "ts": fx.timestamp("2026-01-02T03:04:05.123456Z"),
-    "by": fx.bytes_value(base64.b64encode(b"\x00\x01\xfe\xff").decode()),
+    "raw": fx.bytes_value(base64.b64encode(b"\x00\x01\xfe\xff").decode()),
     "geo": fx.geo(37.4, -122.1),
-    "arr": fx.array([fx.integer(1), fx.string("two"), fx.boolean(False)]),
-    "map": fx.mapping({"inner": fx.string("deep"), "n": fx.integer(7)}),
+    "arr": fx.array([fx.integer(1), fx.integer(2), fx.integer(3)]),
+    "nested": fx.mapping({"inner": fx.string("deep"), "n": fx.integer(7)}),
     "vec": fx.vector([1.0, 2.0, 3.0]),
 }
 
@@ -232,6 +238,22 @@ def seed_everything(db):
             "f": {"v": fx.string("cherry"), "k": fx.integer(6)},
         },
     )
+
+    # -- arrays: what widens, and what does not
+    db.seed(
+        f"{PREFIX}_arrays",
+        {
+            "a": {
+                "numbers": fx.array([fx.integer(1), fx.double(2.5)]),
+                "with_null": fx.array([fx.string("x"), fx.null()]),
+            },
+            "b": {"numbers": fx.array([fx.integer(3)]), "with_null": fx.array([fx.null()])},
+            "c": {"numbers": fx.array([fx.double(0.5)]), "with_null": fx.array([fx.string("y")])},
+        },
+    )
+    # On its own, so the element type is inferred from the leading integer and
+    # the trailing string is what the cast trips over.
+    db.seed(f"{PREFIX}_mixedarray", {"a": {"mixed": fx.array([fx.integer(1), fx.string("two")])}})
 
     # -- one document per type
     db.seed(f"{PREFIX}_types", {"only": TYPE_DOCUMENT})
@@ -511,6 +533,242 @@ def _():
         ["SET firestore_max_threads=4"],
     )
     assert_eq(sorted(rows), server, "the scan returns exactly the collection")
+
+
+# ---- aggregation bounds -----------------------------------------------------
+
+
+@test("count: the server treats upTo as a ceiling on the count")
+def _():
+    # BuildCountAggregationQuery sends the scan's limit as `upTo`, and the
+    # scanner clamps the result afterwards on the grounds that upTo is only a
+    # hint. Whether it is a hint or a hard ceiling is the server's to say.
+    collection = f"{PREFIX}_hundred"
+    assert_eq(DB.aggregate_count(collection), 100, "the unbounded count")
+
+    bounded = DB.aggregate_count(collection, up_to=10)
+    assert_true(bounded <= 100, "a bounded count never exceeds the collection")
+    if bounded != 10:
+        raise AssertionError(f"upTo=10 returned {bounded}: it is a hint here, so the scanner's clamp is load-bearing")
+
+
+@test("count: a scan limit bounds what count(*) reports")
+def _():
+    # Whatever upTo does above, the extension owes the query its own limit.
+    collection = f"{PREFIX}_hundred"
+    rows = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection, 'scan_limit:=10')});")
+    assert_eq(int(rows[0]), 10, "count(*) under a scan limit")
+
+
+@test("count: a zero scan limit counts nothing")
+def _():
+    # The aggregation reads a zero upTo as "no bound", so a zero limit has to
+    # be settled before the query is built or it returns the whole collection.
+    collection = f"{PREFIX}_hundred"
+    rows = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection, 'scan_limit:=0')});")
+    assert_eq(int(rows[0]), 0, "count(*) under a zero scan limit")
+
+
+@test("count: the pushed count equals the number of rows a scan returns")
+def _():
+    collection = f"{PREFIX}_hundred"
+    counted = int(run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection)});")[0])
+    scanned = int(run_sql(f"SELECT count(n) FROM firestore_scan({scan_args(collection)});")[0])
+    assert_eq(counted, 100, "the aggregation count")
+    assert_eq(scanned, counted, "counting and scanning agree")
+
+
+# ---- value types ------------------------------------------------------------
+
+
+@test("types: every Firestore type survives the round trip")
+def _():
+    # The mock emits this project's belief about Firestore's encodings. These
+    # documents were stored by the server, so what comes back is the real one.
+    collection = f"{PREFIX}_types"
+    rows = run_sql(
+        "SELECT s, i_max, i_min, d, b, n IS NULL, hex(raw), arr, ts FROM firestore_scan("
+        + scan_args(collection)
+        + ");",
+        columns=True,
+    )
+    assert_eq(len(rows), 1, "one document")
+    values = rows[0]
+
+    assert_eq(values[0], "hello", "string")
+    assert_eq(values[1], "9223372036854775807", "int64 max survives the JSON string encoding")
+    assert_eq(values[2], "-9223372036854775808", "int64 min")
+    assert_eq(values[3], "0.1", "double")
+    assert_eq(values[4].lower(), "true", "boolean")
+    assert_eq(values[5].lower(), "true", "an explicit null reads as SQL NULL")
+    assert_eq(values[6], "0001FEFF", "bytes survive as their exact octets")
+    assert_true(values[7].startswith("[1"), f"an array keeps its elements: {values[7]!r}")
+    assert_true(values[8].startswith("2026-01-02"), "timestamp")
+
+
+@test("types: a timestamp keeps sub-second precision")
+def _():
+    # Firestore stores microseconds. A conversion through seconds would round
+    # them away silently.
+    rows = run_sql(f"SELECT strftime(ts, '%Y-%m-%d %H:%M:%S.%f') FROM firestore_scan({scan_args(PREFIX + '_types')});")
+    assert_eq(rows[0], "2026-01-02 03:04:05.123456", "microseconds are preserved")
+
+
+@test("types: a map is surfaced in each documented encoding")
+def _():
+    # 'wire' is the documented default and hands back Firestore's own typed
+    # JSON; 'variant' decodes it into addressable values. Both are read from
+    # what the server actually stored.
+    collection = f"{PREFIX}_types"
+    wire = run_sql(f"SELECT nested FROM firestore_scan({scan_args(collection)});")
+    assert_true("stringValue" in wire[0], f"the default encoding is Firestore's wire form: {wire[0]!r}")
+
+    rows = run_sql(
+        "SELECT nested.inner, nested.n FROM firestore_scan(" + scan_args(collection, "map_encoding:='variant'") + ");"
+    )
+    assert_eq(rows[0], "deep,7", "variant encoding makes map fields addressable")
+
+
+ARRAY_DEFECT = (
+    "an array mixing strings with numbers or booleans fails the whole query: list element types are "
+    "not widened to VARCHAR the way a scalar field's are, so the scan throws a cast error on data "
+    "Firestore accepts"
+)
+
+
+@test("types: array element types widen where they can")
+def _():
+    # Integers and doubles widen to DOUBLE[], and a null among strings is
+    # simply a null element. This is the behaviour the mixed case below
+    # should have had.
+    collection = f"{PREFIX}_arrays"
+    rows = run_sql(f"SELECT typeof(numbers), typeof(with_null) FROM firestore_scan({scan_args(collection)});")
+    assert_eq(rows[0], "DOUBLE[],VARCHAR[]", "numeric widening, and nulls do not change the element type")
+
+
+@test("types: an array mixing strings and numbers is readable", known_defect=ARRAY_DEFECT)
+def _():
+    # Firestore arrays are heterogeneous by design and the extension documents
+    # array as LIST. A scalar field holding both types becomes VARCHAR; a list
+    # of them errors instead.
+    collection = f"{PREFIX}_mixedarray"
+    rows = run_sql(f"SELECT mixed FROM firestore_scan({scan_args(collection)});")
+    assert_eq(len(rows), 1, "the mixed array reads without failing the query")
+
+
+@test("types: a vector is inferred as a fixed-size array")
+def _():
+    # Firestore encodes a vector as a tagged map, not an array, so this checks
+    # the extension recognises the real encoding rather than the mock's.
+    rows = run_sql(f"SELECT typeof(vec) FROM firestore_scan({scan_args(PREFIX + '_types')});")
+    assert_eq(rows[0], "DOUBLE[3]", "vector inferred from the server's own encoding")
+
+
+@test("types: binary bytes survive both directions unchanged")
+def _():
+    # Firestore transports bytes as base64. Anything that reads them through a
+    # VARCHAR cast renders each byte above 0x7f as a \xNN escape, and stores
+    # that text instead -- so a round trip is the check that matters, not just
+    # that the column is a BLOB.
+    collection = f"{PREFIX}_written"
+    DB.delete_collection(collection)
+    run_sql(
+        f"CALL firestore_insert('{collection}', "
+        "(SELECT 'blob' AS id, '\\x00\\x7F\\x80\\xFE\\xFF'::BLOB AS payload), document_id := 'id');"
+    )
+    rows = run_sql(f"SELECT hex(payload), octet_length(payload) FROM firestore_scan({scan_args(collection)});")
+    assert_eq(rows[0], "007F80FEFF,5", "every octet round-trips through Firestore")
+
+
+@test("types: a geo point keeps both coordinates")
+def _():
+    rows = run_sql(f"SELECT geo FROM firestore_scan({scan_args(PREFIX + '_types')});")
+    assert_true("37.4" in rows[0] and "-122.1" in rows[0], f"latitude and longitude both present: {rows[0]!r}")
+
+
+# ---- document weight --------------------------------------------------------
+
+
+@test("weight: a document close to the 1 MiB ceiling is read whole")
+def _():
+    collection = f"{PREFIX}_huge"
+    rows = run_sql(f"SELECT length(blob) FROM firestore_scan({scan_args(collection)});")
+    assert_eq(int(rows[0]), 900_000, "the whole document comes back")
+
+
+@test("weight: a heavy collection is paged smaller rather than failing")
+def _():
+    # The byte budget exists so a page of heavy documents does not have to be
+    # held in memory at the requested page size. Squeezing it makes the policy
+    # shrink; the scan still has to return everything.
+    collection = f"{PREFIX}_fat"
+    rows = run_sql(
+        f"SELECT count(n) FROM firestore_scan({scan_args(collection)});",
+        ["SET firestore_page_byte_budget=1048576"],
+    )
+    assert_eq(int(rows[0]), 400, "a squeezed byte budget still reads the whole collection")
+
+
+# ---- writes -----------------------------------------------------------------
+
+
+@test("write: inserted documents come back with their values")
+def _():
+    # The mock answers every commit with an empty writeResults, so the write
+    # path is only ever exercised for real here.
+    collection = f"{PREFIX}_written"
+    DB.delete_collection(collection)
+    run_sql(
+        f"CALL firestore_insert('{collection}', ("
+        "SELECT 'w' || i AS id, i AS n, 'row-' || i AS label FROM range(5) t(i)"
+        "), document_id := 'id');"
+    )
+    stored = {doc["name"].rsplit("/", 1)[-1]: doc["fields"] for doc in DB.list_documents(collection)}
+    assert_eq(sorted(stored), [f"w{i}" for i in range(5)], "the explicit document ids were used")
+    assert_eq(stored["w3"]["label"]["stringValue"], "row-3", "string values round-trip")
+    assert_eq(int(stored["w3"]["n"]["integerValue"]), 3, "integer values round-trip")
+
+
+@test("write: a batch larger than one commit is written completely")
+def _():
+    # Firestore caps a commit at 500 writes, so anything above that has to be
+    # split. An off-by-one there loses documents silently.
+    collection = f"{PREFIX}_written"
+    DB.delete_collection(collection)
+    run_sql(
+        f"CALL firestore_insert('{collection}', ("
+        "SELECT 'b' || lpad(i::VARCHAR, 4, '0') AS id, i AS n FROM range(1200) t(i)"
+        "), document_id := 'id');"
+    )
+    assert_eq(DB.aggregate_count(collection), 1200, "every document of an over-sized batch was written")
+
+
+@test("write: a scan reads back exactly what was written")
+def _():
+    collection = f"{PREFIX}_written"
+    DB.delete_collection(collection)
+    run_sql(
+        f"CALL firestore_insert('{collection}', ("
+        "SELECT 'r' || i AS id, i AS n FROM range(50) t(i)"
+        "), document_id := 'id');"
+    )
+    rows = run_sql(
+        f"SELECT count(*), count(DISTINCT __document_id), sum(n) FROM firestore_scan({scan_args(collection)});"
+    )
+    assert_eq(rows[0], f"50,50,{sum(range(50))}", "the scan agrees with what was inserted")
+
+
+@test("write: deleting a document removes it")
+def _():
+    collection = f"{PREFIX}_written"
+    DB.delete_collection(collection)
+    run_sql(
+        f"CALL firestore_insert('{collection}', ("
+        "SELECT 'd' || i AS id, i AS n FROM range(4) t(i)"
+        "), document_id := 'id');"
+    )
+    run_sql(f"CALL firestore_delete('{collection}', 'd2');")
+    assert_eq(sorted(DB.document_ids(collection)), ["d0", "d1", "d3"], "only the named document was deleted")
 
 
 # ================================================================ runner
