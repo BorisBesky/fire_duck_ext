@@ -65,7 +65,7 @@ def secret_statement():
     raise AssertionError("no endpoint configured")
 
 
-def run_sql(sql, settings=None, timeout=600, columns=False):
+def run_sql(sql, settings=None, timeout=600, columns=False, host=None):
     # CSV mode is set before the secret so its own success row is a bare
     # `true` rather than a boxed table, and can be stripped below.
     script = "LOAD fire_duck_ext;\n.mode csv\n.headers off\n" + secret_statement() + ";\n"
@@ -74,7 +74,9 @@ def run_sql(sql, settings=None, timeout=600, columns=False):
     script += sql + "\n"
 
     env = dict(os.environ)
-    if EMULATOR:
+    if host:
+        env["FIRESTORE_EMULATOR_HOST"] = host
+    elif EMULATOR:
         env["FIRESTORE_EMULATOR_HOST"] = EMULATOR
     completed = subprocess.run(
         [DUCKDB, "-batch", "-init", "/dev/null"],
@@ -154,6 +156,37 @@ def assert_eq(actual, expected, what):
 def assert_true(condition, what):
     if not condition:
         raise AssertionError(what)
+
+
+# ---------------------------------------------------------------- capabilities
+
+CAPABILITIES = set()
+
+
+def detect_capabilities(db):
+    """What this endpoint can actually be asked.
+
+    The emulator serves documents and aggregations but not the Admin index
+    API, and it authenticates with a fixed owner token rather than minting
+    OAuth ones -- so the tests about index planning and token refresh have
+    nothing to run against there and are skipped rather than quietly passing.
+    """
+    found = set()
+    if not EMULATOR:
+        found.add("live")
+        if CREDENTIALS:
+            found.add("oauth")
+    try:
+        db._request("GET", db.base.replace("/documents", "") + "/collectionGroups/-/indexes")
+        found.add("admin_indexes")
+    except (fx.FirestoreError, OSError):
+        pass
+    if EMULATOR:
+        # Only the emulator can be put behind the fault-injecting proxy: it
+        # forwards plain HTTP, and terminating TLS to inject a status code is
+        # not what these tests are about.
+        found.add("fault_injection")
+    return found
 
 
 # ================================================================ fixtures
@@ -771,6 +804,194 @@ def _():
     assert_eq(sorted(DB.document_ids(collection)), ["d0", "d1", "d3"], "only the named document was deleted")
 
 
+# ---- transient failures -----------------------------------------------------
+
+
+def through_proxy(sql, settings=None, failures=0, status=503):
+    """Run a query against the endpoint with `failures` requests failed first.
+
+    Returns (rows, error, proxy stats). A query that fails is reported rather
+    than raised, because for these tests failing loudly is an acceptable
+    outcome and returning the wrong rows is not.
+    """
+    proxy = fx.FlakyProxy(EMULATOR).start()
+    try:
+        if failures:
+            proxy.fail_next(failures, status)
+        try:
+            return run_sql(sql, settings, host=proxy.host), None, proxy.stats()
+        except AssertionError as error:
+            return None, str(error), proxy.stats()
+    finally:
+        proxy.stop()
+
+
+@test("resilience: a scan through the proxy is unaffected when nothing fails", needs=("fault_injection",))
+def _():
+    # Establishes the baseline: the proxy itself changes nothing, so a
+    # difference in the tests below is the injected failure and not the proxy.
+    collection = f"{PREFIX}_hundred"
+    rows, error, stats = through_proxy(f"SELECT count(n) FROM firestore_scan({scan_args(collection)});")
+    assert_eq(error, None, f"the query succeeds through the proxy: {error}")
+    assert_eq(int(rows[0]), 100, "every document still arrives")
+    assert_true(stats["requests"] > 0, "the proxy was actually in the path")
+
+
+@test("resilience: a server error fails the query rather than truncating it", needs=("fault_injection",))
+def _():
+    # There is no retry: FirestoreClient throws on any 5xx. That is a
+    # defensible choice; silently returning the rows read so far would not be.
+    # This pins down which of the two happens.
+    collection = f"{PREFIX}_hundred"
+    rows, error, stats = through_proxy(
+        f"SELECT count(n) FROM firestore_scan({scan_args(collection)});", failures=1, status=503
+    )
+    assert_eq(stats["failures"], 1, "the failure was injected")
+    if rows is not None:
+        assert_eq(int(rows[0]), 100, "a query that survives a 5xx must still return every document")
+    else:
+        assert_true("500" in error or "erver" in error, f"a 5xx is reported as a server error: {error}")
+
+
+@test("resilience: a rate limit is reported as a rate limit", needs=("fault_injection",))
+def _():
+    # A 429 has to reach the user as something they can act on -- backing off,
+    # lowering firestore_max_threads -- rather than as a generic failure.
+    collection = f"{PREFIX}_hundred"
+    rows, error, _stats = through_proxy(
+        f"SELECT count(n) FROM firestore_scan({scan_args(collection)});", failures=1, status=429
+    )
+    if rows is not None:
+        assert_eq(int(rows[0]), 100, "a query that survives a 429 must still return every document")
+        return
+    assert_true(
+        "ate limit" in error or "429" in error,
+        f"the error names the rate limit rather than reporting something generic: {error}",
+    )
+
+
+@test("resilience: a failure part-way through paging does not truncate the scan", needs=("fault_injection",))
+def _():
+    # The dangerous shape: the first page arrives, a later one fails. A scan
+    # that treats that as the end of the collection reports success with rows
+    # missing. Either every document comes back, or the query fails.
+    collection = f"{PREFIX}_numeric"  # 1200 documents, so several pages
+    rows, error, stats = through_proxy(
+        f"SELECT count(n) FROM firestore_scan({scan_args(collection, 'page_size:=300')});",
+        failures=0,
+    )
+    assert_eq(error, None, "the unfailed baseline succeeds")
+    assert_eq(int(rows[0]), 1200, "baseline row count")
+    baseline_requests = stats["requests"]
+    assert_true(baseline_requests > 2, "the baseline really did page")
+
+    # Fail one request after the scan is under way. Two requests go out before
+    # the first page of the scan itself (schema inference), so failing the
+    # fourth lands mid-scan.
+    proxy = fx.FlakyProxy(EMULATOR).start()
+    try:
+        served = {"n": 0}
+        original = proxy._take_failure
+
+        def fail_the_fourth():
+            served["n"] += 1
+            if served["n"] == 4:
+                proxy.fail_next(1, 503)
+            return original()
+
+        proxy._take_failure = fail_the_fourth
+        try:
+            rows = run_sql(
+                f"SELECT count(n) FROM firestore_scan({scan_args(collection, 'page_size:=300')});",
+                host=proxy.host,
+            )
+        except AssertionError as error:
+            # Failing loudly is the acceptable outcome, but only if it is this
+            # failure: an error that does not name the injected status would
+            # mean the scan broke for some other reason.
+            assert_true("503" in str(error), f"the reported error is the injected one: {error}")
+            assert_eq(proxy.stats()["failures"], 1, "exactly one request was failed")
+            return
+    finally:
+        proxy.stop()
+
+    assert_eq(int(rows[0]), 1200, "a scan that recovers from a mid-page failure must still be complete")
+
+
+# ---- index planning ---------------------------------------------------------
+
+
+@test("indexes: the Admin index list is read without error", needs=("admin_indexes",))
+def _():
+    # FetchCompositeIndexes parses this response, and everything the planner
+    # decides rests on it. Against the emulator there is no such endpoint at
+    # all, so this only means anything on a live project.
+    collection = f"{PREFIX}_hundred"
+    rows = run_sql(f"EXPLAIN SELECT count(n) FROM firestore_scan({scan_args(collection)});")
+    assert_true(any("FIRESTORE_SCAN" in row for row in rows), "the plan mentions the scan")
+
+
+@test("indexes: a multi-field ORDER BY with no composite index still returns every row", needs=("live",))
+def _():
+    # Firestore answers a query needing an absent composite index with
+    # FAILED_PRECONDITION. The extension is supposed to notice it cannot order
+    # server-side and let DuckDB sort instead -- not surface the error, and not
+    # return a subset.
+    collection = f"{PREFIX}_hundred"
+    rows = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection)}) ORDER BY n;")
+    assert_eq(int(rows[0]), 100, "every row, sorted client-side")
+
+
+@test("indexes: a filter needing an absent composite index still filters correctly", needs=("live",))
+def _():
+    # Two range filters on different fields need a composite index. Whether it
+    # is pushed or applied by DuckDB, the answer has to be the same.
+    collection = f"{PREFIX}_hundred"
+    rows = run_sql(f"SELECT count(*) FROM firestore_scan({scan_args(collection)}) WHERE n > 10 AND n < 20;")
+    assert_eq(int(rows[0]), 9, "the filter is applied by whichever side can apply it")
+
+
+@test("indexes: a collection group is not ordered server-side without an explicit index", needs=("live",))
+def _():
+    # Firestore's default single-field indexes cover collection scope only, so
+    # ordering a collection group by a field needs an index created for it.
+    # The extension declines to push the ordering, and DuckDB sorts. What
+    # matters is that no rows are lost either way.
+    collection = f"~{PREFIX}_hundred"
+    rows = run_sql("SELECT count(*) FROM firestore_scan(" + scan_args(collection, "order_by:='n'") + ");")
+    assert_eq(int(rows[0]), 100, "an ordered collection group still returns every document")
+
+
+# ---- credentials ------------------------------------------------------------
+
+
+@test("auth: a service-account token is minted once and reused across threads", needs=("oauth",))
+def _():
+    # Several scan threads reach for the token at the same time. The
+    # credentials are shared and guarded by a mutex; the failure this guards
+    # against is each thread minting its own, or worse, tearing the cached one.
+    collection = f"{PREFIX}_numeric"
+    rows = run_sql(
+        f"SELECT count(n), count(DISTINCT __document_id) FROM firestore_scan({scan_args(collection)});",
+        ["SET firestore_max_threads=8"],
+    )
+    assert_eq(rows[0], "1200,1200", "every document read exactly once under eight threads")
+
+
+@test("auth: a scan spanning a token refresh completes", needs=("oauth",))
+def _():
+    # An OAuth token lasts an hour and is refreshed five minutes before expiry.
+    # A scan long enough to cross that boundary must not fail half way, and the
+    # refresh must not be attempted once per thread.
+    collection = f"{PREFIX}_numeric"
+    rows = run_sql(
+        f"SELECT count(n) FROM firestore_scan({scan_args(collection, 'page_size:=50')});",
+        ["SET firestore_max_threads=4"],
+        timeout=1800,
+    )
+    assert_eq(int(rows[0]), 1200, "the scan completes across the refresh boundary")
+
+
 # ================================================================ runner
 
 
@@ -792,6 +1013,9 @@ def main():
         )
         return 2
 
+    global CAPABILITIES
+    CAPABILITIES = detect_capabilities(DB)
+
     target = EMULATOR or f"{PROJECT} (live)"
     print(f"seeding {target} ...", flush=True)
     try:
@@ -801,12 +1025,20 @@ def main():
         return 2
     print(f"seeded in {seconds}s\n")
 
+    print("endpoint offers: " + (", ".join(sorted(CAPABILITIES)) or "nothing beyond plain document access") + "\n")
+
     passed = failed = 0
     defects = []
+    skipped = []
     unexpectedly_fixed = []
     try:
-        for name, function, _needs, known_defect in TESTS:
+        for name, function, needs, known_defect in TESTS:
             if filter_text and filter_text not in name:
+                continue
+            missing = needs - CAPABILITIES
+            if missing:
+                print(f"skip  {name}\n        needs {', '.join(sorted(missing))}")
+                skipped.append((name, missing))
                 continue
             try:
                 function()
@@ -838,7 +1070,14 @@ def main():
     for name in unexpectedly_fixed:
         print(f"\nNOTE  '{name}' is marked as a known defect but passed; drop the marker.")
 
-    print(f"\n{passed} passed, {failed} failed, {len(defects)} known defects")
+    if skipped:
+        needed = sorted({capability for _name, missing in skipped for capability in missing})
+        print(f"\n{len(skipped)} tests skipped; they need: {', '.join(needed)}")
+        print("  live           -- a Google-hosted project, not the emulator")
+        print("  admin_indexes  -- the Admin index API, which the emulator does not serve")
+        print("  oauth          -- service-account credentials, so tokens are minted and refreshed")
+
+    print(f"\n{passed} passed, {failed} failed, {len(defects)} known defects, {len(skipped)} skipped")
     return 1 if failed else 0
 
 

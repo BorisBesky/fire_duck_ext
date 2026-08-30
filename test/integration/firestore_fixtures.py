@@ -17,11 +17,14 @@ Two things live here:
     rather than only with itself.
 """
 
+import http.client
 import json
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The database id appears in two forms and they are not interchangeable:
 # a URL path needs `(default)` percent-encoded, while a document's resource
@@ -250,3 +253,117 @@ def from_environment():
         api_key=os.environ.get("FIRESTORE_TEST_API_KEY") or None,
         secure=True,
     )
+
+
+# ---------------------------------------------------------------- fault injection
+
+
+class FlakyProxy:
+    """An HTTP proxy in front of Firestore that can fail requests on demand.
+
+    Rate limits and transient server errors are part of talking to a real
+    Firestore, and they cannot be summoned on request. This sits between the
+    extension and a real endpoint, forwards everything unchanged, and fails a
+    chosen number of requests with a chosen status -- so the client's behaviour
+    under a 429 or a 503 is exercised against real traffic rather than a
+    hand-written stub.
+
+    Only plain HTTP upstreams are supported, which in practice means the
+    emulator: proxying TLS would mean terminating it, and the point here is the
+    client's reaction to a status code, not the transport.
+    """
+
+    def __init__(self, upstream_host):
+        self.upstream_host = upstream_host
+        self.fail_status = 0
+        self.fail_remaining = 0
+        self.failures_served = 0
+        self.requests_served = 0
+        self._lock = threading.Lock()
+        self._server = None
+        self._thread = None
+
+    @property
+    def host(self):
+        return f"127.0.0.1:{self._server.server_address[1]}"
+
+    def fail_next(self, count, status=503):
+        with self._lock:
+            self.fail_remaining = count
+            self.fail_status = status
+            self.failures_served = 0
+
+    def stats(self):
+        with self._lock:
+            return {"requests": self.requests_served, "failures": self.failures_served}
+
+    def reset(self):
+        with self._lock:
+            self.requests_served = 0
+            self.failures_served = 0
+            self.fail_remaining = 0
+
+    def _take_failure(self):
+        with self._lock:
+            self.requests_served += 1
+            if self.fail_remaining <= 0:
+                return 0
+            self.fail_remaining -= 1
+            self.failures_served += 1
+            return self.fail_status
+
+    def start(self):
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _forward(self):
+                status = proxy._take_failure()
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else None
+                if status:
+                    payload = json.dumps(
+                        {"error": {"code": status, "message": "injected failure", "status": "UNAVAILABLE"}}
+                    ).encode()
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                connection = http.client.HTTPConnection(proxy.upstream_host, timeout=120)
+                headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+                connection.request(self.command, self.path, body=body, headers=headers)
+                upstream = connection.getresponse()
+                payload = upstream.read()
+                self.send_response(upstream.status)
+                for key, value in upstream.getheaders():
+                    if key.lower() in ("transfer-encoding", "content-length", "connection"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                connection.close()
+
+            do_GET = _forward
+            do_POST = _forward
+            do_PATCH = _forward
+            do_DELETE = _forward
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None

@@ -228,6 +228,19 @@ CREATE SECRET emulator (
 );
 ```
 
+`show_missing:=true` lists documents that exist only to parent a subcollection,
+which the emulator treats as a metadata operation and refuses without admin
+credentials. An API key sends no `Authorization` header at all, so pass the
+emulator's owner token instead:
+
+```sql
+CREATE SECRET emulator (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    ID_TOKEN 'owner'
+);
+```
+
 ## Functions
 
 | Function | Description |
@@ -827,6 +840,41 @@ npm install -g firebase-tools
 firebase emulators:exec --only firestore --project test-project \
     "./test/scripts/run_integration_tests.sh"
 ```
+
+### Large-collection tests
+
+Paging, projection, count and parallel-scan behaviour is asserted at the
+request level against a mock Firestore, so a collection of hundreds of
+thousands of documents exists instantly and every request's page size is
+recorded:
+
+```bash
+./test/scripts/run_large_collection_tests.sh
+```
+
+### Validation against a real Firestore
+
+The mock can only confirm the extension agrees with what this project believes
+Firestore does. These tests check that belief against a server -- cursor
+semantics, sort order, phantom documents, aggregation bounds, value encodings,
+and the write path:
+
+```bash
+./test/scripts/run_real_firestore_tests.sh
+```
+
+That starts the emulator and runs everything the emulator can answer. Tests
+that need a Google-hosted project -- index planning, OAuth token refresh -- are
+skipped and say so. To run those, point the file at a live project:
+
+```bash
+FIRESTORE_TEST_PROJECT=my-project \
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json \
+    python3 test/integration/real_firestore.py
+```
+
+Fixtures are written under the `fdx_validation_` prefix and deleted afterwards;
+set `FDX_KEEP_DATA=1` to keep them.
 
 ## License
 
