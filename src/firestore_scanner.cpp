@@ -448,6 +448,20 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		return std::move(result);
 	}
 
+	// __document_id is this extension's name for the document's resource name,
+	// which Firestore calls __name__. An ordering has to go out under the
+	// server's name: Firestore drops documents that lack the ordering field,
+	// and no document has a field called __document_id, so ordering by it
+	// returned an empty scan rather than the collection in id order.
+	//
+	// Document-path scans returned above. There __document_id names a
+	// subcollection rather than a document, and is sorted locally.
+	for (auto &field : result->parsed_order_by) {
+		if (field.field_path == "__document_id") {
+			field.field_path = "__name__";
+		}
+	}
+
 	// An explicit schema means no inference at all -- and no bind-time sampling
 	// request. column_names/column_types were filled by ParseColumnsOverride.
 	if (result->has_columns_override) {

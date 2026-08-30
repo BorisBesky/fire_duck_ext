@@ -376,15 +376,17 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	add_param("pageSize", std::to_string(ClampFirestorePageSize(query.page_size)));
 
-	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
-	// Only send showMissing=true when talking to production Firestore.
-	// Firestore API does not allow showMissing and orderBy together (HTTP 400),
-	// so skip showMissing when an order_by is specified.
+	// Firestore does not allow showMissing together with orderBy (HTTP 400),
+	// so skip it when the query is ordered.
+	//
+	// The emulator was previously excluded here as not supporting showMissing.
+	// It does: listing missing documents is a metadata operation, so it needs
+	// admin credentials, and an unauthenticated request is refused rather than
+	// answered. Skipping it silently dropped the phantom documents the caller
+	// explicitly asked for; sending it means an emulator without admin
+	// credentials says so instead.
 	if (query.show_missing) {
-		if (!GetEmulatorHost().empty()) {
-			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does "
-			             "not support it.");
-		} else if (query.order_by.has_value()) {
+		if (query.order_by.has_value()) {
 			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow "
 			             "showMissing together with orderBy; ordered scans will not include phantom documents.");
 		} else {
