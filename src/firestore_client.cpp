@@ -376,15 +376,17 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 
 	add_param("pageSize", std::to_string(ClampFirestorePageSize(query.page_size)));
 
-	// Note: The Firestore Emulator does not support showMissing (returns 0 results).
-	// Only send showMissing=true when talking to production Firestore.
-	// Firestore API does not allow showMissing and orderBy together (HTTP 400),
-	// so skip showMissing when an order_by is specified.
+	// Firestore does not allow showMissing together with orderBy (HTTP 400),
+	// so skip it when the query is ordered.
+	//
+	// The emulator was previously excluded here as not supporting showMissing.
+	// It does: listing missing documents is a metadata operation, so it needs
+	// admin credentials, and an unauthenticated request is refused rather than
+	// answered. Skipping it silently dropped the phantom documents the caller
+	// explicitly asked for; sending it means an emulator without admin
+	// credentials says so instead.
 	if (query.show_missing) {
-		if (!GetEmulatorHost().empty()) {
-			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because the Firestore Emulator does "
-			             "not support it.");
-		} else if (query.order_by.has_value()) {
+		if (query.order_by.has_value()) {
 			FS_LOG_DEBUG("show_missing=true requested but showMissing is skipped because Firestore does not allow "
 			             "showMissing together with orderBy; ordered scans will not include phantom documents.");
 		} else {
@@ -897,10 +899,10 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 	}
 }
 
-std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
-                                                                              int64_t sample_size, bool show_missing,
-                                                                              FirestoreMapEncoding map_encoding,
-                                                                              int64_t page_size) {
+std::vector<std::pair<std::string, LogicalType>>
+FirestoreClient::InferSchema(const std::string &collection, int64_t sample_size, bool show_missing,
+                             FirestoreMapEncoding map_encoding, int64_t page_size,
+                             FirestoreSchemaAccumulator::OrderingSafety *ordering_safety) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
 	const bool is_collection_group = !collection.empty() && collection[0] == '~';
@@ -938,6 +940,10 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		}
 
 		if (page.documents.empty()) {
+			// An empty page is the end of the collection just as much as a
+			// response that says so, and the ordering verdict below depends on
+			// telling "ran out of documents" from "ran out of sample".
+			has_more_pages = false;
 			break;
 		}
 		for (const auto &document : page.documents) {
@@ -949,6 +955,13 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		has_more_pages = page.HasMorePages();
 	}
 
+	// The sample is exhaustive when the collection ran out before the sample
+	// did -- which is what turns the ordering verdict below from a statement
+	// about the sample into one about the data.
+	if (ordering_safety != nullptr) {
+		*ordering_safety = accumulator.Ordering(!has_more_pages);
+	}
+
 	// Convert the summary to DuckDB types.
 	std::vector<std::pair<std::string, LogicalType>> result;
 	for (const auto &entry : accumulator.Fields()) {
@@ -956,10 +969,10 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		const auto &summary = entry.second;
 
 		if (summary.type_name == "arrayValue") {
-			// Element type by majority of the elements actually sampled.
+			// The narrowest element type every sampled element fits into.
 			LogicalType element_type = LogicalType::VARCHAR; // Default
 			const std::string best_element_type =
-			    FirestoreSchemaAccumulator::MajorityElementType(summary.array_element_types);
+			    FirestoreSchemaAccumulator::WidenElementTypes(summary.array_element_types);
 			if (best_element_type == "integerValue")
 				element_type = LogicalType::BIGINT;
 			else if (best_element_type == "doubleValue")

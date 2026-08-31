@@ -177,6 +177,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "document ids spread over the key space, such as Firestore auto-ids",
 	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultMaxThreads),
 	                          FirestoreSettings::SetMaxScanThreads);
+	config.AddExtensionOption("firestore_orderby_pushdown",
+	                          "Whether a SQL ORDER BY may be sent to Firestore. Off by default, because Firestore's "
+	                          "ordering is not SQL's: it omits documents that lack the ordering field, sorts nulls "
+	                          "first, and orders across types by its own precedence, so pushing the sort down "
+	                          "changes which rows a query returns. The order_by:= parameter is unaffected",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(FirestoreSettings::kDefaultOrderByPushdown));
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);

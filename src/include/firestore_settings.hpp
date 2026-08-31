@@ -110,6 +110,39 @@ struct FirestoreSettings {
 		parameter = Value::BIGINT(NormalizeMaxThreads(parameter));
 	}
 
+	// Whether a SQL ORDER BY may be sent to Firestore.
+	//
+	// Firestore's ordering is not SQL's, so pushing the sort down changes what
+	// a query returns rather than only how it is arranged. Firestore omits
+	// documents that lack the ordering field, sorts null below every other
+	// value, and orders across types by its own precedence -- while a field
+	// holding more than one type reaches DuckDB as VARCHAR and compares as a
+	// string. With a LIMIT the two disagree about which rows survive.
+	//
+	// On by default, because the optimizer checks each ordering field against
+	// the documents sampled for the schema and declines the pushdown -- with a
+	// warning naming the field -- wherever the two orderings would disagree.
+	// The saving is real where they agree: a LIMIT 700 over 3000 documents
+	// fetches 1700 instead of 4000. Turning it off keeps every sort in DuckDB,
+	// including the ones the sample judged safe.
+	//
+	// A sort is only ever sent with a LIMIT. DuckDB re-sorts the rows either
+	// way, so an ordered request without one fetches exactly the same
+	// documents and only risks losing some.
+	//
+	// The named `order_by:=` parameter is unaffected: asking for the server's
+	// ordering explicitly is already a choice. So is orderby_pushdown:=true,
+	// which skips the safety check.
+	static constexpr bool kDefaultOrderByPushdown = true;
+
+	static bool OrderByPushdown(const ClientContext &context) {
+		Value pushdown_value;
+		if (context.TryGetCurrentSetting("firestore_orderby_pushdown", pushdown_value)) {
+			return !pushdown_value.IsNull() && BooleanValue::Get(pushdown_value);
+		}
+		return kDefaultOrderByPushdown;
+	}
+
 	// Fewer than one thread is not a scan; cap the top so a stray setting
 	// cannot open an unbounded number of connections.
 	static int64_t NormalizeMaxThreads(const Value &value) {

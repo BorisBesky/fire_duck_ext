@@ -168,7 +168,10 @@ VariantValue FirestoreValueToVariant(const json &fv) {
 		return VariantValue(Value(fv["referenceValue"].get<std::string>()));
 	}
 	if (fv.contains("bytesValue")) {
-		return VariantValue(Value::BLOB(Base64Decode(fv["bytesValue"].get<std::string>())));
+		// BLOB_RAW takes the decoded octets as they are. Value::BLOB(string)
+		// would cast instead, reading \x escapes and rejecting any byte above
+		// 0x7f -- which failed the whole query on ordinary binary data.
+		return VariantValue(Value::BLOB_RAW(Base64Decode(fv["bytesValue"].get<std::string>())));
 	}
 	if (fv.contains("geoPointValue")) {
 		const auto &geo = fv["geoPointValue"];
@@ -477,7 +480,9 @@ Value FirestoreValueToDuckDB(const json &fv, const LogicalType &target_type, Fir
 		std::string b64 = fv["bytesValue"].get<std::string>();
 		// Decode base64 to binary data
 		std::string decoded = Base64Decode(b64);
-		return Value::BLOB(decoded);
+		// The octets are already binary; casting them as a string would reject
+		// every byte above 0x7f.
+		return Value::BLOB_RAW(decoded);
 	}
 
 	// Unknown type - return as string
@@ -548,8 +553,10 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
 	}
 
 	case LogicalTypeId::BLOB: {
-		// Base64 encode the binary data for Firestore
-		std::string blob_data = value.GetValue<std::string>();
+		// Base64 encode the binary data for Firestore. As on the read side,
+		// StringValue::Get reads the octets themselves; casting to VARCHAR
+		// first would encode the \xNN escape text rather than the bytes.
+		const auto &blob_data = StringValue::Get(value);
 		return {{"bytesValue", Base64Encode(blob_data)}};
 	}
 
@@ -820,8 +827,11 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 		break;
 	}
 	case LogicalTypeId::BLOB: {
-		// Handle BLOB type (bytesValue)
-		auto blob_data = converted.GetValue<std::string>();
+		// Handle BLOB type (bytesValue). StringValue::Get reads the stored
+		// octets; GetValue<std::string> would cast the blob to VARCHAR first,
+		// which renders every byte above 0x7f as a \xNN escape and stored the
+		// escape text as the value.
+		const auto &blob_data = StringValue::Get(converted);
 		FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, blob_data);
 		break;
 	}

@@ -125,7 +125,8 @@ FD_TEST("accumulator: array element types are counted across documents") {
 	const auto &counts = accumulator.Fields().at("tags").array_element_types;
 	FD_REQUIRE_EQ(counts.at("integerValue"), 2);
 	FD_REQUIRE_EQ(counts.at("stringValue"), 1);
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("integerValue"));
+	// Integers outnumber the string, but the string still has to be readable.
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("stringValue"));
 }
 
 FD_TEST("accumulator: explicit nulls do not vote for an element type") {
@@ -136,7 +137,7 @@ FD_TEST("accumulator: explicit nulls do not vote for an element type") {
 
 	const auto &counts = accumulator.Fields().at("tags").array_element_types;
 	FD_REQUIRE_EQ(counts.size(), 1u);
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("doubleValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("doubleValue"));
 }
 
 FD_TEST("accumulator: an arrayValue with no values array is still typed as an array") {
@@ -146,15 +147,42 @@ FD_TEST("accumulator: an arrayValue with no values array is still typed as an ar
 	FD_REQUIRE(accumulator.Fields().at("tags").array_element_types.empty());
 }
 
-FD_TEST("accumulator: majority element type falls back to string when nothing was learned") {
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType({}), std::string("stringValue"));
+FD_TEST("accumulator: an element type falls back to string when nothing was learned") {
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({}), std::string("stringValue"));
 }
 
-FD_TEST("accumulator: an element type tie resolves to the alphabetically first name") {
-	// Deterministic beats arbitrary: the same collection must infer the same
-	// schema on every bind, cache hit or not.
-	std::map<std::string, int64_t> counts {{"stringValue", 3}, {"integerValue", 3}};
-	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::MajorityElementType(counts), std::string("integerValue"));
+FD_TEST("accumulator: one element type is used as it is") {
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"integerValue", 4}}), std::string("integerValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"booleanValue", 1}}), std::string("booleanValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"timestampValue", 2}}),
+	              std::string("timestampValue"));
+}
+
+FD_TEST("accumulator: integers and doubles widen to double") {
+	// A number column holds both, so this mix does not have to become text.
+	std::map<std::string, int64_t> counts {{"integerValue", 9}, {"doubleValue", 1}};
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("doubleValue"));
+}
+
+FD_TEST("accumulator: any other mix widens to string") {
+	// Whichever type is more common, the others still have to be readable:
+	// choosing one of them made the scan throw on every element of the rest.
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"integerValue", 3}, {"stringValue", 3}}),
+	              std::string("stringValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"booleanValue", 99}, {"integerValue", 1}}),
+	              std::string("stringValue"));
+	FD_REQUIRE_EQ(
+	    FirestoreSchemaAccumulator::WidenElementTypes({{"doubleValue", 1}, {"integerValue", 1}, {"stringValue", 1}}),
+	    std::string("stringValue"));
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes({{"mapValue", 2}, {"stringValue", 1}}),
+	              std::string("stringValue"));
+}
+
+FD_TEST("accumulator: a type counted zero times is not a type that was seen") {
+	// An entry can exist with a zero count; treating it as present would widen
+	// a perfectly uniform list to string for no reason.
+	std::map<std::string, int64_t> counts {{"integerValue", 5}, {"stringValue", 0}};
+	FD_REQUIRE_EQ(FirestoreSchemaAccumulator::WidenElementTypes(counts), std::string("integerValue"));
 }
 
 // ---------------------------------------------------------------- vectors
@@ -208,4 +236,99 @@ FD_TEST("accumulator: memory is bounded by field count, not document count") {
 	}
 	FD_REQUIRE_EQ(accumulator.DocumentsSeen(), 50000);
 	FD_REQUIRE_EQ(accumulator.Fields().size(), 2u);
+}
+
+// ---------------------------------------------------------------- ordering safety
+
+FD_TEST("ordering: a field on every document with one type is safe") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"score", {{"integerValue", "2"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE(safety.IsSafe("score"));
+	FD_REQUIRE(safety.exhaustive);
+	FD_REQUIRE_EQ(safety.documents_sampled, 2);
+}
+
+FD_TEST("ordering: a field missing from some documents is not safe") {
+	// Firestore returns no document that lacks the field it orders by, so this
+	// is the case that silently drops rows.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"other", {{"integerValue", "2"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("score"));
+	FD_REQUIRE(safety.Explain("score").find("1 of 2") != std::string::npos);
+	FD_REQUIRE(safety.Explain("score").find("lacks the field") != std::string::npos);
+}
+
+FD_TEST("ordering: a field holding more than one type is not safe") {
+	// It reaches DuckDB as VARCHAR and compares as a string, while Firestore
+	// orders it by type precedence -- so a limit keeps different rows.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"v", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"v", {{"stringValue", "two"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("v"));
+	FD_REQUIRE(safety.Explain("v").find("more than one type") != std::string::npos);
+	FD_REQUIRE(safety.Explain("v").find("integerValue") != std::string::npos);
+}
+
+FD_TEST("ordering: an explicit null counts as a second type") {
+	// Firestore sorts null below every other value; DuckDB puts nulls last.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"v", {{"stringValue", "a"}}}});
+	accumulator.AddDocument(json {{"v", {{"nullValue", nullptr}}}});
+
+	FD_REQUIRE_FALSE(accumulator.Ordering(true).IsSafe("v"));
+}
+
+FD_TEST("ordering: a phantom document makes every field optional") {
+	// A document with no fields is one Firestore would drop from any ordered
+	// query, so nothing on the other documents can be safely ordered.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json::object());
+
+	FD_REQUIRE_FALSE(accumulator.Ordering(true).IsSafe("score"));
+}
+
+FD_TEST("ordering: __name__ is always safe") {
+	// The document's own key: every document has one, it is always a string,
+	// and it is never null.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	FD_REQUIRE(accumulator.Ordering(true).IsSafe("__name__"));
+}
+
+FD_TEST("ordering: a field the sample never saw is not safe, and says so") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("absent"));
+	FD_REQUIRE(safety.Explain("absent").find("not seen in any") != std::string::npos);
+}
+
+FD_TEST("ordering: a bounded sample reports itself as not exhaustive") {
+	// The verdict is only as good as the sample, and the caller has to be able
+	// to say so in a warning.
+	FirestoreSchemaAccumulator accumulator(1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	auto safety = accumulator.Ordering(false);
+	FD_REQUIRE_FALSE(safety.exhaustive);
+	FD_REQUIRE(safety.IsSafe("score"));
+}
+
+FD_TEST("ordering: an empty sample makes nothing safe") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE(safety.safe_fields.empty());
+	FD_REQUIRE_FALSE(safety.IsSafe("anything"));
+	FD_REQUIRE(safety.IsSafe("__name__"));
 }

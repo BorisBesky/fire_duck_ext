@@ -19,6 +19,9 @@ namespace duckdb {
 struct CachedSchemaEntry {
 	std::vector<std::pair<std::string, LogicalType>> schema;
 	std::shared_ptr<FirestoreIndexCache> index_cache;
+	// Which fields Firestore may be asked to sort by, learned from the same
+	// sample that produced the schema.
+	std::shared_ptr<FirestoreSchemaAccumulator::OrderingSafety> ordering_safety;
 	std::chrono::steady_clock::time_point cached_at;
 
 	bool IsExpired(int64_t ttl_seconds) const {
@@ -349,6 +352,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	scan_func.named_parameters["scan_limit"] = LogicalType::BIGINT;
 	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
+	scan_func.named_parameters["orderby_pushdown"] = LogicalType::BOOLEAN;
 	scan_func.named_parameters["map_encoding"] = LogicalType::VARCHAR;
 	scan_func.named_parameters["schema_sample_size"] = LogicalType::BIGINT;
 	scan_func.named_parameters["unmapped_column"] = LogicalType::BOOLEAN;
@@ -397,6 +401,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			result->parsed_order_by = ParseOrderByString(result->order_by.value());
 		} else if (kv.first == "show_missing") {
 			result->show_missing = kv.second.GetValue<bool>();
+		} else if (kv.first == "orderby_pushdown") {
+			result->orderby_pushdown = kv.second.GetValue<bool>();
 		} else if (kv.first == "map_encoding") {
 			result->map_encoding = ParseMapEncoding(StringUtil::Lower(kv.second.GetValue<string>()));
 		} else if (kv.first == "schema_sample_size") {
@@ -446,6 +452,20 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		names.push_back("__document_id");
 		return_types.push_back(LogicalType::VARCHAR);
 		return std::move(result);
+	}
+
+	// __document_id is this extension's name for the document's resource name,
+	// which Firestore calls __name__. An ordering has to go out under the
+	// server's name: Firestore drops documents that lack the ordering field,
+	// and no document has a field called __document_id, so ordering by it
+	// returned an empty scan rather than the collection in id order.
+	//
+	// Document-path scans returned above. There __document_id names a
+	// subcollection rather than a document, and is sorted locally.
+	for (auto &field : result->parsed_order_by) {
+		if (field.field_path == "__document_id") {
+			field.field_path = "__name__";
+		}
 	}
 
 	// An explicit schema means no inference at all -- and no bind-time sampling
@@ -508,6 +528,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 					result->column_types.push_back(col_type);
 				}
 
+				result->ordering_safety = it->second.ordering_safety;
+
 				// Also restore index cache if available
 				if (it->second.index_cache) {
 					result->index_cache = it->second.index_cache;
@@ -530,8 +552,10 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	// same page size as the scan itself.
 	const int64_t bind_page_size =
 	    result->page_size.has_value() ? result->page_size.value() : FirestoreSettings::PageSize(context);
-	auto schema =
-	    client.InferSchema(result->collection, sample_size, result->show_missing, result->map_encoding, bind_page_size);
+	FirestoreSchemaAccumulator::OrderingSafety ordering_safety;
+	auto schema = client.InferSchema(result->collection, sample_size, result->show_missing, result->map_encoding,
+	                                 bind_page_size, &ordering_safety);
+	result->ordering_safety = std::make_shared<FirestoreSchemaAccumulator::OrderingSafety>(std::move(ordering_safety));
 
 	// Check if collection exists (has documents)
 	if (schema.empty()) {
@@ -620,6 +644,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		CachedSchemaEntry entry;
 		entry.schema = schema;
 		entry.index_cache = result->index_cache;
+		entry.ordering_safety = result->ordering_safety;
 		entry.cached_at = std::chrono::steady_clock::now();
 		schema_cache[cache_key] = std::move(entry);
 		FS_LOG_DEBUG("Schema cached for: " + cache_key);
