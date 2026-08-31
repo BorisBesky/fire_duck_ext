@@ -301,7 +301,7 @@ SELECT * FROM firestore_scan('users', database:='my-other-db');
 | `scan_limit` | BIGINT | Maximum number of rows to fetch from Firestore. When combined with a `WHERE` clause, the limit is only enforced if filter pushdown succeeds; if pushdown fails, `scan_limit` is ignored so no matching rows are lost. SQL `LIMIT` can also be pushed down automatically, and named `scan_limit` takes precedence when both are present. |
 | `order_by` | VARCHAR | Server-side ordering. Specify one or more fields separated by commas, each optionally followed by `DESC` (e.g. `'score'`, `'score DESC'`, `'score DESC, name ASC'`). SQL `ORDER BY` can also be pushed down automatically, and named `order_by` takes precedence when both are present. Multi-field ordering requires a composite index. |
 | `show_missing` | BOOLEAN | Include phantom documents that have no fields but serve as parent paths for subcollections. Default: `true`. |
-| `orderby_pushdown` | BOOLEAN | Whether a SQL `ORDER BY` may be sent to Firestore for this scan, overriding `firestore_orderby_pushdown`. Default: the setting, which is `false`. See [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown). |
+| `orderby_pushdown` | BOOLEAN | `true` forces a SQL `ORDER BY` to Firestore for this scan, skipping the safety check; `false` keeps the sort in DuckDB. Default: the `firestore_orderby_pushdown` setting, with the check applied. See [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown). |
 | `map_encoding` | VARCHAR | How Firestore `map` fields are surfaced: `'wire'` (default), `'json'`, or `'variant'`. See [Map Encoding](#map-encoding). |
 | `schema_sample_size` | BIGINT | Documents sampled to infer the schema. Default `1000`; `-1` samples every document. Overrides the `firestore_schema_sample_size` setting. See [Schema Inference](#schema-inference-and-unmapped-fields). |
 | `unmapped_column` | BOOLEAN | Append a `__unmapped` column carrying any field not present in the inferred schema. Default: `false`. |
@@ -421,7 +421,7 @@ SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
 | `firestore_page_size` | `1000` | Documents fetched per round trip, clamped to Firestore's 1-1000 range. |
 | `firestore_page_byte_budget` | `67108864` | Uncompressed bytes a page may weigh before the scan requests fewer documents; `0` disables the guard. See [Large Collections](#large-collections). |
 | `firestore_max_threads` | `1` | Threads one scan may split across, reading separate key ranges. `1` (the default) disables parallel scanning; raise it only for collections whose document ids spread over the key space. Capped at 64. See [Large Collections](#large-collections). |
-| `firestore_orderby_pushdown` | `false` | Whether a SQL `ORDER BY` may be sent to Firestore. Off by default because Firestore's ordering is not SQL's — it omits documents lacking the ordering field, and sorts nulls and mixed types differently — so pushing the sort down changes which rows a query returns. `order_by:=` is unaffected. See [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown). |
+| `firestore_orderby_pushdown` | `true` | Whether a SQL `ORDER BY` may be sent to Firestore. Each ordering field is still checked against the sampled documents first, since Firestore omits documents lacking the ordering field and sorts nulls and mixed types differently; a field that would change the answer keeps its sort in DuckDB and logs a warning. Set `false` to disable the optimization entirely. `order_by:=` is unaffected. See [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown). |
 
 Sampling streams: each page is folded into the inferred schema and released, so
 `schema_sample_size:=-1` costs one page of memory rather than the whole
@@ -495,9 +495,9 @@ WHERE a.label < b.label;
 down to Firestore, reducing the number of documents fetched for sorted and top-N
 queries.
 
-> **`ORDER BY` pushdown is off by default** (`firestore_orderby_pushdown`), because
-> Firestore's ordering is not SQL's and sending the sort to the server changes
-> which rows a query returns:
+> **`ORDER BY` pushdown is checked before it is used.** Firestore's ordering is
+> not SQL's, and sending a sort to the server can change which rows a query
+> returns:
 >
 > - Firestore omits documents that do not have the ordering field. `ORDER BY v`
 >   over a collection where some documents lack `v` returns fewer rows — with no
@@ -506,22 +506,41 @@ queries.
 >   own precedence, while DuckDB sorts nulls last and compares a mixed-type field
 >   as `VARCHAR`. Under a `LIMIT` the two keep different rows.
 >
-> With the pushdown off, `ORDER BY` means what SQL says it means and DuckDB does
-> the sorting — which also means the `LIMIT` stays local, since a server-side
-> limit applied in the wrong order would cut the wrong rows.
+> Both are visible in the documents sampled to infer the schema, so the optimizer
+> checks each ordering field before pushing it. A field carried by every sampled
+> document, with a single type, is pushed. Anything else keeps the sort in DuckDB
+> and logs a warning naming the field and the evidence:
 >
-> Turn it on where the collection's shape makes the two orderings equivalent —
-> every document carrying the ordering field, with a single type — and the scan
-> stops at the limit instead of reading the collection:
->
-> ```sql
-> SET firestore_orderby_pushdown = true;                              -- session
-> SELECT * FROM firestore_scan('events', orderby_pushdown:=true);     -- one scan
+> ```
+> Not sending ORDER BY to Firestore for 'events': 340 of 1000 sampled documents
+> do not have it, and Firestore returns no document that lacks the field it is
+> ordered by, so ordering 'v' server-side would not return the rows this query
+> asks for. DuckDB will sort instead, which means reading the collection rather
+> than stopping at the LIMIT. This was judged from 1000 sampled documents; raise
+> firestore_schema_sample_size to widen it. Pass orderby_pushdown:=true to send
+> it anyway.
 > ```
 >
-> `order_by:=` is unaffected: asking for the server's ordering explicitly is
-> already a choice, and it keeps Firestore's semantics, including omitting
-> documents without the field.
+> The verdict is as good as the sample: a bounded sample can miss the one
+> document that would have made a field optional, and the warning says whether
+> the whole collection was sampled. `schema_sample_size:=-1` makes it certain.
+>
+> **A sort is only ever sent with a `LIMIT`.** DuckDB re-sorts the rows either
+> way, so an ordered request without one fetches exactly the same documents and
+> only risks losing some.
+>
+> `firestore_orderby_pushdown` (default `true`) turns the whole optimization off.
+> `orderby_pushdown:=true` on a scan *forces* it, skipping the safety check — for
+> callers who know their data better than the sample does:
+>
+> ```sql
+> SET firestore_orderby_pushdown = false;                            -- never push
+> SELECT * FROM firestore_scan('events', orderby_pushdown:=true);    -- push anyway
+> ```
+>
+> `order_by:=` is unaffected and unchecked: asking for the server's ordering
+> explicitly is already a choice, and it keeps Firestore's semantics, including
+> omitting documents without the field.
 
 Supported patterns, once enabled:
 

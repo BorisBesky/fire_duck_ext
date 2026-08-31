@@ -217,6 +217,71 @@ static bool TryExtractLimit(LogicalTopN &topn_op, FirestoreScanBindData &bind_da
 	return true;
 }
 
+// Whether sending this ORDER BY to Firestore would change the query's answer.
+//
+// Firestore's ordering is not SQL's. It returns only documents that carry the
+// ordering field, so ordering by an optional field drops rows -- with no LIMIT
+// needed. And it sorts null below everything and orders across types by its own
+// precedence, while a field holding more than one type reaches DuckDB as VARCHAR
+// and compares as a string, so under a LIMIT the two keep different rows.
+//
+// The sample taken for the schema already knows both: how many documents
+// carried each field, and how many types it held. Where it says a field is
+// present everywhere with one type, the two orderings agree and the sort can go
+// to the server. Where it does not, the sort stays in DuckDB and the reason is
+// logged once, naming the field -- a query that is slower than expected should
+// say why.
+//
+// Without a sample -- an explicit `columns` override -- nothing is known, so
+// nothing is safe. Passing orderby_pushdown:=true asks for Firestore's ordering
+// regardless, and is honoured without this check.
+static bool OrderingWouldChangeResults(LogicalGet &get, const std::vector<BoundOrderByNode> &order_nodes,
+                                       const FirestoreScanBindData &bind_data,
+                                       const std::vector<LogicalProjection *> &projections) {
+	if (bind_data.orderby_pushdown.has_value() && bind_data.orderby_pushdown.value()) {
+		return false; // Asked for explicitly; the caller owns the semantics.
+	}
+
+	const auto *safety = bind_data.ordering_safety.get();
+	if (safety == nullptr) {
+		FS_LOG_WARN("Not sending ORDER BY to Firestore for '" + bind_data.collection +
+		            "': no schema was sampled (an explicit `columns` override), so whether Firestore would return "
+		            "the same rows cannot be checked. DuckDB will sort instead. Pass orderby_pushdown:=true to send "
+		            "it anyway.");
+		return true;
+	}
+
+	for (const auto &order_node : order_nodes) {
+		if (order_node.expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+			return true; // Not a plain column; TryExtractOrderBy would decline anyway.
+		}
+		auto &colref = order_node.expression->Cast<BoundColumnRefExpression>();
+		idx_t col_idx;
+		if (!ResolveColumnThroughProjections(colref, get, projections, col_idx) || col_idx >= get.names.size()) {
+			return true;
+		}
+
+		std::string field_name = get.names[col_idx];
+		if (field_name == "__document_id") {
+			field_name = "__name__";
+		}
+		if (safety->IsSafe(field_name)) {
+			continue;
+		}
+
+		FS_LOG_WARN("Not sending ORDER BY to Firestore for '" + bind_data.collection +
+		            "': " + safety->Explain(field_name) + ", so ordering '" + field_name +
+		            "' server-side would not return the rows this query asks for. " +
+		            "DuckDB will sort instead, which means reading the collection rather than stopping at the LIMIT. " +
+		            (safety->exhaustive ? "Every document was sampled, so this is certain."
+		                                : "This was judged from " + std::to_string(safety->documents_sampled) +
+		                                      " sampled documents; raise firestore_schema_sample_size to widen it.") +
+		            " Pass orderby_pushdown:=true to send it anyway.");
+		return true;
+	}
+	return false;
+}
+
 // Recursively walk the logical plan tree top-down, tracking the nearest
 // LogicalOrder, LogicalLimit, and LogicalProjection ancestors. When we find
 // a LogicalGet for firestore_scan, inject the extracted ORDER BY / LIMIT
@@ -339,16 +404,21 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 				return;
 			}
 
-			// Only inject ORDER BY if named param was not already set, and only
-			// where the caller has asked for Firestore's ordering. Sending the
-			// sort to the server changes which rows come back -- Firestore
-			// omits documents lacking the ordering field -- so by default the
-			// sort stays in DuckDB. Declining it also stops the LIMIT going
-			// down, via sql_order_blocks_limit below: a server-side limit
-			// applied in the wrong order would cut the wrong rows.
+			// Only inject ORDER BY if the named param was not already set, the
+			// caller allows the pushdown, a LIMIT will ride along, and the
+			// sampled documents say Firestore would order the way DuckDB does.
+			//
+			// The LIMIT condition is what makes the pushdown worth anything:
+			// DuckDB re-sorts the rows either way, so an ordered request
+			// without a limit fetches exactly the same documents and only
+			// risks losing some. The safety check is what keeps it honest --
+			// see OrderingWouldChangeResults.
 			const auto *order_nodes =
 			    current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
-			if (bind_data.parsed_order_by.empty() && order_nodes && orderby_pushdown_allowed) {
+			const bool limit_would_ride_along =
+			    !bind_data.limit.has_value() && (current_limit != nullptr || current_topn != nullptr);
+			if (bind_data.parsed_order_by.empty() && order_nodes && orderby_pushdown_allowed &&
+			    limit_would_ride_along && !OrderingWouldChangeResults(get, *order_nodes, bind_data, projections)) {
 				if (TryExtractOrderBy(get, *order_nodes, bind_data, projections)) {
 					// Build EXPLAIN info
 					std::string info;

@@ -1010,49 +1010,94 @@ def _():
     assert_eq(int(rows[0]), 700, "rows from ORDER BY with LIMIT")
 
 
-@test("orderby pushdown: off by default, the whole collection is read and sorted here")
+@test("orderby pushdown: on by default, the limit bounds what is fetched")
 def _():
-    # Firestore omits documents that lack the ordering field and sorts by its
-    # own rules, so by default the sort stays in DuckDB -- which means the
-    # limit cannot go to the server either, and every document is fetched.
+    # f1 is on every document of this collection with one type, so Firestore
+    # would order it the way DuckDB does. The sort goes to the server and the
+    # limit with it, and the scan stops instead of reading all 3000.
     reset_stats()
     rows = run_sql(
         "SELECT count(*) FROM (SELECT * FROM firestore_scan("
         + scan_args("bench_flat_4_3000")
         + ") ORDER BY f1 LIMIT 700);"
     )
-    assert_eq(int(rows[0]), 700, "the query still returns 700 rows")
-    served = stats()["docs_served"]
-    if served < 3000:
-        raise AssertionError(f"expected the whole collection to be read, got {served} documents")
-
-
-@test("orderby pushdown: turning it on bounds what is fetched")
-def _():
-    # The round trips the setting exists to save: with the ordering sent to
-    # Firestore the limit goes with it, so the scan stops after 700 documents
-    # instead of reading 3000.
-    reset_stats()
-    rows = run_sql(
-        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
-        + scan_args("bench_flat_4_3000")
-        + ") ORDER BY f1 LIMIT 700);",
-        ["SET firestore_orderby_pushdown=true"],
-    )
-    assert_eq(int(rows[0]), 700, "the query still returns 700 rows")
+    assert_eq(int(rows[0]), 700, "the query returns 700 rows")
     served = stats()["docs_served"]
     if served >= 3000:
         raise AssertionError(f"expected the limit to bound the fetch, got {served} documents")
 
 
-@test("orderby pushdown: the scan parameter overrides the setting")
+@test("orderby pushdown: an ORDER BY without a LIMIT is never sent")
+def _():
+    # DuckDB re-sorts the rows either way, so an ordered request without a
+    # limit fetches exactly the same documents -- all of them -- while still
+    # risking the ones Firestore would drop. It buys nothing, so it is not sent.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan(" + scan_args("bench_flat_4_3000") + ") ORDER BY f1);"
+    )
+    assert_eq(int(rows[0]), 3000, "every row is returned")
+    served = stats()["docs_served"]
+    if served < 3000:
+        raise AssertionError(f"an unlimited ordered scan still reads the collection, got {served} documents")
+
+
+@test("orderby pushdown: an optional ordering field keeps the sort local")
+def _():
+    # `late_field` only appears from document 500, so Firestore ordered by it
+    # would return no document below that. The default 1000-document sample
+    # sees 500 with the field and 500 without, declines the pushdown, and the
+    # scan reads the collection -- 1000 sampled plus 3000 scanned.
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_late_500_3000")
+        + ") ORDER BY late_field LIMIT 700);"
+    )
+    assert_eq(int(rows[0]), 700, "the query returns 700 rows")
+    served = stats()["docs_served"]
+    if served < 1000 + 3000:
+        raise AssertionError(f"the optional field should have kept the sort local, got {served} documents")
+
+
+@test("orderby pushdown: turning it off keeps every sort local")
+def _():
+    reset_stats()
+    rows = run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_flat_4_3000")
+        + ") ORDER BY f1 LIMIT 700);",
+        ["SET firestore_orderby_pushdown=false"],
+    )
+    assert_eq(int(rows[0]), 700, "the query returns 700 rows")
+    served = stats()["docs_served"]
+    if served < 3000:
+        raise AssertionError(f"with the pushdown off the collection is read, got {served} documents")
+
+
+@test("orderby pushdown: the scan parameter forces it past the safety check")
+def _():
+    # The escape hatch the warning names: a caller who knows their data can
+    # send the sort even where the sample says the two orderings differ.
+    reset_stats()
+    run_sql(
+        "SELECT count(*) FROM (SELECT * FROM firestore_scan("
+        + scan_args("bench_late_500_3000", "orderby_pushdown:=true")
+        + ") ORDER BY late_field LIMIT 700);"
+    )
+    # 1000 sampled at bind, then a bounded scan rather than the whole 3000.
+    served = stats()["docs_served"]
+    if served >= 1000 + 3000:
+        raise AssertionError(f"orderby_pushdown:=true should have sent the sort anyway, got {served} documents")
+
+
+@test("orderby pushdown: the scan parameter can also turn it off")
 def _():
     reset_stats()
     run_sql(
         "SELECT count(*) FROM (SELECT * FROM firestore_scan("
         + scan_args("bench_flat_4_3000", "orderby_pushdown:=false")
-        + ") ORDER BY f1 LIMIT 700);",
-        ["SET firestore_orderby_pushdown=true"],
+        + ") ORDER BY f1 LIMIT 700);"
     )
     served = stats()["docs_served"]
     if served < 3000:

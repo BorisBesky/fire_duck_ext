@@ -49,11 +49,12 @@ docs:
     functions firestore_array_union(), firestore_array_remove(), and
     firestore_array_append().
 
-    WHERE filters, a SQL LIMIT, the column projection, and a bare COUNT(*) are
-    pushed down to Firestore where possible. A query then transfers only what
-    it uses: matching rows, selected fields, and for a count, no documents at
-    all. Sending a SQL ORDER BY to the server is opt-in, because Firestore
-    orders differently from SQL and doing so changes which rows come back.
+    WHERE filters, SQL ORDER BY / LIMIT, the column projection, and a bare
+    COUNT(*) are pushed down to Firestore where possible. A query then
+    transfers only what it uses: matching rows, selected fields, and for a
+    count, no documents at all. Firestore orders differently from SQL, so an
+    ORDER BY is only sent when the sampled documents say the two agree;
+    otherwise DuckDB sorts and the reason is logged.
 
     Scans stream a page at a time, so a collection of any size can be read
     without holding it in memory, and the page size adapts when documents turn

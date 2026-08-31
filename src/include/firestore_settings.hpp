@@ -119,15 +119,21 @@ struct FirestoreSettings {
 	// holding more than one type reaches DuckDB as VARCHAR and compares as a
 	// string. With a LIMIT the two disagree about which rows survive.
 	//
-	// Off by default, so `ORDER BY` means what SQL says it means and DuckDB
-	// does the sorting. Turn it on to get Firestore's ordering, and the round
-	// trips it saves, where the collection's shape makes them equivalent --
-	// every document carrying the field, with one type.
+	// On by default, because the optimizer checks each ordering field against
+	// the documents sampled for the schema and declines the pushdown -- with a
+	// warning naming the field -- wherever the two orderings would disagree.
+	// The saving is real where they agree: a LIMIT 700 over 3000 documents
+	// fetches 1700 instead of 4000. Turning it off keeps every sort in DuckDB,
+	// including the ones the sample judged safe.
+	//
+	// A sort is only ever sent with a LIMIT. DuckDB re-sorts the rows either
+	// way, so an ordered request without one fetches exactly the same
+	// documents and only risks losing some.
 	//
 	// The named `order_by:=` parameter is unaffected: asking for the server's
-	// ordering explicitly is already a choice, and this setting is about
-	// whether an ordinary SQL query is quietly given those semantics.
-	static constexpr bool kDefaultOrderByPushdown = false;
+	// ordering explicitly is already a choice. So is orderby_pushdown:=true,
+	// which skips the safety check.
+	static constexpr bool kDefaultOrderByPushdown = true;
 
 	static bool OrderByPushdown(const ClientContext &context) {
 		Value pushdown_value;

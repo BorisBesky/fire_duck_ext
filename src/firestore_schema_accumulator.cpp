@@ -38,6 +38,8 @@ void FirestoreSchemaAccumulator::AddDocument(const json &fields) {
 		if (summary.type_name.empty()) {
 			summary.type_name = type_name;
 		}
+		summary.documents_present++;
+		summary.type_names.insert(type_name);
 
 		if (type_name == "arrayValue" && field_value["arrayValue"].contains("values")) {
 			for (const auto &element : field_value["arrayValue"]["values"]) {
@@ -53,6 +55,37 @@ void FirestoreSchemaAccumulator::AddDocument(const json &fields) {
 			summary.has_vector_dimension = true;
 		}
 	}
+}
+
+FirestoreSchemaAccumulator::OrderingSafety FirestoreSchemaAccumulator::Ordering(bool sample_exhaustive) const {
+	OrderingSafety safety;
+	safety.documents_sampled = documents_seen_;
+	safety.exhaustive = sample_exhaustive;
+
+	for (const auto &entry : fields_) {
+		const std::string &field_name = entry.first;
+		const auto &summary = entry.second;
+
+		if (summary.documents_present < documents_seen_) {
+			const int64_t absent = documents_seen_ - summary.documents_present;
+			safety.reasons[field_name] = std::to_string(absent) + " of " + std::to_string(documents_seen_) +
+			                             " sampled documents do not have it, and Firestore returns no document that "
+			                             "lacks the field it is ordered by";
+			continue;
+		}
+		if (summary.type_names.size() > 1) {
+			std::string types;
+			for (const auto &type_name : summary.type_names) {
+				types += (types.empty() ? "" : ", ") + type_name;
+			}
+			safety.reasons[field_name] =
+			    "it holds more than one type (" + types +
+			    "), so DuckDB compares it as text while Firestore orders it by its own type precedence";
+			continue;
+		}
+		safety.safe_fields.insert(field_name);
+	}
+	return safety;
 }
 
 std::string FirestoreSchemaAccumulator::WidenElementTypes(const std::map<std::string, int64_t> &element_types) {

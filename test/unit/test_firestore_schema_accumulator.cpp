@@ -237,3 +237,98 @@ FD_TEST("accumulator: memory is bounded by field count, not document count") {
 	FD_REQUIRE_EQ(accumulator.DocumentsSeen(), 50000);
 	FD_REQUIRE_EQ(accumulator.Fields().size(), 2u);
 }
+
+// ---------------------------------------------------------------- ordering safety
+
+FD_TEST("ordering: a field on every document with one type is safe") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"score", {{"integerValue", "2"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE(safety.IsSafe("score"));
+	FD_REQUIRE(safety.exhaustive);
+	FD_REQUIRE_EQ(safety.documents_sampled, 2);
+}
+
+FD_TEST("ordering: a field missing from some documents is not safe") {
+	// Firestore returns no document that lacks the field it orders by, so this
+	// is the case that silently drops rows.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"other", {{"integerValue", "2"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("score"));
+	FD_REQUIRE(safety.Explain("score").find("1 of 2") != std::string::npos);
+	FD_REQUIRE(safety.Explain("score").find("lacks the field") != std::string::npos);
+}
+
+FD_TEST("ordering: a field holding more than one type is not safe") {
+	// It reaches DuckDB as VARCHAR and compares as a string, while Firestore
+	// orders it by type precedence -- so a limit keeps different rows.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"v", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json {{"v", {{"stringValue", "two"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("v"));
+	FD_REQUIRE(safety.Explain("v").find("more than one type") != std::string::npos);
+	FD_REQUIRE(safety.Explain("v").find("integerValue") != std::string::npos);
+}
+
+FD_TEST("ordering: an explicit null counts as a second type") {
+	// Firestore sorts null below every other value; DuckDB puts nulls last.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"v", {{"stringValue", "a"}}}});
+	accumulator.AddDocument(json {{"v", {{"nullValue", nullptr}}}});
+
+	FD_REQUIRE_FALSE(accumulator.Ordering(true).IsSafe("v"));
+}
+
+FD_TEST("ordering: a phantom document makes every field optional") {
+	// A document with no fields is one Firestore would drop from any ordered
+	// query, so nothing on the other documents can be safely ordered.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+	accumulator.AddDocument(json::object());
+
+	FD_REQUIRE_FALSE(accumulator.Ordering(true).IsSafe("score"));
+}
+
+FD_TEST("ordering: __name__ is always safe") {
+	// The document's own key: every document has one, it is always a string,
+	// and it is never null.
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	FD_REQUIRE(accumulator.Ordering(true).IsSafe("__name__"));
+}
+
+FD_TEST("ordering: a field the sample never saw is not safe, and says so") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE_FALSE(safety.IsSafe("absent"));
+	FD_REQUIRE(safety.Explain("absent").find("not seen in any") != std::string::npos);
+}
+
+FD_TEST("ordering: a bounded sample reports itself as not exhaustive") {
+	// The verdict is only as good as the sample, and the caller has to be able
+	// to say so in a warning.
+	FirestoreSchemaAccumulator accumulator(1);
+	accumulator.AddDocument(json {{"score", {{"integerValue", "1"}}}});
+
+	auto safety = accumulator.Ordering(false);
+	FD_REQUIRE_FALSE(safety.exhaustive);
+	FD_REQUIRE(safety.IsSafe("score"));
+}
+
+FD_TEST("ordering: an empty sample makes nothing safe") {
+	FirestoreSchemaAccumulator accumulator(-1);
+	auto safety = accumulator.Ordering(true);
+	FD_REQUIRE(safety.safe_fields.empty());
+	FD_REQUIRE_FALSE(safety.IsSafe("anything"));
+	FD_REQUIRE(safety.IsSafe("__name__"));
+}

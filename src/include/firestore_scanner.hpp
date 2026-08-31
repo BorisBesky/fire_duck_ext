@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
+#include "firestore_schema_accumulator.hpp"
 #include "firestore_index.hpp"
 #include "firestore_paging.hpp"
 #include <memory>
@@ -53,9 +54,15 @@ struct FirestoreScanBindData : public TableFunctionData {
 	bool show_missing = true;
 
 	// Whether a SQL ORDER BY may be sent to Firestore for this scan. Unset
-	// follows the firestore_orderby_pushdown setting; see FirestoreSettings
-	// for why the default is off.
+	// follows the firestore_orderby_pushdown setting; see FirestoreSettings.
+	// Setting it true also skips the safety check below -- an explicit request
+	// for Firestore's ordering is taken at face value.
 	std::optional<bool> orderby_pushdown;
+
+	// Which fields the sampled documents say Firestore may be asked to sort
+	// by. Null when no schema was inferred (an explicit `columns` override),
+	// which is treated as "nothing is known to be safe".
+	std::shared_ptr<FirestoreSchemaAccumulator::OrderingSafety> ordering_safety;
 
 	// How mapValue fields are surfaced. Defaults to WIRE so existing queries
 	// that reach into $.x.mapValue.fields.y keep working.

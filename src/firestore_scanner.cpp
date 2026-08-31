@@ -19,6 +19,9 @@ namespace duckdb {
 struct CachedSchemaEntry {
 	std::vector<std::pair<std::string, LogicalType>> schema;
 	std::shared_ptr<FirestoreIndexCache> index_cache;
+	// Which fields Firestore may be asked to sort by, learned from the same
+	// sample that produced the schema.
+	std::shared_ptr<FirestoreSchemaAccumulator::OrderingSafety> ordering_safety;
 	std::chrono::steady_clock::time_point cached_at;
 
 	bool IsExpired(int64_t ttl_seconds) const {
@@ -525,6 +528,8 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 					result->column_types.push_back(col_type);
 				}
 
+				result->ordering_safety = it->second.ordering_safety;
+
 				// Also restore index cache if available
 				if (it->second.index_cache) {
 					result->index_cache = it->second.index_cache;
@@ -547,8 +552,10 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	// same page size as the scan itself.
 	const int64_t bind_page_size =
 	    result->page_size.has_value() ? result->page_size.value() : FirestoreSettings::PageSize(context);
-	auto schema =
-	    client.InferSchema(result->collection, sample_size, result->show_missing, result->map_encoding, bind_page_size);
+	FirestoreSchemaAccumulator::OrderingSafety ordering_safety;
+	auto schema = client.InferSchema(result->collection, sample_size, result->show_missing, result->map_encoding,
+	                                 bind_page_size, &ordering_safety);
+	result->ordering_safety = std::make_shared<FirestoreSchemaAccumulator::OrderingSafety>(std::move(ordering_safety));
 
 	// Check if collection exists (has documents)
 	if (schema.empty()) {
@@ -637,6 +644,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		CachedSchemaEntry entry;
 		entry.schema = schema;
 		entry.index_cache = result->index_cache;
+		entry.ordering_safety = result->ordering_safety;
 		entry.cached_at = std::chrono::steady_clock::now();
 		schema_cache[cache_key] = std::move(entry);
 		FS_LOG_DEBUG("Schema cached for: " + cache_key);

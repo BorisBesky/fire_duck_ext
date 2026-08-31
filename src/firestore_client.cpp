@@ -899,10 +899,10 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 	}
 }
 
-std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(const std::string &collection,
-                                                                              int64_t sample_size, bool show_missing,
-                                                                              FirestoreMapEncoding map_encoding,
-                                                                              int64_t page_size) {
+std::vector<std::pair<std::string, LogicalType>>
+FirestoreClient::InferSchema(const std::string &collection, int64_t sample_size, bool show_missing,
+                             FirestoreMapEncoding map_encoding, int64_t page_size,
+                             FirestoreSchemaAccumulator::OrderingSafety *ordering_safety) {
 	FS_LOG_DEBUG("Inferring schema for collection: " + collection);
 
 	const bool is_collection_group = !collection.empty() && collection[0] == '~';
@@ -940,6 +940,10 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		}
 
 		if (page.documents.empty()) {
+			// An empty page is the end of the collection just as much as a
+			// response that says so, and the ordering verdict below depends on
+			// telling "ran out of documents" from "ran out of sample".
+			has_more_pages = false;
 			break;
 		}
 		for (const auto &document : page.documents) {
@@ -949,6 +953,13 @@ std::vector<std::pair<std::string, LogicalType>> FirestoreClient::InferSchema(co
 		page_token = page.next_page_token;
 		start_at = page.next_start_at;
 		has_more_pages = page.HasMorePages();
+	}
+
+	// The sample is exhaustive when the collection ran out before the sample
+	// did -- which is what turns the ordering verdict below from a statement
+	// about the sample into one about the data.
+	if (ordering_safety != nullptr) {
+		*ordering_safety = accumulator.Ordering(!has_more_pages);
 	}
 
 	// Convert the summary to DuckDB types.

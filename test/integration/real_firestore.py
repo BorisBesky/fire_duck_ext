@@ -456,39 +456,55 @@ def _():
     assert_eq(limited, sorted_locally(collection, "ORDER BY v LIMIT 5"), "the same five rows as an unpushed sort")
 
 
-@test("ordering: the pushdown can be turned on per session")
+@test("ordering: the setting being on does not override the safety check")
 def _():
-    # Opting in gives Firestore's ordering, and with it Firestore's rule about
-    # documents lacking the field. That is the trade the setting exists to
-    # make: fewer round trips where the collection's shape makes the two
-    # orderings equivalent.
+    # The pushdown is on by default. The setting says Firestore may be asked to
+    # sort; the sample still decides whether it would answer the same question,
+    # and here it would not -- two of the six documents have no `v`.
     collection = f"{PREFIX}_sparse"
     rows = run_sql(
-        f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v;",
+        f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY v LIMIT 3;",
         ["SET firestore_orderby_pushdown=true"],
     )
-    assert_eq(len(rows), 4, "with the pushdown on, Firestore omits the documents without the field")
+    assert_eq(rows, sorted_locally(collection, "ORDER BY v LIMIT 3"), "the sort stayed in DuckDB")
 
 
-@test("ordering: the pushdown can be turned on for one scan")
+@test("ordering: the scan parameter forces the pushdown past the check")
 def _():
+    # The escape hatch the warning names. Asking for it explicitly means
+    # accepting Firestore's rule about documents that lack the field, so the
+    # two documents without `v` are gone.
     collection = f"{PREFIX}_sparse"
     rows = run_sql(
-        "SELECT __document_id FROM firestore_scan(" + scan_args(collection, "orderby_pushdown:=true") + ") ORDER BY v;"
+        "SELECT __document_id FROM firestore_scan("
+        + scan_args(collection, "orderby_pushdown:=true")
+        + ") ORDER BY v LIMIT 6;"
     )
-    assert_eq(len(rows), 4, "the scan parameter turns the pushdown on")
+    assert_eq(len(rows), 4, "Firestore omits the documents without the field")
 
 
-@test("ordering: a scan parameter overrides the session setting")
+@test("ordering: the scan parameter can turn the pushdown off")
 def _():
     collection = f"{PREFIX}_sparse"
     rows = run_sql(
         "SELECT __document_id FROM firestore_scan("
         + scan_args(collection, "orderby_pushdown:=false")
-        + ") ORDER BY v;",
+        + ") ORDER BY v LIMIT 6;",
         ["SET firestore_orderby_pushdown=true"],
     )
-    assert_eq(len(rows), 6, "the scan parameter wins over the setting")
+    assert_eq(len(rows), 6, "every document is returned")
+
+
+@test("ordering: a field present everywhere with one type is pushed")
+def _():
+    # The case the pushdown exists for: `n` is on every document of this
+    # collection and is always an integer, so Firestore orders it the way
+    # DuckDB does and the sort can go to the server.
+    collection = f"{PREFIX}_hundred"
+    plan = run_sql(f"EXPLAIN SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY n LIMIT 5;")
+    assert_true(any("Pushed Order" in line for line in plan), "the plan shows the ordering going to Firestore")
+    rows = run_sql(f"SELECT __document_id FROM firestore_scan({scan_args(collection)}) ORDER BY n LIMIT 5;")
+    assert_eq(rows, sorted_locally(collection, "ORDER BY n LIMIT 5"), "and the rows are the ones SQL asks for")
 
 
 @test("ordering: the named order_by parameter uses Firestore's ordering")

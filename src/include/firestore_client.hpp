@@ -5,6 +5,7 @@
 #include "firestore_logger.hpp"
 #include "firestore_types.hpp" // FirestoreMapEncoding
 #include "firestore_paging.hpp"
+#include "firestore_schema_accumulator.hpp"
 #include "duckdb.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -150,7 +151,8 @@ public:
 	std::vector<std::pair<std::string, LogicalType>>
 	InferSchema(const std::string &collection, int64_t sample_size = 1000, bool show_missing = true,
 	            FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE,
-	            int64_t page_size = FIRESTORE_MAX_PAGE_SIZE);
+	            int64_t page_size = FIRESTORE_MAX_PAGE_SIZE,
+	            FirestoreSchemaAccumulator::OrderingSafety *ordering_safety = nullptr);
 
 	// Resource name of a collection: projects/P/databases/D/documents/<path>.
 	// This is the form cursors and referenceValue use, and it is the same
