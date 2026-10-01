@@ -47,7 +47,8 @@ docs:
     firestore_update(), firestore_delete(), their batch counterparts
     (firestore_update_batch(), firestore_delete_batch()), and the array-transform
     functions firestore_array_union(), firestore_array_remove(), and
-    firestore_array_append().
+    firestore_array_append(). Every function documents itself in
+    duckdb_functions() with a description, parameter names, and an example.
 
     WHERE filters, SQL ORDER BY / LIMIT, the column projection, and a bare
     COUNT(*) are pushed down to Firestore where possible. A query then

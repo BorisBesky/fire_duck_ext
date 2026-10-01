@@ -1,0 +1,115 @@
+# name: test/sql/firestore_function_docs.test
+# description: Every function documents itself in duckdb_functions(), the only reference a SQL connection can reach
+# group: [sql]
+
+require fire_duck_ext
+
+# Every overload carries a description, one example, and categories
+query II
+SELECT count(*), count(DISTINCT function_name)
+FROM duckdb_functions()
+WHERE function_name LIKE 'firestore%'
+  AND description IS NOT NULL
+  AND len(examples) = 1
+  AND len(categories) > 0;
+----
+13	12
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name LIKE 'firestore%'
+  AND (description IS NULL OR len(examples) = 0 OR len(categories) = 0);
+----
+0
+
+# No placeholder names: positional arguments are named, named parameters keep their own names.
+# Sorted, because named parameters come out in hash-map order, which varies by platform.
+query II
+SELECT function_name, list_sort(parameters)
+FROM duckdb_functions()
+WHERE function_name LIKE 'firestore%'
+ORDER BY function_name, len(parameters);
+----
+firestore_array_append	[api_key, collection, credentials, database, document_id, field, project_id, values]
+firestore_array_remove	[api_key, collection, credentials, database, document_id, field, project_id, values]
+firestore_array_union	[api_key, collection, credentials, database, document_id, field, project_id, values]
+firestore_clear_cache	[]
+firestore_clear_cache	[collection]
+firestore_connect	[database]
+firestore_delete	[api_key, collection, credentials, database, document_id, project_id]
+firestore_delete_batch	[api_key, collection, credentials, database, document_ids, project_id]
+firestore_disconnect	[]
+firestore_insert	[api_key, collection, credentials, database, document_id, project_id, subquery]
+firestore_scan	[api_key, collection, columns, credentials, database, map_encoding, order_by, orderby_pushdown, page_size, project_id, scan_limit, schema_sample_size, show_missing, unmapped_column]
+firestore_update	[api_key, collection, credentials, database, document_id, project_id]
+firestore_update_batch	[api_key, collection, credentials, database, document_ids, project_id]
+
+# Each name sits next to its own type. firestore_scan mixes VARCHAR, BIGINT,
+# BOOLEAN and ANY parameters, so a name list out of step with the type list shows here.
+query II
+SELECT name, type
+FROM (
+    SELECT unnest(parameters) AS name, unnest(parameter_types) AS type
+    FROM duckdb_functions()
+    WHERE function_name = 'firestore_scan'
+)
+ORDER BY name;
+----
+api_key	VARCHAR
+collection	VARCHAR
+columns	ANY
+credentials	VARCHAR
+database	VARCHAR
+map_encoding	VARCHAR
+order_by	VARCHAR
+orderby_pushdown	BOOLEAN
+page_size	BIGINT
+project_id	VARCHAR
+scan_limit	BIGINT
+schema_sample_size	BIGINT
+show_missing	BOOLEAN
+unmapped_column	BOOLEAN
+
+# Positional arguments come first, in call order
+query II
+SELECT function_name, parameters[1:2]
+FROM duckdb_functions()
+WHERE function_name IN ('firestore_insert', 'firestore_update_batch', 'firestore_array_union')
+ORDER BY function_name;
+----
+firestore_array_union	[collection, document_id]
+firestore_insert	[collection, subquery]
+firestore_update_batch	[collection, document_ids]
+
+query I
+SELECT parameters[3:4]
+FROM duckdb_functions()
+WHERE function_name = 'firestore_array_union';
+----
+[field, values]
+
+# The two firestore_clear_cache overloads are described separately
+query II
+SELECT len(parameters), description LIKE 'Forget the cached schema of one collection%'
+FROM duckdb_functions()
+WHERE function_name = 'firestore_clear_cache'
+ORDER BY len(parameters);
+----
+0	false
+1	true
+
+# Examples are full statements: a table function is not valid as a bare expression
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name LIKE 'firestore%'
+  AND NOT regexp_matches(examples[1], '^(SELECT .* FROM firestore_|CALL firestore_)');
+----
+0
+
+# The extension describes itself in duckdb_extensions()
+query I
+SELECT description FROM duckdb_extensions() WHERE extension_name = 'fire_duck_ext';
+----
+Query Google Cloud Firestore directly from DuckDB using SQL

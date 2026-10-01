@@ -258,6 +258,18 @@ CREATE SECRET emulator (
 | `firestore_array_append('collection', 'doc_id', 'field', ['v1', ...])` | Append to array |
 | `firestore_connect('database')` | Set the active database for the session; used by subsequent calls until `firestore_disconnect()` |
 | `firestore_disconnect()` | Clear the session's active database |
+| `firestore_clear_cache()` | Forget every cached inferred schema, so the next scan samples again |
+| `firestore_clear_cache('collection')` | Forget one collection path's cached schema |
+
+Every function also documents itself in `duckdb_functions()` with a description,
+its parameter names, and a runnable example, so the reference is reachable from
+any SQL connection, including an agent's:
+
+```sql
+SELECT function_name, description, parameters, examples
+FROM duckdb_functions()
+WHERE function_name LIKE 'firestore%';
+```
 
 ## Batch Operations
 
