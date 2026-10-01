@@ -7,6 +7,7 @@
 #include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
 #include "firestore_optimizer.hpp"
+#include "firestore_function_docs.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
@@ -152,6 +153,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Initialize logging from environment variable
 	InitializeLogging();
 
+	// Reported by duckdb_extensions() once the extension is loaded
+	loader.SetDescription("Query Google Cloud Firestore directly from DuckDB using SQL");
+
 	// Register extension options
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("firestore_schema_cache_ttl", "Schema cache TTL in seconds (0 to disable caching)",
@@ -178,10 +182,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(FirestoreSettings::kDefaultMaxThreads),
 	                          FirestoreSettings::SetMaxScanThreads);
 	config.AddExtensionOption("firestore_orderby_pushdown",
-	                          "Whether a SQL ORDER BY may be sent to Firestore. Off by default, because Firestore's "
-	                          "ordering is not SQL's: it omits documents that lack the ordering field, sorts nulls "
-	                          "first, and orders across types by its own precedence, so pushing the sort down "
-	                          "changes which rows a query returns. The order_by:= parameter is unaffected",
+	                          "Whether a SQL ORDER BY ... LIMIT may be sent to Firestore. Each ordering field is "
+	                          "first checked against the sampled documents, because Firestore omits documents that "
+	                          "lack the ordering field, sorts nulls first, and orders across types by its own "
+	                          "precedence; a field that would change which rows a query returns keeps its sort in "
+	                          "DuckDB. The order_by:= parameter is unaffected",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(FirestoreSettings::kDefaultOrderByPushdown));
 
 	// Register the firestore secret type for credential management
@@ -195,25 +200,45 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterFirestoreWriteFunctions(loader);
 
 	// Register cache clear function: call firestore_clear_cache()
+	TableFunctionSet clear_cache_set("firestore_clear_cache");
 	// Overload 1: No arguments - clears entire cache
-	TableFunction clear_cache_all("firestore_clear_cache", {}, FirestoreClearCacheFunction, FirestoreClearCacheBindAll,
-	                              FirestoreOneShotInit);
-	loader.RegisterFunction(clear_cache_all);
-
+	clear_cache_set.AddFunction(
+	    TableFunction({}, FirestoreClearCacheFunction, FirestoreClearCacheBindAll, FirestoreOneShotInit));
 	// Overload 2: With collection argument - clears only that collection
-	TableFunction clear_cache_collection("firestore_clear_cache", {LogicalType::VARCHAR}, FirestoreClearCacheFunction,
-	                                     FirestoreClearCacheBindCollection, FirestoreOneShotInit);
-	loader.RegisterFunction(clear_cache_collection);
+	clear_cache_set.AddFunction(TableFunction({LogicalType::VARCHAR}, FirestoreClearCacheFunction,
+	                                          FirestoreClearCacheBindCollection, FirestoreOneShotInit));
+	RegisterDocumentedTableFunction(
+	    loader, std::move(clear_cache_set),
+	    {{{},
+	      "Forget every cached Firestore schema, so the next scan of each collection samples its documents again.",
+	      "CALL firestore_clear_cache();",
+	      {"firestore", "cache"}},
+	     {{"collection"},
+	      "Forget the cached schema of one collection path (e.g. 'users', '~orders' or 'users/u1/orders'), so its "
+	      "next scan samples its documents again.",
+	      "CALL firestore_clear_cache('users');",
+	      {"firestore", "cache"}}});
 
 	// Register firestore_connect(database_id) - sets session-scoped database
 	TableFunction connect_func("firestore_connect", {LogicalType::VARCHAR}, FirestoreConnectFunction,
 	                           FirestoreConnectBind, FirestoreOneShotInit);
-	loader.RegisterFunction(connect_func);
+	RegisterDocumentedTableFunction(
+	    loader, connect_func,
+	    {{"database"},
+	     "Make a Firestore database ID the default for later calls in this session that pass no database := "
+	     "parameter. Fails if no firestore secret covers that database.",
+	     "CALL firestore_connect('analytics-db');",
+	     {"firestore", "session"}});
 
 	// Register firestore_disconnect() - clears session-scoped database
 	TableFunction disconnect_func("firestore_disconnect", {}, FirestoreDisconnectFunction, FirestoreDisconnectBind,
 	                              FirestoreOneShotInit);
-	loader.RegisterFunction(disconnect_func);
+	RegisterDocumentedTableFunction(loader, disconnect_func,
+	                                {{},
+	                                 "Clear the session's default database set by firestore_connect(), so later calls "
+	                                 "pick their database as they would without it.",
+	                                 "CALL firestore_disconnect();",
+	                                 {"firestore", "session"}});
 
 	// Register optimizer extension for SQL ORDER BY / LIMIT pushdown to Firestore.
 	// This walks the logical plan tree to find ORDER BY / LIMIT nodes above firestore_scan

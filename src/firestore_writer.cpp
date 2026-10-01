@@ -2,6 +2,7 @@
 #include "firestore_types.hpp"
 #include "firestore_secrets.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_function_docs.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -1000,7 +1001,14 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	insert_func.named_parameters["database"] = LogicalType::VARCHAR;
 	insert_func.named_parameters["document_id"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(insert_func);
+	RegisterDocumentedTableFunction(
+	    loader, insert_func,
+	    {{"collection", "subquery"},
+	     "Insert one Firestore document per row of a subquery, with one field per column. document_id := names the "
+	     "column that supplies document IDs, which is then left out of the fields; without it Firestore generates "
+	     "the IDs. Returns the number of documents inserted.",
+	     "CALL firestore_insert('users', (SELECT 'alice' AS id, 'Alice' AS name, 30 AS age), document_id := 'id');",
+	     {"firestore", "write"}});
 
 	// Register firestore_update table function
 	// Usage: CALL firestore_update('collection', 'doc_id', 'field1', value1, ...)
@@ -1014,7 +1022,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	update_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	update_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(update_func);
+	RegisterDocumentedTableFunction(
+	    loader, update_func,
+	    {{"collection", "document_id"},
+	     "Set fields on one Firestore document from the trailing field-name/value pairs, leaving its other fields "
+	     "as they are. Returns a one-row count.",
+	     "CALL firestore_update('users', 'user123', 'status', 'verified', 'age', 31);",
+	     {"firestore", "write"}});
 
 	// Register firestore_delete table function
 	// Usage: CALL firestore_delete('collection', 'doc_id')
@@ -1027,7 +1041,11 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	delete_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	delete_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(delete_func);
+	RegisterDocumentedTableFunction(loader, delete_func,
+	                                {{"collection", "document_id"},
+	                                 "Delete one Firestore document by ID. Returns a one-row count.",
+	                                 "CALL firestore_delete('users', 'user123');",
+	                                 {"firestore", "write"}});
 
 	// Register firestore_update_batch table function
 	// Usage: CALL firestore_update_batch('collection', ['id1','id2'], 'field1', value1, ...)
@@ -1041,7 +1059,14 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	update_batch_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	update_batch_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(update_batch_func);
+	RegisterDocumentedTableFunction(
+	    loader, update_batch_func,
+	    {{"collection", "document_ids"},
+	     "Set the same field-name/value pairs on every Firestore document in a list of IDs, sent through "
+	     "batchWrite in groups of up to 500. Batches are not atomic: each write succeeds or fails on its own. "
+	     "Returns a one-row count.",
+	     "CALL firestore_update_batch('users', ['user1', 'user2'], 'status', 'reviewed');",
+	     {"firestore", "write"}});
 
 	// Register firestore_delete_batch table function
 	// Usage: CALL firestore_delete_batch('collection', ['id1','id2'])
@@ -1054,7 +1079,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	delete_batch_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	delete_batch_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(delete_batch_func);
+	RegisterDocumentedTableFunction(
+	    loader, delete_batch_func,
+	    {{"collection", "document_ids"},
+	     "Delete every Firestore document in a list of IDs, sent through batchWrite in groups of up to 500. "
+	     "Batches are not atomic: each delete succeeds or fails on its own. Returns a one-row count.",
+	     "CALL firestore_delete_batch('users', ['user1', 'user2']);",
+	     {"firestore", "write"}});
 
 	// Register firestore_array_union table function
 	// Usage: SELECT * FROM firestore_array_union('collection', 'doc_id', 'field', ['val1', 'val2'])
@@ -1069,7 +1100,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	array_union_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	array_union_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(array_union_func);
+	RegisterDocumentedTableFunction(
+	    loader, array_union_func,
+	    {{"collection", "document_id", "field", "values"},
+	     "Add values to an array field of one Firestore document, skipping any the array already holds "
+	     "(Firestore's arrayUnion transform). Returns a one-row count.",
+	     "CALL firestore_array_union('users', 'user123', 'tags', ['vip', 'active']);",
+	     {"firestore", "write"}});
 
 	// Register firestore_array_remove table function
 	// Usage: SELECT * FROM firestore_array_remove('collection', 'doc_id', 'field', ['val1', 'val2'])
@@ -1084,7 +1121,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	array_remove_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	array_remove_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(array_remove_func);
+	RegisterDocumentedTableFunction(
+	    loader, array_remove_func,
+	    {{"collection", "document_id", "field", "values"},
+	     "Remove every occurrence of the given values from an array field of one Firestore document (Firestore's "
+	     "arrayRemove transform). Returns a one-row count.",
+	     "CALL firestore_array_remove('users', 'user123', 'tags', ['inactive']);",
+	     {"firestore", "write"}});
 
 	// Register firestore_array_append table function
 	// Usage: SELECT * FROM firestore_array_append('collection', 'doc_id', 'field', ['val1', 'val2'])
@@ -1099,7 +1142,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	array_append_func.named_parameters["api_key"] = LogicalType::VARCHAR;
 	array_append_func.named_parameters["database"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(array_append_func);
+	RegisterDocumentedTableFunction(
+	    loader, array_append_func,
+	    {{"collection", "document_id", "field", "values"},
+	     "Append values to an array field of one Firestore document, keeping duplicates. The array is read and "
+	     "written back whole, so a concurrent write to the same field can be lost. Returns a one-row count.",
+	     "CALL firestore_array_append('users', 'user123', 'events', ['login']);",
+	     {"firestore", "write"}});
 }
 
 void RegisterFirestoreCopyFunction(ExtensionLoader &loader) {

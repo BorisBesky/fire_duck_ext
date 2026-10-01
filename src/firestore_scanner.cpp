@@ -6,6 +6,7 @@
 #include "firestore_logger.hpp"
 #include "firestore_error.hpp"
 #include "firestore_path_utils.hpp"
+#include "firestore_function_docs.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -368,7 +369,16 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	// while leaving all expressions for DuckDB to re-verify (ensuring correct results)
 	scan_func.pushdown_complex_filter = FirestoreComplexFilterPushdown;
 
-	loader.RegisterFunction(scan_func);
+	RegisterDocumentedTableFunction(
+	    loader, scan_func,
+	    {{"collection"},
+	     "Read a Firestore collection as a table: one row per document, with __document_id plus columns inferred "
+	     "from sampled documents. The path may name a nested collection ('users/u1/orders'), every collection with "
+	     "one name ('~orders', a collection-group query), or a document ('users/u1'), which lists that document's "
+	     "subcollection IDs instead. WHERE filters, ORDER BY ... LIMIT, the projection and COUNT(*) are pushed down to "
+	     "Firestore where possible. With API-key or Firebase-user auth, pass show_missing := false.",
+	     "SELECT __document_id, name FROM firestore_scan('users', show_missing := false) WHERE status = 'active';",
+	     {"firestore", "read"}});
 }
 
 unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunctionBindInput &input,

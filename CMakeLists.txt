@@ -39,6 +39,7 @@ set(EXTENSION_SOURCES
     src/firestore_logger.cpp
     src/firestore_index.cpp
     src/firestore_optimizer.cpp
+    src/firestore_function_docs.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
