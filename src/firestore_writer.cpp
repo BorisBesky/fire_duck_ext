@@ -46,7 +46,7 @@ struct FirestoreInsertGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreInsertBindData>();
 
 	// Get collection name (first positional argument)
@@ -80,7 +80,7 @@ static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, Tabl
 	}
 
 	// Capture input table schema (column names and types from the subquery)
-	result->column_names = input.input_table_names;
+	result->column_names = FirestoreNameStrings(input.input_table_names);
 	result->column_types = input.input_table_types;
 
 	if (result->column_names.empty()) {
@@ -221,7 +221,7 @@ static OperatorResultType FirestoreInsertInOutFunction(ExecutionContext &context
 		}
 	}
 
-	output.SetCardinality(0);
+	FirestoreSetCardinality(output, 0);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -232,7 +232,7 @@ static OperatorFinalizeResultType FirestoreInsertFinal(ExecutionContext &context
 	auto &global_state = data.global_state->Cast<FirestoreInsertGlobalState>();
 
 	if (global_state.count_emitted) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
@@ -242,8 +242,8 @@ static OperatorFinalizeResultType FirestoreInsertFinal(ExecutionContext &context
 	}
 
 	// Emit the final count
-	FlatVector::GetData<int64_t>(output.data[0])[0] = static_cast<int64_t>(global_state.rows_inserted);
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = static_cast<int64_t>(global_state.rows_inserted);
+	FirestoreSetCardinality(output, 1);
 	global_state.count_emitted = true;
 	return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 }
@@ -275,7 +275,7 @@ struct FirestoreUpdateGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreUpdateBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreUpdateBindData>();
 
 	// Get collection name (first arg)
@@ -346,7 +346,7 @@ static void FirestoreUpdateFunction(ClientContext &context, TableFunctionInput &
 	auto &global_state = data.global_state->Cast<FirestoreUpdateGlobalState>();
 
 	if (global_state.done) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -373,8 +373,8 @@ static void FirestoreUpdateFunction(ClientContext &context, TableFunctionInput &
 		throw InvalidInputException("Firestore update failed: " + std::string(e.what()));
 	}
 
-	FlatVector::GetData<int64_t>(output.data[0])[0] = count;
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = count;
+	FirestoreSetCardinality(output, 1);
 	global_state.done = true;
 }
 
@@ -399,7 +399,7 @@ struct FirestoreDeleteGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreDeleteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreDeleteBindData>();
 
 	// Get collection name (first arg)
@@ -449,7 +449,7 @@ static void FirestoreDeleteFunction(ClientContext &context, TableFunctionInput &
 	auto &global_state = data.global_state->Cast<FirestoreDeleteGlobalState>();
 
 	if (global_state.done) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -469,8 +469,8 @@ static void FirestoreDeleteFunction(ClientContext &context, TableFunctionInput &
 		throw InvalidInputException("Firestore delete failed: " + std::string(e.what()));
 	}
 
-	FlatVector::GetData<int64_t>(output.data[0])[0] = count;
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = count;
+	FirestoreSetCardinality(output, 1);
 	global_state.done = true;
 }
 
@@ -497,7 +497,8 @@ struct FirestoreUpdateBatchGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreUpdateBatchBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types,
+                                                         vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreUpdateBatchBindData>();
 
 	// Get collection name (first arg)
@@ -576,7 +577,7 @@ static void FirestoreUpdateBatchFunction(ClientContext &context, TableFunctionIn
 	auto &global_state = data.global_state->Cast<FirestoreUpdateBatchGlobalState>();
 
 	if (global_state.done) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -651,8 +652,8 @@ static void FirestoreUpdateBatchFunction(ClientContext &context, TableFunctionIn
 		throw InvalidInputException("Firestore batch update failed: " + std::string(e.what()));
 	}
 
-	FlatVector::GetData<int64_t>(output.data[0])[0] = count;
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = count;
+	FirestoreSetCardinality(output, 1);
 	global_state.done = true;
 }
 
@@ -677,7 +678,8 @@ struct FirestoreDeleteBatchGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreDeleteBatchBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types,
+                                                         vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreDeleteBatchBindData>();
 
 	// Get collection name (first arg)
@@ -739,7 +741,7 @@ static void FirestoreDeleteBatchFunction(ClientContext &context, TableFunctionIn
 	auto &global_state = data.global_state->Cast<FirestoreDeleteBatchGlobalState>();
 
 	if (global_state.done) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -802,8 +804,8 @@ static void FirestoreDeleteBatchFunction(ClientContext &context, TableFunctionIn
 		throw InvalidInputException("Firestore batch delete failed: " + std::string(e.what()));
 	}
 
-	FlatVector::GetData<int64_t>(output.data[0])[0] = count;
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = count;
+	FirestoreSetCardinality(output, 1);
 	global_state.done = true;
 }
 
@@ -833,7 +835,8 @@ struct FirestoreArrayTransformGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> FirestoreArrayTransformBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names,
+                                                            vector<LogicalType> &return_types,
+                                                            vector<FirestoreName> &names,
                                                             FirestoreClient::ArrayTransformType transform_type) {
 	auto result = make_uniq<FirestoreArrayTransformBindData>();
 	result->transform_type = transform_type;
@@ -892,19 +895,22 @@ static unique_ptr<FunctionData> FirestoreArrayTransformBind(ClientContext &conte
 }
 
 static unique_ptr<FunctionData> FirestoreArrayUnionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types,
+                                                        vector<FirestoreName> &names) {
 	return FirestoreArrayTransformBind(context, input, return_types, names,
 	                                   FirestoreClient::ArrayTransformType::ARRAY_UNION);
 }
 
 static unique_ptr<FunctionData> FirestoreArrayRemoveBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types,
+                                                         vector<FirestoreName> &names) {
 	return FirestoreArrayTransformBind(context, input, return_types, names,
 	                                   FirestoreClient::ArrayTransformType::ARRAY_REMOVE);
 }
 
 static unique_ptr<FunctionData> FirestoreArrayAppendBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types,
+                                                         vector<FirestoreName> &names) {
 	return FirestoreArrayTransformBind(context, input, return_types, names,
 	                                   FirestoreClient::ArrayTransformType::ARRAY_APPEND);
 }
@@ -919,7 +925,7 @@ static void FirestoreArrayTransformFunction(ClientContext &context, TableFunctio
 	auto &global_state = data.global_state->Cast<FirestoreArrayTransformGlobalState>();
 
 	if (global_state.done) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -949,8 +955,8 @@ static void FirestoreArrayTransformFunction(ClientContext &context, TableFunctio
 		throw InvalidInputException("Firestore array transform failed: " + std::string(e.what()));
 	}
 
-	FlatVector::GetData<int64_t>(output.data[0])[0] = count;
-	output.SetCardinality(1);
+	FirestoreMutableData<int64_t>(output.data[0])[0] = count;
+	FirestoreSetCardinality(output, 1);
 	global_state.done = true;
 }
 
@@ -995,11 +1001,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	insert_func.in_out_function = FirestoreInsertInOutFunction;
 	insert_func.in_out_function_final = FirestoreInsertFinal;
 
-	insert_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	insert_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	insert_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	insert_func.named_parameters["database"] = LogicalType::VARCHAR;
-	insert_func.named_parameters["document_id"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(insert_func, {
+	                                             {"project_id", LogicalType::VARCHAR},
+	                                             {"credentials", LogicalType::VARCHAR},
+	                                             {"api_key", LogicalType::VARCHAR},
+	                                             {"database", LogicalType::VARCHAR},
+	                                             {"document_id", LogicalType::VARCHAR},
+	                                         });
 
 	RegisterDocumentedTableFunction(
 	    loader, insert_func,
@@ -1016,11 +1024,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR}, // collection, document_id
 	                          FirestoreUpdateFunction, FirestoreUpdateBind, FirestoreUpdateInitGlobal);
 
-	update_func.varargs = LogicalType::ANY; // Accept field/value pairs
-	update_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	update_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	update_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	update_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreSetVarArgs(update_func, LogicalType::ANY); // Accept field/value pairs
+	FirestoreAddNamedParameters(update_func, {
+	                                             {"project_id", LogicalType::VARCHAR},
+	                                             {"credentials", LogicalType::VARCHAR},
+	                                             {"api_key", LogicalType::VARCHAR},
+	                                             {"database", LogicalType::VARCHAR},
+	                                         });
 
 	RegisterDocumentedTableFunction(
 	    loader, update_func,
@@ -1036,10 +1046,12 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR}, // collection, document_id
 	                          FirestoreDeleteFunction, FirestoreDeleteBind, FirestoreDeleteInitGlobal);
 
-	delete_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	delete_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	delete_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	delete_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(delete_func, {
+	                                             {"project_id", LogicalType::VARCHAR},
+	                                             {"credentials", LogicalType::VARCHAR},
+	                                             {"api_key", LogicalType::VARCHAR},
+	                                             {"database", LogicalType::VARCHAR},
+	                                         });
 
 	RegisterDocumentedTableFunction(loader, delete_func,
 	                                {{"collection", "document_id"},
@@ -1053,11 +1065,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    "firestore_update_batch", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
 	    FirestoreUpdateBatchFunction, FirestoreUpdateBatchBind, FirestoreUpdateBatchInitGlobal);
 
-	update_batch_func.varargs = LogicalType::ANY; // Accept field/value pairs
-	update_batch_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	update_batch_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	update_batch_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	update_batch_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreSetVarArgs(update_batch_func, LogicalType::ANY); // Accept field/value pairs
+	FirestoreAddNamedParameters(update_batch_func, {
+	                                                   {"project_id", LogicalType::VARCHAR},
+	                                                   {"credentials", LogicalType::VARCHAR},
+	                                                   {"api_key", LogicalType::VARCHAR},
+	                                                   {"database", LogicalType::VARCHAR},
+	                                               });
 
 	RegisterDocumentedTableFunction(
 	    loader, update_batch_func,
@@ -1074,10 +1088,12 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    "firestore_delete_batch", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)},
 	    FirestoreDeleteBatchFunction, FirestoreDeleteBatchBind, FirestoreDeleteBatchInitGlobal);
 
-	delete_batch_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	delete_batch_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	delete_batch_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	delete_batch_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(delete_batch_func, {
+	                                                   {"project_id", LogicalType::VARCHAR},
+	                                                   {"credentials", LogicalType::VARCHAR},
+	                                                   {"api_key", LogicalType::VARCHAR},
+	                                                   {"database", LogicalType::VARCHAR},
+	                                               });
 
 	RegisterDocumentedTableFunction(
 	    loader, delete_batch_func,
@@ -1095,10 +1111,12 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    FirestoreArrayTransformFunction, FirestoreArrayUnionBind, FirestoreArrayTransformInitGlobal);
 
-	array_union_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	array_union_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	array_union_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	array_union_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(array_union_func, {
+	                                                  {"project_id", LogicalType::VARCHAR},
+	                                                  {"credentials", LogicalType::VARCHAR},
+	                                                  {"api_key", LogicalType::VARCHAR},
+	                                                  {"database", LogicalType::VARCHAR},
+	                                              });
 
 	RegisterDocumentedTableFunction(
 	    loader, array_union_func,
@@ -1116,10 +1134,12 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    FirestoreArrayTransformFunction, FirestoreArrayRemoveBind, FirestoreArrayTransformInitGlobal);
 
-	array_remove_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	array_remove_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	array_remove_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	array_remove_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(array_remove_func, {
+	                                                   {"project_id", LogicalType::VARCHAR},
+	                                                   {"credentials", LogicalType::VARCHAR},
+	                                                   {"api_key", LogicalType::VARCHAR},
+	                                                   {"database", LogicalType::VARCHAR},
+	                                               });
 
 	RegisterDocumentedTableFunction(
 	    loader, array_remove_func,
@@ -1137,10 +1157,12 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    FirestoreArrayTransformFunction, FirestoreArrayAppendBind, FirestoreArrayTransformInitGlobal);
 
-	array_append_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	array_append_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	array_append_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	array_append_func.named_parameters["database"] = LogicalType::VARCHAR;
+	FirestoreAddNamedParameters(array_append_func, {
+	                                                   {"project_id", LogicalType::VARCHAR},
+	                                                   {"credentials", LogicalType::VARCHAR},
+	                                                   {"api_key", LogicalType::VARCHAR},
+	                                                   {"database", LogicalType::VARCHAR},
+	                                               });
 
 	RegisterDocumentedTableFunction(
 	    loader, array_append_func,

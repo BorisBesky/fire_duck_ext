@@ -3,6 +3,7 @@
 #include "firestore_scanner.hpp"
 #include "firestore_settings.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_duckdb_compat.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -27,18 +28,18 @@ static bool IsBareCountStar(const LogicalAggregate &aggregate) {
 		return false;
 	}
 	auto &expression = *aggregate.expressions[0];
-	if (expression.expression_class != ExpressionClass::BOUND_AGGREGATE) {
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 		return false;
 	}
 	auto &aggregate_expression = expression.Cast<BoundAggregateExpression>();
-	if (aggregate_expression.function.name != "count_star") {
+	if (FirestoreAggregateName(aggregate_expression) != "count_star") {
 		return false;
 	}
 	// count(DISTINCT x) and count(*) FILTER (WHERE ...) both depend on values.
-	if (aggregate_expression.IsDistinct() || aggregate_expression.filter != nullptr) {
+	if (aggregate_expression.IsDistinct() || FirestoreAggregateHasFilter(aggregate_expression)) {
 		return false;
 	}
-	return aggregate_expression.children.empty();
+	return FirestoreChildren(aggregate_expression).empty();
 }
 
 // Returns true if this operator type blocks ORDER BY / LIMIT from applying to child scans.
@@ -79,9 +80,9 @@ static bool IsBarrierOperator(LogicalOperatorType type) {
 static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colref, LogicalGet &get,
                                             const std::vector<LogicalProjection *> &projections, idx_t &out_col_idx) {
 	// Direct reference to the scan table
-	if (colref.binding.table_index == get.table_index) {
+	if (FirestoreBindingTable(colref) == FirestoreIndexValue(get.table_index)) {
 		auto &col_ids = get.GetColumnIds();
-		idx_t binding_idx = colref.binding.column_index;
+		idx_t binding_idx = FirestoreBindingColumn(colref);
 		if (binding_idx >= col_ids.size()) {
 			return false;
 		}
@@ -92,24 +93,24 @@ static bool ResolveColumnThroughProjections(const BoundColumnRefExpression &colr
 	// Try to resolve through tracked projections
 	for (size_t pi = 0; pi < projections.size(); pi++) {
 		auto *proj = projections[pi];
-		if (colref.binding.table_index != proj->table_index) {
+		if (FirestoreBindingTable(colref) != FirestoreIndexValue(proj->table_index)) {
 			continue;
 		}
-		idx_t proj_col_idx = colref.binding.column_index;
+		idx_t proj_col_idx = FirestoreBindingColumn(colref);
 		if (proj_col_idx >= proj->expressions.size()) {
 			continue;
 		}
 		// The projection expression at this index should be a BoundColumnRefExpression
 		// pointing to the underlying table
 		auto &proj_expr = *proj->expressions[proj_col_idx];
-		if (proj_expr.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		if (proj_expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			FS_LOG_DEBUG("Projection expression is not a column ref, skipping ORDER BY pushdown");
 			return false;
 		}
 		auto &inner_colref = proj_expr.Cast<BoundColumnRefExpression>();
-		if (inner_colref.binding.table_index == get.table_index) {
+		if (FirestoreBindingTable(inner_colref) == FirestoreIndexValue(get.table_index)) {
 			auto &col_ids = get.GetColumnIds();
-			idx_t binding_idx = inner_colref.binding.column_index;
+			idx_t binding_idx = FirestoreBindingColumn(inner_colref);
 			if (binding_idx >= col_ids.size()) {
 				return false;
 			}
@@ -135,7 +136,7 @@ static bool TryExtractOrderBy(LogicalGet &get, const vector<BoundOrderByNode> &o
 	for (size_t oi = 0; oi < orders.size(); oi++) {
 		auto &ob = orders[oi];
 		// Only handle simple column references - skip expressions like score + 1
-		if (ob.expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		if (ob.expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			FS_LOG_DEBUG("ORDER BY expression is not a simple column ref, skipping pushdown");
 			return false;
 		}
@@ -154,7 +155,7 @@ static bool TryExtractOrderBy(LogicalGet &get, const vector<BoundOrderByNode> &o
 			return false;
 		}
 
-		std::string field_name = get.names[col_idx];
+		std::string field_name = FirestoreNameString(get.names[col_idx]);
 		// __document_id maps to __name__ in Firestore
 		if (field_name == "__document_id") {
 			field_name = "__name__";
@@ -252,7 +253,7 @@ static bool OrderingWouldChangeResults(LogicalGet &get, const std::vector<BoundO
 	}
 
 	for (const auto &order_node : order_nodes) {
-		if (order_node.expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		if (order_node.expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return true; // Not a plain column; TryExtractOrderBy would decline anyway.
 		}
 		auto &colref = order_node.expression->Cast<BoundColumnRefExpression>();
@@ -261,7 +262,7 @@ static bool OrderingWouldChangeResults(LogicalGet &get, const std::vector<BoundO
 			return true;
 		}
 
-		std::string field_name = get.names[col_idx];
+		std::string field_name = FirestoreNameString(get.names[col_idx]);
 		if (field_name == "__document_id") {
 			field_name = "__name__";
 		}
@@ -341,7 +342,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 	// Check if this is a firestore_scan LogicalGet
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
-		if (get.function.name == "firestore_scan" && get.bind_data) {
+		if (FirestoreFunctionName(get) == "firestore_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->CastNoConst<FirestoreScanBindData>();
 			// The scan's own parameter wins over the session setting.
 			const bool orderby_pushdown_allowed = bind_data.orderby_pushdown.has_value()
@@ -367,7 +368,7 @@ static void WalkPlanTree(LogicalOperator &op, LogicalOrder *current_order, Logic
 					    current_topn ? &current_topn->orders : (current_order ? &current_order->orders : nullptr);
 					if (order_nodes && order_nodes->size() == 1) {
 						auto &ob = (*order_nodes)[0];
-						if (ob.expression->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+						if (ob.expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 							auto &colref = ob.expression->Cast<BoundColumnRefExpression>();
 							idx_t col_idx;
 							if (ResolveColumnThroughProjections(colref, get, projections, col_idx) &&

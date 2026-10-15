@@ -44,20 +44,21 @@ struct FirestoreClearCacheBindData : public TableFunctionData {
 static void FirestoreClearCacheFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FirestoreOneShotState>();
 	if (state.finished) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
 	auto &bind_data = data.bind_data->Cast<FirestoreClearCacheBindData>();
 	ClearFirestoreSchemaCache(bind_data.collection);
-	FlatVector::GetData<bool>(output.data[0])[0] = true;
-	output.SetCardinality(1);
+	FirestoreMutableData<bool>(output.data[0])[0] = true;
+	FirestoreSetCardinality(output, 1);
 	state.finished = true;
 }
 
 // Bind for clear cache with no arguments (clears all)
 static unique_ptr<FunctionData> FirestoreClearCacheBindAll(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<FirestoreName> &names) {
 	// Table functions must return at least one column
 	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
@@ -70,7 +71,7 @@ static unique_ptr<FunctionData> FirestoreClearCacheBindAll(ClientContext &contex
 // Bind for clear cache with collection argument
 static unique_ptr<FunctionData> FirestoreClearCacheBindCollection(ClientContext &context, TableFunctionBindInput &input,
                                                                   vector<LogicalType> &return_types,
-                                                                  vector<string> &names) {
+                                                                  vector<FirestoreName> &names) {
 	// Table functions must return at least one column
 	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
@@ -91,7 +92,7 @@ struct FirestoreConnectBindData : public TableFunctionData {
 
 // Bind for firestore_connect(database_id)
 static unique_ptr<FunctionData> FirestoreConnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<FirestoreName> &names) {
 	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 
@@ -104,7 +105,7 @@ static unique_ptr<FunctionData> FirestoreConnectBind(ClientContext &context, Tab
 static void FirestoreConnectFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FirestoreOneShotState>();
 	if (state.finished) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -122,14 +123,15 @@ static void FirestoreConnectFunction(ClientContext &context, TableFunctionInput 
 	// Store in session state
 	SetConnectedDatabase(context, bind_data.database_id);
 
-	FlatVector::GetData<bool>(output.data[0])[0] = true;
-	output.SetCardinality(1);
+	FirestoreMutableData<bool>(output.data[0])[0] = true;
+	FirestoreSetCardinality(output, 1);
 	state.finished = true;
 }
 
 // Bind for firestore_disconnect()
 static unique_ptr<FunctionData> FirestoreDisconnectBind(ClientContext &context, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types,
+                                                        vector<FirestoreName> &names) {
 	names.push_back("Success");
 	return_types.push_back(LogicalType::BOOLEAN);
 	return make_uniq<TableFunctionData>();
@@ -139,13 +141,13 @@ static unique_ptr<FunctionData> FirestoreDisconnectBind(ClientContext &context, 
 static void FirestoreDisconnectFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<FirestoreOneShotState>();
 	if (state.finished) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
 	ClearConnectedDatabase(context);
-	FlatVector::GetData<bool>(output.data[0])[0] = true;
-	output.SetCardinality(1);
+	FirestoreMutableData<bool>(output.data[0])[0] = true;
+	FirestoreSetCardinality(output, 1);
 	state.finished = true;
 }
 
