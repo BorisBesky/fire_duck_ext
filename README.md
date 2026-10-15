@@ -495,7 +495,7 @@ call firestore_update('embeddings', 'emb1',
 SELECT a.label, b.label,
     sqrt(list_sum(list_transform(
         generate_series(1, 3),
-        i -> power(a.vector[i] - b.vector[i], 2)
+        lambda i: power(a.vector[i] - b.vector[i], 2)
     ))) AS distance
 FROM firestore_scan('embeddings') a, firestore_scan('embeddings') b
 WHERE a.label < b.label;

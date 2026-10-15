@@ -57,11 +57,11 @@ No Firestore credentials found
 # firestore_update_batch Error Handling
 # ============================================
 
-# Non-list document IDs (string instead of list) — DuckDB rejects at type check before bind
+# Non-list document IDs (string instead of list) — DuckDB rejects before bind (1.5: no overload; 2.0: failed cast)
 statement error
 SELECT * FROM firestore_update_batch('users', 'not-a-list', 'field', 'value');
 ----
-No function matches
+<REGEX>:.*(No function matches|can't be cast to the destination type VARCHAR\[\]).*
 
 # Empty field list after document IDs
 statement error
@@ -83,7 +83,7 @@ firestore_update_batch requires field name/value pairs
 statement error
 SELECT * FROM firestore_delete_batch('users', 'not-a-list');
 ----
-No function matches
+<REGEX>:.*(No function matches|can't be cast to the destination type VARCHAR\[\]).*
 
 # ============================================
 # Function Signature Validation

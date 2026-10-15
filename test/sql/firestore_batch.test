@@ -23,7 +23,7 @@ CREATE SECRET batch_test (
 statement error
 SELECT * FROM firestore_update_batch('users', 'not-a-list', 'field', 'value');
 ----
-No function matches
+<REGEX>:.*(No function matches|can't be cast to the destination type VARCHAR\[\]).*
 
 # Must have at least one field to update
 statement error
@@ -51,7 +51,7 @@ must be a string
 statement error
 SELECT * FROM firestore_delete_batch('users', 'not-a-list');
 ----
-No function matches
+<REGEX>:.*(No function matches|can't be cast to the destination type VARCHAR\[\]).*
 
 # ============================================
 # Filtering Pattern Tests (DuckDB-side filtering)

@@ -292,7 +292,7 @@ run_query "SELECT * FROM firestore_array_append('array_test', 'arr1', 'tags', ['
 TAG_COUNT=$(run_query "SELECT list_count(tags) FROM firestore_scan('array_test');")
 assert_eq "$TAG_COUNT" "4" "Array has 4 tags after append (duplicates allowed)"
 
-INITIAL_OCCURRENCES=$(run_query "SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');")
+INITIAL_OCCURRENCES=$(run_query "SELECT list_count(list_filter(tags, lambda x: x = 'initial')) FROM firestore_scan('array_test');")
 assert_eq "$INITIAL_OCCURRENCES" "2" "'initial' appears twice (duplicate created)"
 
 # Test 15: Array union (no duplicates)
@@ -312,7 +312,7 @@ assert_eq "$TAG_COUNT_AFTER" "$EXPECTED_AFTER" "Union added exactly 1 new elemen
 echo "Test 16: Array remove..."
 run_query "SELECT * FROM firestore_array_remove('array_test', 'arr1', 'tags', ['initial']);" > /dev/null
 
-INITIAL_COUNT=$(run_query "SELECT list_count(list_filter(tags, x -> x = 'initial')) FROM firestore_scan('array_test');")
+INITIAL_COUNT=$(run_query "SELECT list_count(list_filter(tags, lambda x: x = 'initial')) FROM firestore_scan('array_test');")
 assert_eq "$INITIAL_COUNT" "0" "All 'initial' entries removed"
 
 HAS_PREMIUM=$(run_query "SELECT list_contains(tags, 'premium') FROM firestore_scan('array_test');")
@@ -432,7 +432,7 @@ assert_eq "$CG_HAS_DELTA" "true" "Collection group array union added 'delta'"
 # Array remove via collection group
 run_query "SELECT * FROM firestore_array_remove('~tags', 'users/user1/tags/tag1', 'labels', ['alpha']);" > /dev/null
 
-CG_ALPHA_COUNT=$(run_query "SELECT list_count(list_filter(labels, x -> x = 'alpha')) FROM firestore_scan('users/user1/tags');")
+CG_ALPHA_COUNT=$(run_query "SELECT list_count(list_filter(labels, lambda x: x = 'alpha')) FROM firestore_scan('users/user1/tags');")
 assert_eq "$CG_ALPHA_COUNT" "0" "Collection group array remove removed all 'alpha' entries"
 
 # Cleanup collection group array test data
