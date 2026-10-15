@@ -141,7 +141,7 @@ inline vector<LogicalType> FirestorePositionalArgumentTypes(const TableFunction 
 }
 
 // The names of the named parameters, in the order duckdb_functions() lists
-// them.
+// them. On DuckDB 1.5, pass the copy GetFunctionByOffset returned.
 inline vector<string> FirestoreNamedParameterNames(const TableFunction &function) {
 	vector<string> result;
 #ifdef FIRESTORE_DUCKDB_V2
@@ -152,10 +152,11 @@ inline vector<string> FirestoreNamedParameterNames(const TableFunction &function
 		}
 	}
 #else
-	// Iterate a copy: the map is unordered and its order differs between
-	// standard libraries, so read it back exactly as duckdb_functions() does.
-	auto named_parameters = function.named_parameters;
-	for (auto &parameter : named_parameters) {
+	// duckdb_functions() iterates the named_parameters of the copy that
+	// GetFunctionByOffset returns, so `function` must be that copy, iterated
+	// as is. The map is unordered, and with libc++ and MSVC copying it again
+	// changes its order, which would pair names with the wrong types.
+	for (auto &parameter : function.named_parameters) {
 		result.push_back(parameter.first);
 	}
 #endif
