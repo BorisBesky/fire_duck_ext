@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "firestore_duckdb_compat.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "firestore_client.hpp"
 #include "firestore_schema_accumulator.hpp"
@@ -255,7 +256,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader);
 
 // Table function callbacks
 unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names);
+                                           vector<LogicalType> &return_types, vector<FirestoreName> &names);
 
 unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 

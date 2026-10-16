@@ -1,6 +1,7 @@
 #include "firestore_index.hpp"
 #include "firestore_types.hpp"
 #include "firestore_logger.hpp"
+#include "firestore_duckdb_compat.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -78,87 +79,6 @@ std::string FormatOrderByForREST(const std::vector<OrderByField> &fields) {
 			result += " desc";
 		}
 	}
-	return result;
-}
-
-// Check for InFilter - may or may not be available depending on DuckDB version
-// We handle it via filter_type check at runtime
-
-std::vector<FirestorePushdownFilter> ConvertDuckDBFilter(const std::string &field_name, const LogicalType &field_type,
-                                                         const TableFilter &filter) {
-	std::vector<FirestorePushdownFilter> result;
-
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &const_filter = filter.Cast<ConstantFilter>();
-		FirestorePushdownFilter pf;
-		pf.field_path = field_name;
-
-		switch (const_filter.comparison_type) {
-		case ExpressionType::COMPARE_EQUAL:
-			pf.firestore_op = "EQUAL";
-			pf.is_equality = true;
-			break;
-		case ExpressionType::COMPARE_NOTEQUAL:
-			pf.firestore_op = "NOT_EQUAL";
-			pf.is_equality = true;
-			break;
-		case ExpressionType::COMPARE_LESSTHAN:
-			pf.firestore_op = "LESS_THAN";
-			break;
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			pf.firestore_op = "LESS_THAN_OR_EQUAL";
-			break;
-		case ExpressionType::COMPARE_GREATERTHAN:
-			pf.firestore_op = "GREATER_THAN";
-			break;
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-			pf.firestore_op = "GREATER_THAN_OR_EQUAL";
-			break;
-		default:
-			FS_LOG_DEBUG("Unsupported comparison type for pushdown on field: " + field_name);
-			return {};
-		}
-
-		pf.firestore_value = DuckDBValueToFirestore(const_filter.constant, field_type);
-		result.push_back(std::move(pf));
-		break;
-	}
-
-	case TableFilterType::IS_NULL: {
-		// IS_NULL is NOT pushed down: Firestore's IS_NULL only matches documents where
-		// the field exists and is explicitly null, not documents where the field is missing.
-		// DuckDB treats missing fields as NULL, so this would produce incorrect results.
-		FS_LOG_DEBUG("IS_NULL filter not pushed down (Firestore excludes missing fields): " + field_name);
-		return {};
-	}
-
-	case TableFilterType::IS_NOT_NULL: {
-		FirestorePushdownFilter pf;
-		pf.field_path = field_name;
-		pf.is_unary = true;
-		pf.unary_op = "IS_NOT_NULL";
-		pf.is_equality = true;
-		result.push_back(std::move(pf));
-		break;
-	}
-
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		for (auto &child : conj.child_filters) {
-			auto child_filters = ConvertDuckDBFilter(field_name, field_type, *child);
-			result.insert(result.end(), std::make_move_iterator(child_filters.begin()),
-			              std::make_move_iterator(child_filters.end()));
-		}
-		break;
-	}
-
-	default:
-		// ConjunctionOrFilter and other types are not pushed down
-		FS_LOG_DEBUG("Filter type not supported for pushdown on field: " + field_name);
-		return {};
-	}
-
 	return result;
 }
 
@@ -418,10 +338,10 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	// Returns false if the column can't be resolved to a pushable field.
 	auto resolve_column = [&](const BoundColumnRefExpression &col_ref, std::string &out_name,
 	                          LogicalType &out_type) -> bool {
-		if (col_ref.binding.table_index != table_index) {
+		if (FirestoreBindingTable(col_ref) != table_index) {
 			return false;
 		}
-		idx_t binding_idx = col_ref.binding.column_index;
+		idx_t binding_idx = FirestoreBindingColumn(col_ref);
 		if (binding_idx >= column_id_map.size()) {
 			return false;
 		}
@@ -439,9 +359,9 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	};
 
 	// Handle AND conjunction - recurse into children
-	if (expr.type == ExpressionType::CONJUNCTION_AND) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
-		for (auto &child : conj.children) {
+		for (auto &child : FirestoreChildren(conj)) {
 			auto child_filters =
 			    ConvertExpressionToFilters(*child, table_index, all_column_names, all_column_types, column_id_map);
 			result.insert(result.end(), std::make_move_iterator(child_filters.begin()),
@@ -452,9 +372,9 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 
 	// Handle OR conjunction - detect OR-of-equalities-on-same-field pattern for Firestore IN
 	// DuckDB rewrites `x IN ('a', 'b')` to `(x = 'a') OR (x = 'b')`
-	if (expr.type == ExpressionType::CONJUNCTION_OR) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
-		if (conj.children.empty()) {
+		if (FirestoreChildren(conj).empty()) {
 			return {};
 		}
 
@@ -463,25 +383,25 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 		LogicalType common_type;
 		std::vector<json> values;
 
-		for (auto &child : conj.children) {
+		for (auto &child : FirestoreChildren(conj)) {
 			// Each child must be a comparison expression with EQUAL
-			if (child->expression_class != ExpressionClass::BOUND_COMPARISON ||
-			    child->type != ExpressionType::COMPARE_EQUAL) {
+			if (!FirestoreIsComparison(*child) || child->GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
 				return {}; // Not all children are equalities - can't convert to IN
 			}
-			auto &cmp = child->Cast<BoundComparisonExpression>();
+			auto &left = FirestoreComparisonLeft(*child);
+			auto &right = FirestoreComparisonRight(*child);
 
 			const BoundColumnRefExpression *col_ref = nullptr;
 			const BoundConstantExpression *const_val = nullptr;
 
-			if (cmp.left->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-			    cmp.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
-				col_ref = &cmp.left->Cast<BoundColumnRefExpression>();
-				const_val = &cmp.right->Cast<BoundConstantExpression>();
-			} else if (cmp.right->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-			           cmp.left->expression_class == ExpressionClass::BOUND_CONSTANT) {
-				col_ref = &cmp.right->Cast<BoundColumnRefExpression>();
-				const_val = &cmp.left->Cast<BoundConstantExpression>();
+			if (left.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			    right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+				col_ref = &left.Cast<BoundColumnRefExpression>();
+				const_val = &right.Cast<BoundConstantExpression>();
+			} else if (right.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			           left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+				col_ref = &right.Cast<BoundColumnRefExpression>();
+				const_val = &left.Cast<BoundConstantExpression>();
 			} else {
 				return {};
 			}
@@ -499,7 +419,7 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 				return {}; // Different columns - can't convert to single IN filter
 			}
 
-			values.push_back(DuckDBValueToFirestore(const_val->value, common_type));
+			values.push_back(DuckDBValueToFirestore(FirestoreConstantValue(*const_val), common_type));
 		}
 
 		// Firestore IN filter has a limit of 30 values
@@ -525,11 +445,10 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	// DuckDB treats missing fields as NULL, so pushing IS_NULL would incorrectly exclude
 	// documents that lack the field entirely. IS_NOT_NULL is safe to push because Firestore
 	// correctly excludes both missing-field and explicitly-null documents.
-	if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-		auto &op_expr = expr.Cast<BoundOperatorExpression>();
-		if (op_expr.children.size() == 1 &&
-		    op_expr.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-			auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		auto &children = FirestoreChildren(expr.Cast<BoundOperatorExpression>());
+		if (children.size() == 1 && children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto &col_ref = children[0]->Cast<BoundColumnRefExpression>();
 			std::string field_name;
 			LogicalType field_type;
 			if (!resolve_column(col_ref, field_name, field_type)) {
@@ -549,17 +468,18 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	// Handle COMPARE_IN / COMPARE_NOT_IN (BoundOperatorExpression)
 	// DuckDB represents `x IN ('a', 'b')` as BoundOperatorExpression with type COMPARE_IN
 	// children[0] = column ref, children[1..n] = constant values
-	if (expr.type == ExpressionType::COMPARE_IN || expr.type == ExpressionType::COMPARE_NOT_IN) {
-		auto &op_expr = expr.Cast<BoundOperatorExpression>();
-		if (op_expr.children.size() < 2) {
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+	    expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+		auto &children = FirestoreChildren(expr.Cast<BoundOperatorExpression>());
+		if (children.size() < 2) {
 			return {};
 		}
 
 		// First child must be a column reference
-		if (op_expr.children[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		if (children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return {};
 		}
-		auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+		auto &col_ref = children[0]->Cast<BoundColumnRefExpression>();
 		std::string field_name;
 		LogicalType field_type;
 		if (!resolve_column(col_ref, field_name, field_type)) {
@@ -568,12 +488,12 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 
 		// Remaining children must be constants
 		std::vector<json> values;
-		for (size_t i = 1; i < op_expr.children.size(); i++) {
-			if (op_expr.children[i]->expression_class != ExpressionClass::BOUND_CONSTANT) {
+		for (size_t i = 1; i < children.size(); i++) {
+			if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 				return {};
 			}
-			auto &const_val = op_expr.children[i]->Cast<BoundConstantExpression>();
-			values.push_back(DuckDBValueToFirestore(const_val.value, field_type));
+			auto &const_val = children[i]->Cast<BoundConstantExpression>();
+			values.push_back(DuckDBValueToFirestore(FirestoreConstantValue(const_val), field_type));
 		}
 
 		// Firestore IN filter has a limit of 30 values
@@ -583,7 +503,7 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 
 		FirestorePushdownFilter pf;
 		pf.field_path = field_name;
-		pf.firestore_op = (expr.type == ExpressionType::COMPARE_IN) ? "IN" : "NOT_IN";
+		pf.firestore_op = (expr.GetExpressionType() == ExpressionType::COMPARE_IN) ? "IN" : "NOT_IN";
 		pf.is_in_filter = true;
 		pf.is_equality = true;
 		pf.in_values = std::move(values);
@@ -592,22 +512,23 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 	}
 
 	// Handle comparison expressions (=, <>, <, <=, >, >=)
-	if (expr.expression_class == ExpressionClass::BOUND_COMPARISON) {
-		auto &cmp = expr.Cast<BoundComparisonExpression>();
+	if (FirestoreIsComparison(expr)) {
+		auto &left = FirestoreComparisonLeft(expr);
+		auto &right = FirestoreComparisonRight(expr);
 
 		// Determine which side is the column and which is the constant
 		const BoundColumnRefExpression *col_ref = nullptr;
 		const BoundConstantExpression *const_val = nullptr;
 		bool reversed = false;
 
-		if (cmp.left->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-		    cmp.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
-			col_ref = &cmp.left->Cast<BoundColumnRefExpression>();
-			const_val = &cmp.right->Cast<BoundConstantExpression>();
-		} else if (cmp.right->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-		           cmp.left->expression_class == ExpressionClass::BOUND_CONSTANT) {
-			col_ref = &cmp.right->Cast<BoundColumnRefExpression>();
-			const_val = &cmp.left->Cast<BoundConstantExpression>();
+		if (left.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		    right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			col_ref = &left.Cast<BoundColumnRefExpression>();
+			const_val = &right.Cast<BoundConstantExpression>();
+		} else if (right.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		           left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			col_ref = &right.Cast<BoundColumnRefExpression>();
+			const_val = &left.Cast<BoundConstantExpression>();
 			reversed = true;
 		} else {
 			// Neither side is a simple column ref + constant
@@ -623,7 +544,7 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 		FirestorePushdownFilter pf;
 		pf.field_path = field_name;
 
-		ExpressionType cmp_type = expr.type;
+		ExpressionType cmp_type = expr.GetExpressionType();
 		// If the constant is on the left (e.g., 5 < x), flip the comparison
 		if (reversed) {
 			switch (cmp_type) {
@@ -670,13 +591,14 @@ std::vector<FirestorePushdownFilter> ConvertExpressionToFilters(const Expression
 			return {};
 		}
 
-		pf.firestore_value = DuckDBValueToFirestore(const_val->value, field_type);
+		pf.firestore_value = DuckDBValueToFirestore(FirestoreConstantValue(*const_val), field_type);
 		result.push_back(std::move(pf));
 		return result;
 	}
 
 	// Unsupported expression type - skip silently
-	FS_LOG_DEBUG("Expression type not supported for pushdown: " + std::to_string(static_cast<int>(expr.type)));
+	FS_LOG_DEBUG("Expression type not supported for pushdown: " +
+	             std::to_string(static_cast<int>(expr.GetExpressionType())));
 	return {};
 }
 

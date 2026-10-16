@@ -67,10 +67,12 @@ statement error
 SELECT * FROM firestore_update_batch('users', ['id1', 'id2', 'id3'], 'status', 'active');
 ----
 
-# Empty list should work (but do nothing)
-statement error
-SELECT * FROM firestore_update_batch('users', [], 'status', 'active');
+# Empty list should work (but do nothing). Typed, because DuckDB 1.5 does not
+# match an untyped [] to VARCHAR[] while 2.0 does.
+query I
+SELECT * FROM firestore_update_batch('users', []::VARCHAR[], 'status', 'active');
 ----
+0
 
 # Clean up
 statement ok

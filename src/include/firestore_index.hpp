@@ -70,10 +70,6 @@ struct FirestoreIndexCache {
 	bool fetch_succeeded = false;
 };
 
-// Convert a DuckDB TableFilter into Firestore pushdown filters
-std::vector<FirestorePushdownFilter> ConvertDuckDBFilter(const std::string &field_name, const LogicalType &field_type,
-                                                         const TableFilter &filter);
-
 // Build Firestore StructuredQuery `where` clause JSON from pushed filters
 json BuildWhereClause(const std::vector<FirestorePushdownFilter> &filters);
 

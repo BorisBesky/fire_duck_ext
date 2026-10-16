@@ -153,9 +153,11 @@ static void FirestoreComplexFilterPushdown(ClientContext &context, LogicalGet &g
 		column_id_map.push_back(cid.GetPrimaryIndex());
 	}
 
+	auto column_names = FirestoreNameStrings(get.names);
+
 	for (auto &filter : filters) {
-		auto converted =
-		    ConvertExpressionToFilters(*filter, get.table_index, get.names, get.returned_types, column_id_map);
+		auto converted = ConvertExpressionToFilters(*filter, FirestoreIndexValue(get.table_index), column_names,
+		                                            get.returned_types, column_id_map);
 		bind_data.candidate_pushdown_filters.insert(bind_data.candidate_pushdown_filters.end(),
 		                                            std::make_move_iterator(converted.begin()),
 		                                            std::make_move_iterator(converted.end()));
@@ -289,7 +291,7 @@ static void ParseColumnsOverride(ClientContext &context, const Value &value, Fir
 			// Always emitted as the first column; listing it again would duplicate it.
 			throw BinderException("firestore_scan \"columns\" must not include '__document_id'; it is always present");
 		}
-		bind_data.column_names.push_back(name);
+		bind_data.column_names.push_back(FirestoreNameString(name));
 		bind_data.column_types.push_back(TransformStringToLogicalType(StringValue::Get(type_val), context));
 	}
 	if (bind_data.column_names.empty()) {
@@ -327,7 +329,7 @@ static void ForEachUnmappedField(const json &fields, const std::vector<std::stri
 // every path that produces a schema: columns override, cache hit, and fresh
 // inference alike.
 static void FinalizeScanSchema(FirestoreScanBindData &bind_data, vector<LogicalType> &return_types,
-                               vector<string> &names) {
+                               vector<FirestoreName> &names) {
 	bind_data.sorted_known_columns = bind_data.column_names;
 	std::sort(bind_data.sorted_known_columns.begin(), bind_data.sorted_known_columns.end());
 
@@ -346,21 +348,23 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 	                        FirestoreScanFunction, FirestoreScanBind, FirestoreScanInitGlobal, FirestoreScanInitLocal);
 
 	// Add named parameters
-	scan_func.named_parameters["project_id"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["credentials"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["api_key"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["database"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["scan_limit"] = LogicalType::BIGINT;
-	scan_func.named_parameters["order_by"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["show_missing"] = LogicalType::BOOLEAN;
-	scan_func.named_parameters["orderby_pushdown"] = LogicalType::BOOLEAN;
-	scan_func.named_parameters["map_encoding"] = LogicalType::VARCHAR;
-	scan_func.named_parameters["schema_sample_size"] = LogicalType::BIGINT;
-	scan_func.named_parameters["unmapped_column"] = LogicalType::BOOLEAN;
-	scan_func.named_parameters["page_size"] = LogicalType::BIGINT;
-	// Struct of column name -> type string, e.g. columns:={'id':'VARCHAR'}.
-	// ANY because the struct's own type varies per call (same as read_json).
-	scan_func.named_parameters["columns"] = LogicalType::ANY;
+	FirestoreAddNamedParameters(scan_func, {
+	                                           {"project_id", LogicalType::VARCHAR},
+	                                           {"credentials", LogicalType::VARCHAR},
+	                                           {"api_key", LogicalType::VARCHAR},
+	                                           {"database", LogicalType::VARCHAR},
+	                                           {"scan_limit", LogicalType::BIGINT},
+	                                           {"order_by", LogicalType::VARCHAR},
+	                                           {"show_missing", LogicalType::BOOLEAN},
+	                                           {"orderby_pushdown", LogicalType::BOOLEAN},
+	                                           {"map_encoding", LogicalType::VARCHAR},
+	                                           {"schema_sample_size", LogicalType::BIGINT},
+	                                           {"unmapped_column", LogicalType::BOOLEAN},
+	                                           {"page_size", LogicalType::BIGINT},
+	                                           // Struct of column name -> type string, e.g. columns:={'id':'VARCHAR'}.
+	                                           // ANY because the struct's own type varies per call (same as read_json).
+	                                           {"columns", LogicalType::ANY},
+	                                       });
 
 	// Enable projection pushdown for efficiency
 	scan_func.projection_pushdown = true;
@@ -382,7 +386,7 @@ void RegisterFirestoreScanFunction(ExtensionLoader &loader) {
 }
 
 unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<FirestoreName> &names) {
 	auto result = make_uniq<FirestoreScanBindData>();
 
 	// Get collection name (required first positional argument)
@@ -484,7 +488,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 		names.push_back("__document_id");
 		return_types.push_back(LogicalType::VARCHAR);
 		for (idx_t i = 0; i < result->column_names.size(); i++) {
-			names.push_back(result->column_names[i]);
+			names.emplace_back(result->column_names[i]);
 			return_types.push_back(result->column_types[i]);
 		}
 		// No index metadata is fetched here, so filter pushdown stays disabled and
@@ -532,7 +536,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 				return_types.push_back(LogicalType::VARCHAR);
 
 				for (const auto &[col_name, col_type] : it->second.schema) {
-					names.push_back(col_name);
+					names.emplace_back(col_name);
 					return_types.push_back(col_type);
 					result->column_names.push_back(col_name);
 					result->column_types.push_back(col_type);
@@ -596,7 +600,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 
 	// Add inferred columns
 	for (const auto &[col_name, col_type] : schema) {
-		names.push_back(col_name);
+		names.emplace_back(col_name);
 		return_types.push_back(col_type);
 		result->column_names.push_back(col_name);
 		result->column_types.push_back(col_type);
@@ -1142,7 +1146,7 @@ unique_ptr<LocalTableFunctionState> FirestoreScanInitLocal(ExecutionContext &con
 
 // Per-chunk VARIANT accumulation.
 //
-// A VARIANT vector is built from a whole chunk at once (VariantValue::ToVARIANT)
+// A VARIANT vector is built from a whole chunk at once (FirestoreVariantsToVector)
 // rather than cell by cell, so values are collected here and converted when the
 // chunk is complete.
 struct VariantChunkBuffer {
@@ -1163,14 +1167,14 @@ struct VariantChunkBuffer {
 		for (idx_t out_col = 0; out_col < is_variant_col.size(); out_col++) {
 			if (is_variant_col[out_col]) {
 				D_ASSERT(values[out_col].size() == count);
-				VariantValue::ToVARIANT(values[out_col], output.data[out_col]);
+				FirestoreVariantsToVector(values[out_col], output.data[out_col]);
 			}
 		}
 	}
 
 	std::vector<bool> is_variant_col;
-	// Inner container must be duckdb::vector -- that is what ToVARIANT takes.
-	std::vector<duckdb::vector<VariantValue>> values;
+	// Inner container must be duckdb::vector -- that is what FirestoreVariantsToVector takes.
+	std::vector<duckdb::vector<FirestoreVariant>> values;
 	bool any = false;
 };
 
@@ -1224,14 +1228,14 @@ static void WriteDocumentRow(const FirestoreScanBindData &bind_data, const Fires
 				// For regular queries, use just the document ID
 				doc_id = doc.document_id;
 			}
-			FlatVector::GetData<string_t>(output.data[out_col])[row] =
+			FirestoreMutableData<string_t>(output.data[out_col])[row] =
 			    StringVector::AddString(output.data[out_col], doc_id);
 		} else if (src_col >= bind_data.column_names.size()) {
 			// __unmapped catch-all: every field the schema does not cover.
 			// It sits past the end of column_names because that vector maps
 			// 1:1 onto Firestore fields and this column maps onto none.
 			if (variants.is_variant_col[out_col]) {
-				VariantValue obj(VariantValueType::OBJECT);
+				FirestoreVariant obj(FirestoreVariantType::OBJECT);
 				bool any = false;
 				ForEachUnmappedField(doc.fields, bind_data.sorted_known_columns,
 				                     [&](const std::string &name, const json &value) {
@@ -1239,7 +1243,7 @@ static void WriteDocumentRow(const FirestoreScanBindData &bind_data, const Fires
 					                     any = true;
 				                     });
 				// No extra fields -> SQL NULL rather than an empty object.
-				variants.values[out_col].push_back(any ? std::move(obj) : VariantValue());
+				variants.values[out_col].push_back(any ? std::move(obj) : FirestoreVariant());
 			} else {
 				json extras = json::object();
 				ForEachUnmappedField(
@@ -1249,7 +1253,7 @@ static void WriteDocumentRow(const FirestoreScanBindData &bind_data, const Fires
 					FlatVector::SetNull(output.data[out_col], row, true);
 				} else {
 					auto str = extras.dump();
-					FlatVector::GetData<string_t>(output.data[out_col])[row] =
+					FirestoreMutableData<string_t>(output.data[out_col])[row] =
 					    StringVector::AddString(output.data[out_col], str);
 				}
 			}
@@ -1259,11 +1263,11 @@ static void WriteDocumentRow(const FirestoreScanBindData &bind_data, const Fires
 
 			if (variants.is_variant_col[out_col]) {
 				// Accumulate only; the VARIANT vector is built once per chunk
-				// below. A default-constructed VariantValue is MISSING, which
-				// ToVARIANT renders as SQL NULL.
+				// below. A default-constructed FirestoreVariant is MISSING, which
+				// the conversion renders as SQL NULL.
 				auto field_it = doc.fields.find(col_name);
 				variants.values[out_col].push_back(field_it != doc.fields.end() ? FirestoreValueToVariant(*field_it)
-				                                                                : VariantValue());
+				                                                                : FirestoreVariant());
 			} else {
 				// One lookup, not contains() plus operator[]: this runs
 				// once per column per row, so the second probe is pure
@@ -1342,7 +1346,7 @@ static bool EnsureLocalPage(FirestoreScanBindData &bind_data, FirestoreScanGloba
 static void ScanKeyRange(FirestoreScanBindData &bind_data, FirestoreScanGlobalState &global_state,
                          FirestoreScanLocalState &local_state, DataChunk &output) {
 	if (!EnsureLocalPage(bind_data, global_state, local_state)) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -1359,7 +1363,7 @@ static void ScanKeyRange(FirestoreScanBindData &bind_data, FirestoreScanGlobalSt
 	}
 
 	variants.Finish(output, count);
-	output.SetCardinality(count);
+	FirestoreSetCardinality(output, count);
 }
 
 void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -1375,7 +1379,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 	}
 
 	if (global_state.finished) {
-		output.SetCardinality(0);
+		FirestoreSetCardinality(output, 0);
 		return;
 	}
 
@@ -1396,7 +1400,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		if (global_state.counted_rows_remaining.value() <= 0) {
 			global_state.finished = true;
 		}
-		output.SetCardinality(emitted);
+		FirestoreSetCardinality(output, emitted);
 		return;
 	}
 
@@ -1406,13 +1410,13 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		idx_t available = global_state.docpath_ids.size();
 		if (global_state.current_index >= available) {
 			global_state.finished = true;
-			output.SetCardinality(0);
+			FirestoreSetCardinality(output, 0);
 			return;
 		}
 
 		idx_t count = 0;
 		idx_t max_count = std::min<idx_t>(STANDARD_VECTOR_SIZE, available - global_state.current_index);
-		auto out_data = FlatVector::GetData<string_t>(output.data[0]);
+		auto out_data = FirestoreMutableData<string_t>(output.data[0]);
 
 		while (count < max_count) {
 			const auto &doc_id = global_state.docpath_ids[global_state.current_index++];
@@ -1422,7 +1426,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		if (global_state.current_index >= available) {
 			global_state.finished = true;
 		}
-		output.SetCardinality(count);
+		FirestoreSetCardinality(output, count);
 		return;
 	}
 
@@ -1444,7 +1448,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		idx_t total_returned = global_state.rows_emitted;
 		if (total_returned >= static_cast<idx_t>(effective_limit.value())) {
 			global_state.finished = true;
-			output.SetCardinality(0);
+			FirestoreSetCardinality(output, 0);
 			return;
 		}
 		max_count = std::min(max_count, static_cast<idx_t>(effective_limit.value()) - total_returned);
@@ -1541,7 +1545,7 @@ void FirestoreScanFunction(ClientContext &context, TableFunctionInput &data, Dat
 		}
 	}
 
-	output.SetCardinality(count);
+	FirestoreSetCardinality(output, count);
 }
 
 } // namespace duckdb

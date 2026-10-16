@@ -1,7 +1,8 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "duckdb/common/types/variant_value.hpp"
+#include "firestore_duckdb_compat.hpp"
+#include "firestore_variant.hpp"
 #include "firestore_wire.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -63,9 +64,9 @@ LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type,
 // {"a":{"integerValue":"1"}} -> {"a":1}
 json UnwrapFirestoreValue(const json &firestore_value);
 
-// Build a DuckDB VariantValue from a Firestore value, preserving per-value
+// Build a VARIANT value (see firestore_variant.hpp) from a Firestore value, preserving per-value
 // types and arbitrary nesting.
-VariantValue FirestoreValueToVariant(const json &firestore_value);
+FirestoreVariant FirestoreValueToVariant(const json &firestore_value);
 
 // Convert Firestore JSON value to DuckDB Value
 Value FirestoreValueToDuckDB(const json &firestore_value, const LogicalType &target_type,
@@ -76,8 +77,8 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type);
 
 // Set a value in a DuckDB vector from Firestore JSON
 // Note: VARIANT columns are NOT written here. DuckDB builds a VARIANT vector
-// from a whole chunk at once (VariantValue::ToVARIANT), so the scanner
-// accumulates VariantValues per row and converts once per chunk.
+// from a whole chunk at once (FirestoreVariantsToVector), so the scanner
+// accumulates FirestoreVariants per row and converts once per chunk.
 void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, const LogicalType &type,
                     FirestoreMapEncoding map_encoding = FirestoreMapEncoding::WIRE);
 

@@ -78,5 +78,7 @@ docs:
     The extension also builds and runs under DuckDB-WASM using API-key or
     Firebase-user auth (service-account auth needs OpenSSL and is native-only).
 
+    The same source builds for DuckDB 1.5 and the upcoming DuckDB 2.0.
+
     See the project README for the parameter and settings reference, type
     mapping, pushdown semantics, and platform notes.

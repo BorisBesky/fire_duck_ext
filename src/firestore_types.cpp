@@ -126,25 +126,25 @@ json UnwrapFirestoreValue(const json &fv) {
 	return fv; // unrecognised: pass through untouched
 }
 
-VariantValue FirestoreValueToVariant(const json &fv) {
+FirestoreVariant FirestoreValueToVariant(const json &fv) {
 	if (fv.contains("nullValue")) {
-		return VariantValue::NullValue();
+		return FirestoreVariant::NullValue();
 	}
 	if (fv.contains("stringValue")) {
-		return VariantValue(Value(fv["stringValue"].get<std::string>()));
+		return FirestoreVariant(Value(fv["stringValue"].get<std::string>()));
 	}
 	if (fv.contains("integerValue")) {
 		int64_t parsed;
 		if (TryParseFirestoreInteger(fv["integerValue"], parsed)) {
-			return VariantValue(Value::BIGINT(parsed));
+			return FirestoreVariant(Value::BIGINT(parsed));
 		}
-		return VariantValue(Value(fv["integerValue"].dump()));
+		return FirestoreVariant(Value(fv["integerValue"].dump()));
 	}
 	if (fv.contains("doubleValue")) {
-		return VariantValue(Value::DOUBLE(fv["doubleValue"].get<double>()));
+		return FirestoreVariant(Value::DOUBLE(fv["doubleValue"].get<double>()));
 	}
 	if (fv.contains("booleanValue")) {
-		return VariantValue(Value::BOOLEAN(fv["booleanValue"].get<bool>()));
+		return FirestoreVariant(Value::BOOLEAN(fv["booleanValue"].get<bool>()));
 	}
 	if (fv.contains("timestampValue")) {
 		// Keep the parsed timestamp so variant_typeof reports TIMESTAMP rather
@@ -159,31 +159,31 @@ VariantValue FirestoreValueToVariant(const json &fv) {
 			normalised[t_pos] = ' ';
 		}
 		try {
-			return VariantValue(Value::TIMESTAMP(Timestamp::FromString(normalised, false)));
+			return FirestoreVariant(Value::TIMESTAMP(Timestamp::FromString(normalised, false)));
 		} catch (const std::exception &) {
-			return VariantValue(Value(ts_str));
+			return FirestoreVariant(Value(ts_str));
 		}
 	}
 	if (fv.contains("referenceValue")) {
-		return VariantValue(Value(fv["referenceValue"].get<std::string>()));
+		return FirestoreVariant(Value(fv["referenceValue"].get<std::string>()));
 	}
 	if (fv.contains("bytesValue")) {
 		// BLOB_RAW takes the decoded octets as they are. Value::BLOB(string)
 		// would cast instead, reading \x escapes and rejecting any byte above
 		// 0x7f -- which failed the whole query on ordinary binary data.
-		return VariantValue(Value::BLOB_RAW(Base64Decode(fv["bytesValue"].get<std::string>())));
+		return FirestoreVariant(Value::BLOB_RAW(Base64Decode(fv["bytesValue"].get<std::string>())));
 	}
 	if (fv.contains("geoPointValue")) {
 		const auto &geo = fv["geoPointValue"];
-		VariantValue obj(VariantValueType::OBJECT);
+		FirestoreVariant obj(FirestoreVariantType::OBJECT);
 		obj.AddChild("latitude",
-		             VariantValue(Value::DOUBLE(geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0)));
+		             FirestoreVariant(Value::DOUBLE(geo.contains("latitude") ? geo["latitude"].get<double>() : 0.0)));
 		obj.AddChild("longitude",
-		             VariantValue(Value::DOUBLE(geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0)));
+		             FirestoreVariant(Value::DOUBLE(geo.contains("longitude") ? geo["longitude"].get<double>() : 0.0)));
 		return obj;
 	}
 	if (fv.contains("arrayValue")) {
-		VariantValue arr(VariantValueType::ARRAY);
+		FirestoreVariant arr(FirestoreVariantType::ARRAY);
 		if (fv["arrayValue"].contains("values")) {
 			const auto &values = fv["arrayValue"]["values"];
 			arr.ReserveItems(values.size());
@@ -194,7 +194,7 @@ VariantValue FirestoreValueToVariant(const json &fv) {
 		return arr;
 	}
 	if (fv.contains("mapValue")) {
-		VariantValue obj(VariantValueType::OBJECT);
+		FirestoreVariant obj(FirestoreVariantType::OBJECT);
 		if (fv["mapValue"].contains("fields")) {
 			const auto &fields = fv["mapValue"]["fields"];
 			for (auto it = fields.begin(); it != fields.end(); ++it) {
@@ -203,7 +203,7 @@ VariantValue FirestoreValueToVariant(const json &fv) {
 		}
 		return obj;
 	}
-	return VariantValue(Value(fv.dump()));
+	return FirestoreVariant(Value(fv.dump()));
 }
 
 LogicalType FirestoreTypeToDuckDB(const std::string &firestore_type, FirestoreMapEncoding map_encoding) {
@@ -620,7 +620,8 @@ json DuckDBValueToFirestore(const Value &value, const LogicalType &source_type) 
 		// Regular struct -> mapValue
 		json fields;
 		for (idx_t i = 0; i < children.size(); i++) {
-			fields[child_types[i].first] = DuckDBValueToFirestore(children[i], child_types[i].second);
+			fields[FirestoreNameString(child_types[i].first)] =
+			    DuckDBValueToFirestore(children[i], child_types[i].second);
 		}
 		return {{"mapValue", {{"fields", fields}}}};
 	}
@@ -656,7 +657,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 		case LogicalTypeId::VARCHAR: {
 			// Everything can become a string
 			auto str = converted.ToString();
-			FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, str);
+			FirestoreMutableData<string_t>(vector)[index] = StringVector::AddString(vector, str);
 			return;
 		}
 		case LogicalTypeId::BIGINT: {
@@ -664,7 +665,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 			if (converted.type().id() == LogicalTypeId::VARCHAR) {
 				try {
 					auto str = converted.GetValue<std::string>();
-					FlatVector::GetData<int64_t>(vector)[index] = std::stoll(str);
+					FirestoreMutableData<int64_t>(vector)[index] = std::stoll(str);
 					return;
 				} catch (const std::exception &e) {
 					FS_LOG_DEBUG("BIGINT conversion failed: " + std::string(e.what()));
@@ -680,7 +681,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 			if (converted.type().id() == LogicalTypeId::VARCHAR) {
 				try {
 					auto str = converted.GetValue<std::string>();
-					FlatVector::GetData<double>(vector)[index] = std::stod(str);
+					FirestoreMutableData<double>(vector)[index] = std::stod(str);
 					return;
 				} catch (const std::exception &e) {
 					FS_LOG_DEBUG("DOUBLE conversion failed: " + std::string(e.what()));
@@ -688,7 +689,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 					return;
 				}
 			} else if (converted.type().id() == LogicalTypeId::BIGINT) {
-				FlatVector::GetData<double>(vector)[index] = static_cast<double>(converted.GetValue<int64_t>());
+				FirestoreMutableData<double>(vector)[index] = static_cast<double>(converted.GetValue<int64_t>());
 				return;
 			}
 			FlatVector::SetNull(vector, index, true);
@@ -700,7 +701,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 				try {
 					auto str = converted.GetValue<std::string>();
 					// Try parsing as timestamp
-					FlatVector::GetData<timestamp_t>(vector)[index] = Timestamp::FromString(str, false);
+					FirestoreMutableData<timestamp_t>(vector)[index] = Timestamp::FromString(str, false);
 					return;
 				} catch (const std::exception &e) {
 					FS_LOG_DEBUG("TIMESTAMP conversion failed: " + std::string(e.what()));
@@ -722,38 +723,40 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 	switch (actual_type.id()) {
 	case LogicalTypeId::VARCHAR: {
 		auto str = converted.GetValue<std::string>();
-		FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, str);
+		FirestoreMutableData<string_t>(vector)[index] = StringVector::AddString(vector, str);
 		break;
 	}
 	case LogicalTypeId::BIGINT:
-		FlatVector::GetData<int64_t>(vector)[index] = converted.GetValue<int64_t>();
+		FirestoreMutableData<int64_t>(vector)[index] = converted.GetValue<int64_t>();
 		break;
 	case LogicalTypeId::INTEGER:
-		FlatVector::GetData<int32_t>(vector)[index] = converted.GetValue<int32_t>();
+		FirestoreMutableData<int32_t>(vector)[index] = converted.GetValue<int32_t>();
 		break;
 	case LogicalTypeId::DOUBLE:
-		FlatVector::GetData<double>(vector)[index] = converted.GetValue<double>();
+		FirestoreMutableData<double>(vector)[index] = converted.GetValue<double>();
 		break;
 	case LogicalTypeId::FLOAT:
-		FlatVector::GetData<float>(vector)[index] = converted.GetValue<float>();
+		FirestoreMutableData<float>(vector)[index] = converted.GetValue<float>();
 		break;
 	case LogicalTypeId::BOOLEAN:
-		FlatVector::GetData<bool>(vector)[index] = converted.GetValue<bool>();
+		FirestoreMutableData<bool>(vector)[index] = converted.GetValue<bool>();
 		break;
 	case LogicalTypeId::TIMESTAMP:
-		FlatVector::GetData<timestamp_t>(vector)[index] = converted.GetValue<timestamp_t>();
+		FirestoreMutableData<timestamp_t>(vector)[index] = converted.GetValue<timestamp_t>();
 		break;
 	case LogicalTypeId::LIST: {
 		// Handle LIST type - need to use ListVector operations
 		auto list_size = ListValue::GetChildren(converted).size();
 		auto list_entry = list_entry_t(ListVector::GetListSize(vector), list_size);
-		FlatVector::GetData<list_entry_t>(vector)[index] = list_entry;
+		FirestoreMutableData<list_entry_t>(vector)[index] = list_entry;
 
-		// Append child values to the list vector's child
-		auto &child_vector = ListVector::GetEntry(vector);
+		// Append child values to the list vector's child. Fetch the child only
+		// after resizing: on DuckDB 2.0 resizing goes through the list's
+		// mutable buffer, so take the reference from that.
 		auto current_size = ListVector::GetListSize(vector);
 		ListVector::SetListSize(vector, current_size + list_size);
 		ListVector::Reserve(vector, current_size + list_size);
+		auto &child_vector = ListVector::GetEntry(vector);
 
 		auto &child_values = ListValue::GetChildren(converted);
 		auto child_type = ListType::GetChildType(actual_type);
@@ -766,23 +769,23 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 				switch (child_type.id()) {
 				case LogicalTypeId::VARCHAR: {
 					auto str = child_val.GetValue<std::string>();
-					FlatVector::GetData<string_t>(child_vector)[current_size + i] =
+					FirestoreMutableData<string_t>(child_vector)[current_size + i] =
 					    StringVector::AddString(child_vector, str);
 					break;
 				}
 				case LogicalTypeId::BIGINT:
-					FlatVector::GetData<int64_t>(child_vector)[current_size + i] = child_val.GetValue<int64_t>();
+					FirestoreMutableData<int64_t>(child_vector)[current_size + i] = child_val.GetValue<int64_t>();
 					break;
 				case LogicalTypeId::DOUBLE:
-					FlatVector::GetData<double>(child_vector)[current_size + i] = child_val.GetValue<double>();
+					FirestoreMutableData<double>(child_vector)[current_size + i] = child_val.GetValue<double>();
 					break;
 				case LogicalTypeId::BOOLEAN:
-					FlatVector::GetData<bool>(child_vector)[current_size + i] = child_val.GetValue<bool>();
+					FirestoreMutableData<bool>(child_vector)[current_size + i] = child_val.GetValue<bool>();
 					break;
 				default:
 					// Fallback to string
 					auto str = child_val.ToString();
-					FlatVector::GetData<string_t>(child_vector)[current_size + i] =
+					FirestoreMutableData<string_t>(child_vector)[current_size + i] =
 					    StringVector::AddString(child_vector, str);
 					break;
 				}
@@ -797,7 +800,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 		auto &child_types = StructType::GetChildTypes(actual_type);
 
 		for (idx_t i = 0; i < struct_children.size() && i < struct_vector.size(); i++) {
-			auto &child_vec = *struct_vector[i];
+			auto &child_vec = FirestoreStructEntry(struct_vector[i]);
 			auto &child_val = struct_children[i];
 
 			if (child_val.IsNull()) {
@@ -805,18 +808,18 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 			} else {
 				switch (child_types[i].second.id()) {
 				case LogicalTypeId::DOUBLE:
-					FlatVector::GetData<double>(child_vec)[index] = child_val.GetValue<double>();
+					FirestoreMutableData<double>(child_vec)[index] = child_val.GetValue<double>();
 					break;
 				case LogicalTypeId::VARCHAR: {
 					auto str = child_val.GetValue<std::string>();
-					FlatVector::GetData<string_t>(child_vec)[index] = StringVector::AddString(child_vec, str);
+					FirestoreMutableData<string_t>(child_vec)[index] = StringVector::AddString(child_vec, str);
 					break;
 				}
 				case LogicalTypeId::BIGINT:
-					FlatVector::GetData<int64_t>(child_vec)[index] = child_val.GetValue<int64_t>();
+					FirestoreMutableData<int64_t>(child_vec)[index] = child_val.GetValue<int64_t>();
 					break;
 				case LogicalTypeId::BOOLEAN:
-					FlatVector::GetData<bool>(child_vec)[index] = child_val.GetValue<bool>();
+					FirestoreMutableData<bool>(child_vec)[index] = child_val.GetValue<bool>();
 					break;
 				default:
 					FlatVector::SetNull(child_vec, index, true);
@@ -832,7 +835,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 		// which renders every byte above 0x7f as a \xNN escape and stored the
 		// escape text as the value.
 		const auto &blob_data = StringValue::Get(converted);
-		FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, blob_data);
+		FirestoreMutableData<string_t>(vector)[index] = StringVector::AddString(vector, blob_data);
 		break;
 	}
 	case LogicalTypeId::ARRAY: {
@@ -847,7 +850,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 				if (child_val.IsNull()) {
 					FlatVector::SetNull(child_vector, index * array_size + i, true);
 				} else {
-					FlatVector::GetData<double>(child_vector)[index * array_size + i] = child_val.GetValue<double>();
+					FirestoreMutableData<double>(child_vector)[index * array_size + i] = child_val.GetValue<double>();
 				}
 			} else {
 				// Dimension mismatch - pad with nulls
@@ -859,7 +862,7 @@ void SetDuckDBValue(Vector &vector, idx_t index, const json &firestore_value, co
 	default:
 		// For complex types, convert to string representation
 		auto str = converted.ToString();
-		FlatVector::GetData<string_t>(vector)[index] = StringVector::AddString(vector, str);
+		FirestoreMutableData<string_t>(vector)[index] = StringVector::AddString(vector, str);
 		break;
 	}
 }

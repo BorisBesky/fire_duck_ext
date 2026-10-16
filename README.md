@@ -495,7 +495,7 @@ call firestore_update('embeddings', 'emb1',
 SELECT a.label, b.label,
     sqrt(list_sum(list_transform(
         generate_series(1, 3),
-        i -> power(a.vector[i] - b.vector[i], 2)
+        lambda i: power(a.vector[i] - b.vector[i], 2)
     ))) AS distance
 FROM firestore_scan('embeddings') a, firestore_scan('embeddings') b
 WHERE a.label < b.label;
@@ -860,6 +860,16 @@ The WASM build must match the DuckDB version bundled by the `@duckdb/duckdb-wasm
 - CMake 3.5+
 - C++17 compiler
 - vcpkg for dependency management
+
+### DuckDB Versions
+
+The same source builds against DuckDB 1.5.x (the `duckdb` submodule pin and the released binaries) and the upcoming DuckDB 2.0. DuckDB 2.0 changed parts of the internal C++ API the extension uses; those differences are confined to `src/include/firestore_duckdb_compat.hpp` and `src/include/firestore_variant.hpp` and are selected at compile time. SQL behavior is the same on both. To build against DuckDB 2.0's release branch:
+
+```bash
+cd duckdb && git fetch origin v2.0-cyanoptera && git checkout FETCH_HEAD && cd ..
+cd extension-ci-tools && git fetch origin v2.0-cyanoptera && git checkout FETCH_HEAD && cd ..
+make release
+```
 
 ### Build Steps
 
