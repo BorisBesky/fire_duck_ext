@@ -3,17 +3,18 @@ cmake_minimum_required(VERSION 3.5)
 # Set extension name here
 set(TARGET_NAME fire_duck_ext)
 
-# OpenSSL is required on native builds for HTTPS (via cpp-httplib) and service-account
-# JWT signing. On WASM there are no OS sockets: HTTP is routed through DuckDB's HTTPUtil
-# and OpenSSL is not used (service-account auth is unsupported there), so it is neither
-# resolved nor linked. Skip resolution for clang-tidy builds which only parse source.
-if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
+# OpenSSL is required on native builds for HTTPS (via cpp-httplib) and
+# service-account JWT signing. On WASM there are no OS sockets: HTTP is routed
+# through DuckDB's HTTPUtil and OpenSSL is not used (service-account auth is
+# unsupported there), so it is neither resolved nor linked. Skip resolution for
+# clang-tidy builds which only parse source.
+if(NOT CLANG_TIDY AND NOT EMSCRIPTEN)
   find_package(OpenSSL REQUIRED)
   # zlib backs CPPHTTPLIB_ZLIB_SUPPORT, which lets cpp-httplib request and
   # transparently inflate gzipped Firestore responses. Same exclusions as
   # OpenSSL: WASM routes HTTP through DuckDB's HTTPUtil (the browser handles
-  # Content-Encoding itself), and clang-tidy only parses source.
-  # No clash with DuckDB's vendored miniz: those symbols live in duckdb_miniz.
+  # Content-Encoding itself), and clang-tidy only parses source. No clash with
+  # DuckDB's vendored miniz: those symbols live in duckdb_miniz.
   find_package(ZLIB REQUIRED)
 endif()
 
@@ -40,8 +41,7 @@ set(EXTENSION_SOURCES
     src/firestore_index.cpp
     src/firestore_optimizer.cpp
     src/firestore_function_docs.cpp
-    src/firestore_variant.cpp
-)
+    src/firestore_variant.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -49,45 +49,33 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Instrument only this extension's sources for coverage, leaving DuckDB itself
 # uninstrumented -- rebuilding DuckDB with --coverage costs far more than it
 # tells us. Off by default; scripts/run_coverage.sh turns it on.
-option(FIRESTORE_COVERAGE "Instrument the extension sources for gcov coverage" OFF)
-if (FIRESTORE_COVERAGE)
+option(FIRESTORE_COVERAGE "Instrument the extension sources for gcov coverage"
+       OFF)
+if(FIRESTORE_COVERAGE)
   target_compile_options(${EXTENSION_NAME} PRIVATE --coverage)
   target_link_libraries(${EXTENSION_NAME} gcov)
 endif()
 
 # Set C++17 standard for our extension (required for std::optional)
-set_target_properties(${EXTENSION_NAME} PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON
-)
-set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON
-)
+set_target_properties(${EXTENSION_NAME} PROPERTIES CXX_STANDARD 17
+                                                   CXX_STANDARD_REQUIRED ON)
+set_target_properties(${LOADABLE_EXTENSION_NAME}
+                      PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
 # nlohmann/json is vendored as a submodule in third_party/nlohmann_json
 target_include_directories(${EXTENSION_NAME}
-    PRIVATE
-    third_party/nlohmann_json/include
-)
+                           PRIVATE third_party/nlohmann_json/include)
 target_include_directories(${LOADABLE_EXTENSION_NAME}
-    PRIVATE
-    third_party/nlohmann_json/include
-)
+                           PRIVATE third_party/nlohmann_json/include)
 
-# Link dependencies to both the static library and the loadable extension.
-# Skip linking for clang-tidy (static analysis only) and for WASM (OpenSSL unused there).
-if (NOT CLANG_TIDY AND NOT EMSCRIPTEN)
-  target_link_libraries(${EXTENSION_NAME}
-      OpenSSL::SSL
-      OpenSSL::Crypto
-      ZLIB::ZLIB
-  )
-  target_link_libraries(${LOADABLE_EXTENSION_NAME}
-      OpenSSL::SSL
-      OpenSSL::Crypto
-      ZLIB::ZLIB
-  )
+# Link dependencies to both the static library and the loadable extension. Skip
+# linking for clang-tidy (static analysis only) and for WASM (OpenSSL unused
+# there).
+if(NOT CLANG_TIDY AND NOT EMSCRIPTEN)
+  target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto
+                        ZLIB::ZLIB)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto
+                        ZLIB::ZLIB)
 endif()
 
 install(

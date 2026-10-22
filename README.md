@@ -863,11 +863,11 @@ The WASM build must match the DuckDB version bundled by the `@duckdb/duckdb-wasm
 
 ### DuckDB Versions
 
-The same source builds against DuckDB 1.5.x (the `duckdb` submodule pin and the released binaries) and the upcoming DuckDB 2.0. DuckDB 2.0 changed parts of the internal C++ API the extension uses; those differences are confined to `src/include/firestore_duckdb_compat.hpp` and `src/include/firestore_variant.hpp` and are selected at compile time. SQL behavior is the same on both. To build against DuckDB 2.0's release branch:
+The extension targets DuckDB 2.0 (the `duckdb` submodule is pinned to v2.0.0), and the same source still builds against DuckDB 1.5.x. DuckDB 2.0 changed parts of the internal C++ API the extension uses; those differences are confined to `src/include/firestore_duckdb_compat.hpp` and `src/include/firestore_variant.hpp` and are selected at compile time. SQL behavior is the same on both. To build against DuckDB 1.5 instead:
 
 ```bash
-cd duckdb && git fetch origin v2.0-cyanoptera && git checkout FETCH_HEAD && cd ..
-cd extension-ci-tools && git fetch origin v2.0-cyanoptera && git checkout FETCH_HEAD && cd ..
+cd duckdb && git fetch origin tag v1.5.6 && git checkout v1.5.6 && cd ..
+cd extension-ci-tools && git fetch origin v1.5.6 && git checkout FETCH_HEAD && cd ..
 make release
 ```
 

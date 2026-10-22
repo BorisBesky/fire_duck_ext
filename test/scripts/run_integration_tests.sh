@@ -847,7 +847,15 @@ echo "Test 35: EXPLAIN shows equality filter pushdown..."
 EXPLAIN_EQ=$(run_explain "EXPLAIN SELECT * FROM firestore_scan('pushdown_test') WHERE status = 'active';")
 assert_contains "$EXPLAIN_EQ" "Firestore Pushed Filters" "EXPLAIN contains Firestore Pushed Filters"
 assert_contains "$EXPLAIN_EQ" "status EQUAL 'active'" "EXPLAIN shows status EQUAL 'active'"
-assert_contains "$EXPLAIN_EQ" "FILTER" "EXPLAIN has post-scan FILTER node for correctness"
+# A filter operator node: "FILTER" in DuckDB 1.5's plan, "Filter" in 2.0's.
+# Whole word, so the scan's "Firestore Pushed Filters" line does not count.
+if echo "$EXPLAIN_EQ" | grep -qiE '(^|[^[:alpha:]])filter([^[:alpha:]]|$)'; then
+    echo "PASS: EXPLAIN has post-scan FILTER node for correctness"
+else
+    echo "FAIL: EXPLAIN has post-scan FILTER node for correctness (no filter operator in plan)"
+    echo "$EXPLAIN_EQ" | head -80
+    exit 1
+fi
 
 # Test 36: EXPLAIN shows range filter pushdown
 echo "Test 36: EXPLAIN shows range filter pushdown..."

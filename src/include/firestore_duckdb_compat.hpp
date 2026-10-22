@@ -21,7 +21,9 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
-#if __has_include("duckdb/common/identifier.hpp")
+// DuckDB 2.0 split the vector helpers into duckdb/common/vector/. Not
+// identifier.hpp: DuckDB 1.5.6 has that header too, but not the 2.0 APIs.
+#if __has_include("duckdb/common/vector/flat_vector.hpp")
 #define FIRESTORE_DUCKDB_V2 1
 #include "duckdb/common/identifier.hpp"
 #include "duckdb/common/vector/array_vector.hpp"
