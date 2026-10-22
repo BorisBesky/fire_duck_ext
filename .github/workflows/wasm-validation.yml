@@ -32,7 +32,11 @@ jobs:
     env:
       DUCKDB_PLATFORM: wasm_eh
       WASM_EXTENSIONS: 1
-      # Keep the DuckDB version in sync with MainDistributionPipeline.yml.
+      # Stays on DuckDB 1.5 while MainDistributionPipeline.yml builds 2.0:
+      # LOAD needs a @duckdb/duckdb-wasm runtime with the same DuckDB minor,
+      # and no published one bundles 2.0 yet (the newest, 1.33.1-dev65.0,
+      # bundles v1.5.6). The 2.0 WASM builds still run in the main pipeline.
+      # Move this (and test/wasm/package.json) to 2.0 once such a runtime ships.
       DUCKDB_VERSION: v1.5.4
     steps:
       - uses: actions/checkout@v4
