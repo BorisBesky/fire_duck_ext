@@ -39,6 +39,10 @@ jobs:
       ci_tools_version: v2.0-cyanoptera
       extension_name: fire_duck_ext
       exclude_archs: 'windows_amd64_mingw'
+      # Opt-in in extension-ci-tools and in community-extensions (where
+      # description.yml's opt_in_platforms requests it). Built here first to
+      # show it compiles before the descriptor asks for it.
+      opt_in_archs: 'windows_arm64'
 
   # Informational only, per the community-extensions maintainer guide
   # (duckdb/community-extensions/UPDATING.md): builds against DuckDB's `main`
