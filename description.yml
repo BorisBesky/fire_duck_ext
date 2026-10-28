@@ -6,6 +6,7 @@ extension:
   build: cmake
   license: MIT
   excluded_platforms: "windows_amd64_mingw"
+  opt_in_platforms: "windows_arm64"
   maintainers:
     - BorisBesky
 
@@ -78,7 +79,7 @@ docs:
     The extension also builds and runs under DuckDB-WASM using API-key or
     Firebase-user auth (service-account auth needs OpenSSL and is native-only).
 
-    Builds for DuckDB 2.0 and DuckDB 1.5.
+    Builds for DuckDB 2.0 (including Windows ARM64) and DuckDB 1.5.
 
     See the project README for the parameter and settings reference, type
     mapping, pushdown semantics, and platform notes.
