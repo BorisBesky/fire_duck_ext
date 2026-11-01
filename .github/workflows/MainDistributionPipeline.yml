@@ -54,18 +54,20 @@ jobs:
   # (via the reusable workflow's `set_duckdb_version` step); it never touches
   # this repo's committed submodule pin.
   #
-  # Temporarily disabled: the current failures against DuckDB `main` look like a
-  # false positive from the upstream `main` toolchain rather than breakage in
-  # this extension. Flip `if:` back to `true` (or drop it) to re-enable.
+  # It was switched off in August (#10) when `main` dropped
+  # duckdb/common/types/variant_value.hpp ahead of DuckDB 2.0. That was a real
+  # API change, not a toolchain false positive, and the DuckDB 2.0 port
+  # (src/include/firestore_duckdb_compat.hpp) resolved it: the extension builds
+  # and passes test/sql against `main` again. No macOS, for the same reason as
+  # the DuckDB 1.5 job below.
   duckdb-next-build:
-    if: false
     name: Build extension binaries (DuckDB main)
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: main
       ci_tools_version: main
       extension_name: fire_duck_ext
-      exclude_archs: 'windows_amd64_mingw'
+      exclude_archs: 'windows_amd64_mingw;osx_amd64;osx_arm64'
 
   # The source still builds against DuckDB 1.5 (see
   # src/include/firestore_duckdb_compat.hpp), and community-extensions still
