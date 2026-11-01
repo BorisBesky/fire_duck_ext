@@ -11,10 +11,11 @@
 //   3. All firestore_* table functions are registered.
 //   4. firestore_update_batch carries its typed (LIST) signature.
 //
-// What it does NOT cover (by design): live Firestore queries (network/CORS) and
-// service-account auth (requires reading a key file, unavailable under WASM — the
-// extension intentionally errors there and steers users to API-key auth). To run
-// arbitrary SQL — including against a real Firestore database — use run_sql.mjs.
+// What it does NOT cover: live Firestore requests, which DuckDB-WASM cannot make
+// under Node (no XMLHttpRequest) — validate_wasm_browser.mjs covers those in
+// Chromium — and service-account auth (requires reading a key file, unavailable
+// under WASM — the extension intentionally errors there and steers users to
+// API-key auth). To run arbitrary SQL, use run_sql.mjs.
 //
 // Requirements:
 //   - A built artifact: build/wasm_eh/.../fire_duck_ext.duckdb_extension.wasm

@@ -10,7 +10,10 @@
 //   node run_sql.mjs queries.sql                 # arg is an existing .sql file
 //   echo "SELECT * FROM firestore_scan('users') LIMIT 5;" | node run_sql.mjs
 //
-// Firestore I/O (firestore_scan/insert/...) needs a reachable database. Set:
+// Firestore I/O (firestore_scan/insert/...) does not work here: under Node,
+// DuckDB-WASM has no XMLHttpRequest and answers every request with an empty 404.
+// Use serve_browser.mjs to query Firestore from a browser. The secret is still
+// created from:
 //   FIRESTORE_PROJECT_ID   GCP project id    (with FIRESTORE_API_KEY, creates a secret)
 //   FIRESTORE_API_KEY      Firebase API key
 //   FIRESTORE_DATABASE     optional database id (default: (default))

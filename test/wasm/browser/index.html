@@ -53,8 +53,9 @@
   <pre id="out">(nothing yet)</pre>
 
   <script type="module">
-    // Pin the DuckDB-WASM version whose bundled DuckDB matches the extension build (1.5.x).
-    import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev57.0/+esm";
+    // Pin the DuckDB-WASM version whose bundled DuckDB matches the extension build
+    // (2.0.0; see test/wasm/package.json). For a DuckDB 1.5 build use 1.33.1-dev57.0.
+    import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev110.0/+esm";
 
     const $ = (id) => document.getElementById(id);
     const status = $("status");
