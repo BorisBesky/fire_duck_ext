@@ -5,6 +5,7 @@
 #include "firestore_logger.hpp"
 #include "firestore_types.hpp" // FirestoreMapEncoding
 #include "firestore_paging.hpp"
+#include "firestore_retry.hpp"
 #include "firestore_schema_accumulator.hpp"
 #include "duckdb.hpp"
 #include <nlohmann/json.hpp>
@@ -95,9 +96,16 @@ ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const st
 
 class FirestoreClient {
 public:
+	// Takes the retry policy from the context's settings, and abandons a wait
+	// between retries when the context's query is interrupted. The context
+	// must outlive the client, as it does for the clients a scan or a write
+	// creates for itself.
+	FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, ClientContext &context);
+
 	// `db` is used to reach DuckDB's HTTPUtil for HTTP transport on WASM builds,
 	// where raw sockets are unavailable.
-	FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db);
+	FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db,
+	                const FirestoreRetryPolicy &retry_policy = FirestoreRetryPolicy());
 
 	// Defined out of line: destroying the unique_ptr<httplib::Client> member
 	// requires httplib::Client to be complete, which it only is in the .cpp.
@@ -193,6 +201,11 @@ private:
 	// DuckDB instance handle; only consulted by the WASM HTTP transport.
 	DatabaseInstance &db_;
 
+	FirestoreRetryPolicy retry_policy_;
+	// Checked while waiting to retry, so an interrupted query stops waiting.
+	// Null when the client was built without a context.
+	ClientContext *interrupt_context_ = nullptr;
+
 #ifndef __EMSCRIPTEN__
 	// Persistent HTTP client, reused across every request this FirestoreClient
 	// makes. Constructing a client per request forces a fresh TCP (and TLS)
@@ -218,11 +231,32 @@ private:
 	// Build URL for Admin API (indexes, fields, etc.)
 	std::string BuildAdminUrl(const std::string &path) const;
 
-	// Make HTTP request with error context.
+	// Make HTTP request with error context, retrying transient failures under
+	// retry_policy_. `safety` says whether the request may be repeated after a
+	// failure that leaves unknown whether Firestore applied it.
 	// `response_bytes_out`, when given, receives the uncompressed size of the
 	// response body -- the figure the paging policy budgets against.
-	json MakeRequest(const std::string &method, const std::string &url, const json &body = {},
-	                 const FirestoreErrorContext &ctx = {}, int64_t *response_bytes_out = nullptr);
+	json MakeRequest(const std::string &method, const std::string &url, FirestoreRetrySafety safety,
+	                 const json &body = {}, const FirestoreErrorContext &ctx = {},
+	                 int64_t *response_bytes_out = nullptr);
+
+	// One HTTP exchange, as the retry loop in MakeRequest sees it.
+	struct HttpAttempt {
+		int status = 0;
+		std::string body;
+		// NONE when a response arrived; otherwise `error` says what failed.
+		FirestoreTransportFailure failure = FirestoreTransportFailure::NONE;
+		std::string error;
+		// Retry-After, when the response carried one; -1 otherwise.
+		int64_t retry_after_ms = -1;
+	};
+
+	// Send one request over this build's transport. Never throws for an HTTP
+	// error or a transport failure; both come back in the result.
+	HttpAttempt SendRequest(const std::string &method, const std::string &url, const std::string &body);
+
+	// Sleep for `delay_ms`, throwing if the query is interrupted meanwhile.
+	void WaitBeforeRetry(int64_t delay_ms);
 
 	// Handle error response with context
 	void HandleError(int status_code, const json &response, const FirestoreErrorContext &ctx);

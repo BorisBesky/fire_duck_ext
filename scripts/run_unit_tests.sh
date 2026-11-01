@@ -41,6 +41,7 @@ done
 COVERED_SOURCES=(
 	src/firestore_wire.cpp
 	src/firestore_paging.cpp
+	src/firestore_retry.cpp
 	src/firestore_schema_accumulator.cpp
 )
 
@@ -49,6 +50,7 @@ TEST_SOURCES=(
 	test/unit/test_harness_self.cpp
 	test/unit/test_firestore_wire.cpp
 	test/unit/test_firestore_paging.cpp
+	test/unit/test_firestore_retry.cpp
 	test/unit/test_firestore_schema_accumulator.cpp
 )
 

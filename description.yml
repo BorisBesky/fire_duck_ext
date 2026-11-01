@@ -61,7 +61,13 @@ docs:
     Scans stream a page at a time, so a collection of any size can be read
     without holding it in memory, and the page size adapts when documents turn
     out to be unusually large. Settings cover paging, schema sampling, ORDER BY
-    pushdown, and optional parallel scanning.
+    pushdown, optional parallel scanning, and retries.
+
+    Transient failures -- 429 and 503 responses, aborted writes, dropped
+    connections -- are retried with jittered exponential backoff (5 retries by
+    default, honouring Retry-After). A failure that may have applied a request
+    is only retried when repeating it is harmless, so creating a document is
+    never sent twice after one.
 
     Firestore's schemaless documents are mapped to typed DuckDB columns
     automatically, with configurable handling for nested maps and for fields

@@ -50,6 +50,19 @@ Control endpoints:
                          observable: without it requests finish too quickly to
                          overlap, whether or not the client is issuing them in
                          parallel.
+  POST /__inject_faults?count=N&kind=K[&op=O][&retry_after=S]
+                         fail the next N requests to operation O (list,
+                         runquery, aggregation, write, create, or any) the way
+                         K says: unavailable (503 UNAVAILABLE), exhausted (429
+                         RESOURCE_EXHAUSTED, with Retry-After S if given),
+                         aborted (409 ABORTED), internal (500 INTERNAL),
+                         already_exists (409 ALREADY_EXISTS), html502 (a 502
+                         HTML page, as from a load balancer), or drop (close the
+                         connection without answering). count=0 clears it.
+  POST /__inject_write_faults?count=N&code=C
+                         fail the next N writes that arrive in :batchWrite
+                         bodies with google.rpc.Code C, reported in the
+                         response's per-write `status` the way Firestore does
 """
 
 import bisect
@@ -111,6 +124,9 @@ class Stats:
         self.max_in_flight = 0
         self.cursor_mismatches = 0
         self.cursor_mismatch_samples = []
+        self.injected_faults = 0
+        self.writes_received = 0
+        self.batch_sizes_in_order = []
 
     def snapshot(self):
         with self.lock:
@@ -143,6 +159,12 @@ class Stats:
                 # the scan. Must stay at zero.
                 "cursor_mismatches": self.cursor_mismatches,
                 "cursor_mismatch_samples": list(self.cursor_mismatch_samples),
+                # Requests answered with an injected failure (/__inject_faults).
+                "injected_faults": self.injected_faults,
+                # Writes in :batchWrite bodies, and each body's size in arrival
+                # order, so a test can see which writes were resent.
+                "writes_received": self.writes_received,
+                "batch_sizes_in_order": list(self.batch_sizes_in_order),
             }
 
 
@@ -152,7 +174,7 @@ class Stats:
 FEATURES = {"fat_shape", "array_type_shapes", "fail_runquery", "page_sizes_in_order", "odd_shape",
             "field_mask", "runquery_select", "aggregation_query", "fail_aggregation",
             "key_range_cursors", "auto_ids", "concurrency_stats", "runtime_delay",
-            "cursor_validation"}
+            "cursor_validation", "fault_injection", "create_document"}
 
 STATS = Stats()
 
@@ -165,6 +187,21 @@ FAIL_RUNQUERY = threading.Event()
 # credentials do not offer the endpoint, and the extension is supposed to fall
 # back to scanning rather than fail the query.
 FAIL_AGGREGATION = threading.Event()
+
+# Failures to serve instead of answering (/__inject_faults), and per-write
+# failures to report from :batchWrite (/__inject_write_faults). Guarded by
+# FAULTS_LOCK; consumed one request (or one write) at a time.
+FAULTS_LOCK = threading.Lock()
+FAULTS = {"count": 0, "kind": "unavailable", "op": "any", "retry_after": None}
+WRITE_FAULTS = {"count": 0, "code": 14}
+
+FAULT_RESPONSES = {
+    "unavailable": (503, "UNAVAILABLE"),
+    "exhausted": (429, "RESOURCE_EXHAUSTED"),
+    "aborted": (409, "ABORTED"),
+    "internal": (500, "INTERNAL"),
+    "already_exists": (409, "ALREADY_EXISTS"),
+}
 
 # Per-connection request counter. One thread == one TCP connection under
 # ThreadingHTTPServer, so thread-local state is per-connection state.
@@ -601,6 +638,52 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, status=200):
         self._send(json.dumps(obj).encode(), status)
 
+    def _maybe_fault(self, op):
+        """Serve an injected failure for `op` if one is pending; True if so."""
+        with FAULTS_LOCK:
+            if FAULTS["count"] <= 0 or FAULTS["op"] not in ("any", op):
+                return False
+            FAULTS["count"] -= 1
+            kind, retry_after = FAULTS["kind"], FAULTS["retry_after"]
+        with STATS.lock:
+            STATS.injected_faults += 1
+            STATS.requests += 1
+            STATS.requests_by_op[op + "_fault"] = STATS.requests_by_op.get(op + "_fault", 0) + 1
+
+        if kind == "drop":
+            # The request was read; the connection dies before any answer, so
+            # the client cannot tell whether it was applied.
+            self.close_connection = True
+            try:
+                self.connection.shutdown(2)
+            except OSError:
+                pass
+            return True
+        if kind == "html502":
+            payload = b"<html><body><h1>502 Bad Gateway</h1></body></html>"
+            self.send_response(502)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return True
+
+        status, rpc = FAULT_RESPONSES[kind]
+        error = {"error": {"code": status, "message": f"injected {rpc}", "status": rpc}}
+        # Firestore's streaming methods answer with an array of results, and
+        # an error arrives as the array's one element.
+        if op in ("runquery", "aggregation"):
+            error = [error]
+        payload = json.dumps(error).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        return True
+
     def _error(self, status, message):
         self._json({"error": {"code": status, "message": message,
                               "status": "NOT_FOUND" if status == 404 else "ERROR"}}, status)
@@ -632,6 +715,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/v1/projects/[^/]+/databases/[^/]+/documents/(.+)$", path)
         if not m:
             self._error(404, "unsupported path"); return
+
+        if self._maybe_fault("list"):
+            return
 
         collection = unquote(m.group(1))
         page_size = int(q.get("pageSize", ["1000"])[0])
@@ -676,9 +762,35 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"fail_runquery": enabled})
             return
 
+        if path == "/__inject_faults":
+            q = parse_qs(u.query)
+            kind = q.get("kind", ["unavailable"])[0]
+            if kind not in FAULT_RESPONSES and kind not in ("drop", "html502"):
+                self._error(400, f"unknown fault kind {kind}"); return
+            with FAULTS_LOCK:
+                FAULTS["count"] = int(q.get("count", ["1"])[0])
+                FAULTS["kind"] = kind
+                FAULTS["op"] = q.get("op", ["any"])[0]
+                FAULTS["retry_after"] = q.get("retry_after", [None])[0]
+                state = dict(FAULTS)
+            self._json(state)
+            return
+
+        if path == "/__inject_write_faults":
+            q = parse_qs(u.query)
+            with FAULTS_LOCK:
+                WRITE_FAULTS["count"] = int(q.get("count", ["1"])[0])
+                WRITE_FAULTS["code"] = int(q.get("code", ["14"])[0])
+                state = dict(WRITE_FAULTS)
+            self._json(state)
+            return
+
         if path == "/__reset":
             with STATS.lock:
                 STATS.reset()
+            with FAULTS_LOCK:
+                FAULTS["count"] = 0
+                WRITE_FAULTS["count"] = 0
             # Must be OUTSIDE the `with`: _send() re-acquires STATS.lock, and a
             # plain threading.Lock is not reentrant -- calling it while holding
             # the lock deadlocks the connection thread permanently.
@@ -709,6 +821,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b"{}"
 
         if path.endswith(":runAggregationQuery"):
+            if self._maybe_fault("aggregation"):
+                return
             if FAIL_AGGREGATION.is_set():
                 self._count("aggregation_failed")
                 self._error(501, "aggregation queries disabled for this test")
@@ -741,6 +855,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.endswith(":runQuery"):
+            if self._maybe_fault("runquery"):
+                return
             if FAIL_RUNQUERY.is_set():
                 self._count("runquery_failed")
                 self._error(500, "runQuery disabled for this test")
@@ -813,8 +929,43 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"collectionIds": []}); return
 
         if path.endswith(":batchWrite") or path.endswith(":commit"):
+            if self._maybe_fault("write"):
+                return
             self._count("write")
-            self._json({"writeResults": []}); return
+            try:
+                writes = json.loads(body).get("writes", [])
+            except (json.JSONDecodeError, AttributeError):
+                writes = []
+            statuses = []
+            with FAULTS_LOCK:
+                for _ in writes:
+                    if WRITE_FAULTS["count"] > 0:
+                        WRITE_FAULTS["count"] -= 1
+                        statuses.append({"code": WRITE_FAULTS["code"], "message": "injected write failure"})
+                    else:
+                        statuses.append({})
+            with STATS.lock:
+                STATS.writes_received += len(writes)
+                STATS.batch_sizes_in_order.append(len(writes))
+            self._json({"writeResults": [{} for _ in writes], "status": statuses}); return
+
+        # documents.createDocument: POST to a collection, with or without
+        # ?documentId=.
+        m = re.match(r"^/v1/projects/[^/]+/databases/[^/]+/documents/([^:]+)$", path)
+        if m:
+            if self._maybe_fault("create"):
+                return
+            self._count("create")
+            try:
+                fields = json.loads(body).get("fields", {})
+            except (json.JSONDecodeError, AttributeError):
+                fields = {}
+            doc_id = parse_qs(u.query).get("documentId", [None])[0] or _auto_id(STATS.requests)
+            name = path[len("/v1/"):] + "/" + doc_id
+            self._json({"name": name, "fields": fields,
+                        "createTime": "2026-01-01T00:00:00.000000Z",
+                        "updateTime": "2026-01-01T00:00:00.000000Z"})
+            return
 
         self._error(404, "unsupported path")
 

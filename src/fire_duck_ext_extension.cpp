@@ -190,6 +190,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "precedence; a field that would change which rows a query returns keeps its sort in "
 	                          "DuckDB. The order_by:= parameter is unaffected",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(FirestoreSettings::kDefaultOrderByPushdown));
+	config.AddExtensionOption("firestore_max_retries",
+	                          "Times a Firestore request is retried after a transient failure (429, 503, 409 "
+	                          "ABORTED, a dropped connection, and for reads and idempotent writes 500 and 504); "
+	                          "0 disables retrying",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreRetryPolicy::kDefaultMaxRetries),
+	                          FirestoreSettings::SetMaxRetries);
+	config.AddExtensionOption("firestore_retry_initial_backoff_ms",
+	                          "Longest wait, in milliseconds, before the first retry; each further retry doubles it. "
+	                          "Waits are jittered between half and all of that",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreRetryPolicy::kDefaultInitialBackoffMs),
+	                          FirestoreSettings::SetRetryBackoffMs);
+	config.AddExtensionOption("firestore_retry_max_backoff_ms",
+	                          "Ceiling, in milliseconds, on any one wait between retries, including one Firestore "
+	                          "asks for with Retry-After",
+	                          LogicalType::BIGINT, Value::BIGINT(FirestoreRetryPolicy::kDefaultMaxBackoffMs),
+	                          FirestoreSettings::SetRetryBackoffMs);
 
 	// Register the firestore secret type for credential management
 	RegisterFirestoreSecretType(loader);
