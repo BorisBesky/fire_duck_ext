@@ -9,6 +9,7 @@ Query Google Cloud Firestore directly from DuckDB using SQL.
 - **Update and delete** with `firestore_update()`, `firestore_delete()`
 - **Batch operations** for bulk updates and deletes
 - **Array transforms** with `firestore_array_union()`, `firestore_array_remove()`, `firestore_array_append()`
+- **Automatic retries** with exponential backoff for transient Firestore failures (rate limits, outages, dropped connections)
 - **Collection group queries** for querying across nested collections
 - **Filter pushdown** sends supported WHERE clauses to Firestore for faster queries
 - **SQL ORDER BY / LIMIT pushdown** for faster top-N and sorted scans
@@ -273,7 +274,7 @@ WHERE function_name LIKE 'firestore%';
 
 ## Batch Operations
 
-`firestore_update_batch()` and `firestore_delete_batch()` group writes into requests of up to 500 operations each using Firestore's `batchWrite` API. `batchWrite` is **not atomic** — individual writes within a batch may succeed or fail independently. If `batchWrite` is unavailable (API key auth does not support it), the extension falls back to individual requests automatically.
+`firestore_update_batch()` and `firestore_delete_batch()` group writes into requests of up to 500 operations each using Firestore's `batchWrite` API. `batchWrite` is **not atomic** — individual writes within a batch may succeed or fail independently. Writes that fail transiently are resent on their own (see [Retries](#retries)); a write that still fails makes the call raise an error naming how many of the batch failed, rather than counting it as written. If `batchWrite` is unavailable (API key auth does not support it), the extension falls back to individual requests automatically.
 
 ```sql
 -- Batch update: mark all pending users as reviewed
@@ -433,6 +434,9 @@ SET firestore_schema_sample_size = 5000;   -- -1 to sample everything
 | `firestore_page_size` | `1000` | Documents fetched per round trip, clamped to Firestore's 1-1000 range. |
 | `firestore_page_byte_budget` | `67108864` | Uncompressed bytes a page may weigh before the scan requests fewer documents; `0` disables the guard. See [Large Collections](#large-collections). |
 | `firestore_max_threads` | `1` | Threads one scan may split across, reading separate key ranges. `1` (the default) disables parallel scanning; raise it only for collections whose document ids spread over the key space. Capped at 64. See [Large Collections](#large-collections). |
+| `firestore_max_retries` | `5` | Times a request is retried after a transient failure; `0` disables retrying. See [Retries](#retries). |
+| `firestore_retry_initial_backoff_ms` | `1000` | Longest wait before the first retry; each further retry doubles it. |
+| `firestore_retry_max_backoff_ms` | `32000` | Ceiling on any one wait between retries, including one Firestore asks for with `Retry-After`. |
 | `firestore_orderby_pushdown` | `true` | Whether a SQL `ORDER BY` may be sent to Firestore. Each ordering field is still checked against the sampled documents first, since Firestore omits documents lacking the ordering field and sorts nulls and mixed types differently; a field that would change the answer keeps its sort in DuckDB and logs a warning. Set `false` to disable the optimization entirely. `order_by:=` is unaffected. See [SQL ORDER BY / LIMIT Pushdown](#sql-order-by--limit-pushdown). |
 
 Sampling streams: each page is folded into the inferred schema and released, so
@@ -808,6 +812,41 @@ likely above the scan rather than in it: a `GROUP BY`, `ORDER BY`, or join
 holding results that the scan is only feeding. Those are DuckDB's own
 operators, so `SET memory_limit` and a writable `SET temp_directory` are what
 let them spill to disk.
+
+## Retries
+
+Firestore sheds load with `429 RESOURCE_EXHAUSTED` and `503 UNAVAILABLE`,
+aborts contended writes with `409 ABORTED`, and now and then drops a
+connection. The extension retries these with exponential backoff instead of
+failing the query, which matters most for a long scan that would otherwise
+lose all its progress to one bad round trip.
+
+A retry is only sent when sending the request twice is harmless, so the rules
+depend on what the request does:
+
+| Failure | Reads, updates, deletes, batch writes, array transforms | Creating a document (`firestore_insert` with auto ids, or where `batchWrite` is unavailable) |
+|---------|------|------|
+| `429`, `503`, `409 ABORTED`, a connection that could not be opened | retried | retried |
+| `500 INTERNAL`, `504 DEADLINE_EXCEEDED`, `502`/`408` from a proxy, a connection lost mid-request | retried | **not** retried: the document may already exist, and an auto-id insert would create a second copy |
+| anything else (`400`, `401`, `403`, `404`, `409 ALREADY_EXISTS`, ...) | not retried | not retried |
+
+Waits use "equal jitter": before retry *n* the extension waits between half and
+all of `firestore_retry_initial_backoff_ms × 2ⁿ`, capped at
+`firestore_retry_max_backoff_ms`. With the defaults that is 0.5–1 s, 1–2 s,
+2–4 s, 4–8 s and 8–16 s, so a request gives up 15–31 s after its first attempt.
+A `Retry-After` header lengthens a wait to what the server asked for, up to the
+same ceiling. Each retry is logged at `WARN`, and interrupting the query
+(Ctrl-C) cuts a wait short.
+
+```sql
+SET firestore_max_retries = 8;                 -- ride out a longer outage
+SET firestore_retry_initial_backoff_ms = 250;  -- or retry sooner
+SET firestore_max_retries = 0;                 -- fail on the first error
+```
+
+Within a `batchWrite`, Firestore reports each write's outcome separately. Writes
+that failed with a transient code are resent by themselves under the same
+policy; the ones that succeeded are not sent again.
 
 ## Missing Documents
 

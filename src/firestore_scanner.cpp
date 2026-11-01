@@ -561,7 +561,7 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 	}
 
 	// Create client and infer schema from collection
-	FirestoreClient client(result->credentials, DatabaseInstance::GetDatabase(context));
+	FirestoreClient client(result->credentials, context);
 	// The sampling request runs before any LIMIT or filter, so it honours the
 	// same page size as the scan itself.
 	const int64_t bind_page_size =
@@ -860,8 +860,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 	// Document path mode: fetch all subcollection IDs, sort, then truncate to limit.
 	if (bind_data.is_document_path) {
 		global_state->is_document_path = true;
-		global_state->client =
-		    make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
+		global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, context);
 
 		auto order = bind_data.docpath_named_order;
 		// Only apply limit at scan level when we also control ordering.
@@ -899,7 +898,7 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 		return std::move(global_state);
 	}
 
-	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context));
+	global_state->client = make_uniq<FirestoreClient>(bind_data.credentials, context);
 
 	// Check if this is a collection group query (starts with ~)
 	if (!bind_data.collection.empty() && bind_data.collection[0] == '~') {
@@ -1137,8 +1136,7 @@ unique_ptr<LocalTableFunctionState> FirestoreScanInitLocal(ExecutionContext &con
 		// underlying connection is not shareable, and its own paging policy so
 		// one heavy range does not shrink every other thread's pages.
 		auto &bind_data = input.bind_data->Cast<FirestoreScanBindData>();
-		local_state->client =
-		    make_uniq<FirestoreClient>(bind_data.credentials, DatabaseInstance::GetDatabase(context.client));
+		local_state->client = make_uniq<FirestoreClient>(bind_data.credentials, context.client);
 		local_state->page_policy = gstate.page_policy;
 	}
 	return std::move(local_state);

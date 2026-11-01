@@ -5,6 +5,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "firestore_paging.hpp"
+#include "firestore_retry.hpp"
 
 namespace duckdb {
 
@@ -141,6 +142,33 @@ struct FirestoreSettings {
 			return !pushdown_value.IsNull() && BooleanValue::Get(pushdown_value);
 		}
 		return kDefaultOrderByPushdown;
+	}
+
+	// Retrying transient failures: 429 RESOURCE_EXHAUSTED, 503 UNAVAILABLE,
+	// 409 ABORTED, dropped connections, and -- for requests safe to repeat --
+	// 500 INTERNAL and 504 DEADLINE_EXCEEDED. See firestore_retry.hpp for which
+	// requests are repeated after which failures.
+	static FirestoreRetryPolicy RetryPolicy(const ClientContext &context) {
+		FirestoreRetryPolicy policy;
+		Value value;
+		if (context.TryGetCurrentSetting("firestore_max_retries", value) && !value.IsNull()) {
+			policy.max_retries = BigIntValue::Get(value);
+		}
+		if (context.TryGetCurrentSetting("firestore_retry_initial_backoff_ms", value) && !value.IsNull()) {
+			policy.initial_backoff_ms = BigIntValue::Get(value);
+		}
+		if (context.TryGetCurrentSetting("firestore_retry_max_backoff_ms", value) && !value.IsNull()) {
+			policy.max_backoff_ms = BigIntValue::Get(value);
+		}
+		return NormalizeFirestoreRetryPolicy(policy);
+	}
+
+	static void SetMaxRetries(ClientContext &context, SetScope scope, Value &parameter) {
+		parameter = Value::BIGINT(NormalizeFirestoreRetryCount(BigIntValue::Get(parameter)));
+	}
+
+	static void SetRetryBackoffMs(ClientContext &context, SetScope scope, Value &parameter) {
+		parameter = Value::BIGINT(NormalizeFirestoreBackoffMs(BigIntValue::Get(parameter)));
 	}
 
 	// Fewer than one thread is not a scan; cap the top so a stray setting

@@ -20,10 +20,13 @@
 #define CPPHTTPLIB_ZLIB_SUPPORT
 #include "httplib.h"
 #endif
+#include "firestore_settings.hpp"
 #include <sstream>
 #include <cstdlib>
 #include <chrono>
 #include <algorithm>
+#include <random>
+#include <thread>
 
 namespace duckdb {
 
@@ -76,8 +79,15 @@ ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const st
 	return result;
 }
 
-FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db)
-    : credentials_(std::move(credentials)), db_(db) {
+FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, ClientContext &context)
+    : FirestoreClient(std::move(credentials), DatabaseInstance::GetDatabase(context),
+                      FirestoreSettings::RetryPolicy(context)) {
+	interrupt_context_ = &context;
+}
+
+FirestoreClient::FirestoreClient(std::shared_ptr<FirestoreCredentials> credentials, DatabaseInstance &db,
+                                 const FirestoreRetryPolicy &retry_policy)
+    : credentials_(std::move(credentials)), db_(db), retry_policy_(NormalizeFirestoreRetryPolicy(retry_policy)) {
 	if (!credentials_) {
 		throw FirestoreError(FirestoreErrorCode::AUTH_CREDENTIALS_NULL, "Credentials cannot be null");
 	}
@@ -133,34 +143,18 @@ std::string FirestoreClient::BuildUrl(const std::string &path) const {
 	return url;
 }
 
-json FirestoreClient::MakeRequest(const std::string &method, const std::string &url, const json &body,
-                                  const FirestoreErrorContext &ctx, int64_t *response_bytes_out) {
-	auto start_time = std::chrono::high_resolution_clock::now();
-
-	FS_LOG_DEBUG("Making " + method + " request to: " + url);
-
-	// Build context for error reporting
-	FirestoreErrorContext error_ctx = ctx;
-	error_ctx.withMethod(method).withUrl(url).withProject(credentials_->project_id);
-
-	// Ensure the cached token is valid (service-account OAuth2 or Firebase user ID token)
-	FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_, db_);
-
-	// Serialize request body for methods that carry one
-	std::string body_str;
-	if (!body.empty() && (method == "POST" || method == "PATCH")) {
-		body_str = body.dump();
-	}
-
+FirestoreClient::HttpAttempt FirestoreClient::SendRequest(const std::string &method, const std::string &url,
+                                                          const std::string &body) {
+	HttpAttempt attempt;
 	std::string auth_header = credentials_->GetAuthHeader();
-
-	int http_code = 0;
-	std::string response_data;
 
 #ifdef __EMSCRIPTEN__
 	// WASM transport: route through DuckDB's HTTPUtil (browser fetch / Node).
 	auto &http = HTTPUtil::Get(db_);
 	auto params = http.InitializeParameters(db_, url);
+	// MakeRequest retries by Firestore's rules; HTTPUtil retrying underneath
+	// as well would multiply the attempts.
+	params->retries = 0;
 
 	HTTPHeaders headers(db_);
 	headers.Insert("Content-Type", "application/json");
@@ -180,37 +174,43 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 		    });
 		req.try_request = true;
 		res = http.Request(req);
-		response_data = body_accum.empty() ? res->body : body_accum;
+		attempt.body = body_accum.empty() ? res->body : body_accum;
 	} else if (method == "DELETE") {
 		DeleteRequestInfo req(url, headers, *params);
 		req.try_request = true;
 		res = http.Request(req);
-		response_data = res->body;
+		attempt.body = res->body;
 	} else {
 		// POST and PATCH share the POST transport. HTTPUtil has no PATCH verb, so
 		// updates go out as POST with X-HTTP-Method-Override (accepted by Firestore).
 		if (method == "PATCH") {
 			headers.Insert("X-HTTP-Method-Override", "PATCH");
 		}
-		PostRequestInfo req(url, headers, *params, const_data_ptr_cast(body_str.c_str()), body_str.size());
+		PostRequestInfo req(url, headers, *params, const_data_ptr_cast(body.c_str()), body.size());
 		req.try_request = true;
 		res = http.Request(req);
-		response_data = !req.buffer_out.empty() ? req.buffer_out : res->body;
+		attempt.body = !req.buffer_out.empty() ? req.buffer_out : res->body;
 	}
 
 	if (res->HasRequestError()) {
-		std::string error_msg = "HTTP request failed: " + res->GetRequestError();
-		FS_LOG_ERROR(error_msg + " " + error_ctx.ToString());
-		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
+		// fetch() does not say how far a failed request got.
+		attempt.failure = FirestoreTransportFailure::AMBIGUOUS;
+		attempt.error = res->GetRequestError();
+		return attempt;
 	}
-	http_code = static_cast<int>(res->status);
+	attempt.status = static_cast<int>(res->status);
+	if (res->HasHeader("Retry-After")) {
+		attempt.retry_after_ms = ParseRetryAfterMs(res->GetHeaderValue("Retry-After"));
+	}
 #else
 	(void)db_; // db_ is only consulted by the WASM transport above.
 
 	// Native transport: direct httplib client over real OS sockets.
 	std::string scheme_host, path;
 	if (!ParseUrl(url, scheme_host, path)) {
-		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_INIT, "Failed to parse URL: " + url, error_ctx);
+		attempt.failure = FirestoreTransportFailure::PERMANENT;
+		attempt.error = "Failed to parse URL: " + url;
+		return attempt;
 	}
 
 	// Reused across requests -- see GetHttpClient. Previously a Client was
@@ -226,9 +226,9 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 	if (method == "GET") {
 		res = cli.Get(path, headers);
 	} else if (method == "POST") {
-		res = cli.Post(path, headers, body_str, "application/json");
+		res = cli.Post(path, headers, body, "application/json");
 	} else if (method == "PATCH") {
-		res = cli.Patch(path, headers, body_str, "application/json");
+		res = cli.Patch(path, headers, body, "application/json");
 	} else if (method == "DELETE") {
 		res = cli.Delete(path, headers);
 	} else {
@@ -237,45 +237,163 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 
 	if (!res) {
 		auto err = res.error();
-		std::string error_msg = "HTTP request failed: " + httplib::to_string(err);
-		FS_LOG_ERROR(error_msg + " " + error_ctx.ToString());
-		throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
-	}
-
-	http_code = res->status;
-	response_data = res->body;
-#endif
-
-	auto end_time = std::chrono::high_resolution_clock::now();
-	auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-	FS_LOG_DEBUG("Request completed in " + std::to_string(duration_ms) + "ms, status: " + std::to_string(http_code));
-
-	error_ctx.withStatus(http_code);
-
-	if (response_bytes_out != nullptr) {
-		// Uncompressed: gzip is inflated by the transport before this point,
-		// and it is the inflated bytes the JSON DOM is built from.
-		*response_bytes_out = static_cast<int64_t>(response_data.size());
-	}
-
-	// Parse response
-	json response;
-	if (!response_data.empty()) {
-		try {
-			response = json::parse(response_data);
-		} catch (const json::exception &e) {
-			error_ctx.withResponseBody(response_data.substr(0, 500));
-			std::string error_msg = "Failed to parse response: " + std::string(e.what());
-			FS_LOG_ERROR(error_msg);
-			throw FirestoreError(FirestoreErrorCode::REQUEST_RESPONSE_PARSE, error_msg, error_ctx);
+		attempt.error = httplib::to_string(err);
+		switch (err) {
+		case httplib::Error::Connection:
+		case httplib::Error::ConnectionTimeout:
+		case httplib::Error::SSLConnection:
+		case httplib::Error::ProxyConnection:
+			attempt.failure = FirestoreTransportFailure::NOT_SENT;
+			break;
+		case httplib::Error::Unknown:
+		case httplib::Error::Read:
+		case httplib::Error::Write:
+			attempt.failure = FirestoreTransportFailure::AMBIGUOUS;
+			break;
+		default:
+			attempt.failure = FirestoreTransportFailure::PERMANENT;
+			break;
 		}
+		// Start the next attempt on a fresh connection rather than whatever
+		// state this one was left in.
+		http_client_.reset();
+		return attempt;
 	}
 
-	// Handle errors
-	HandleError(http_code, response, error_ctx);
+	attempt.status = res->status;
+	attempt.body = std::move(res->body);
+	if (res->has_header("Retry-After")) {
+		attempt.retry_after_ms = ParseRetryAfterMs(res->get_header_value("Retry-After"));
+	}
+#endif
+	return attempt;
+}
 
-	return response;
+void FirestoreClient::WaitBeforeRetry(int64_t delay_ms) {
+	// In short slices, so an interrupted query does not sit out the rest of a
+	// backoff that may run to tens of seconds.
+	constexpr int64_t kSliceMs = 50;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+	while (true) {
+		if (interrupt_context_ && interrupt_context_->IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return;
+		}
+		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+		std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds(kSliceMs)));
+	}
+}
+
+// Uniform in [0, 1), for spreading retries out. Per thread, so parallel scan
+// threads neither share a generator nor retry in lockstep.
+static double RetryJitter() {
+	thread_local std::mt19937_64 generator(std::random_device {}());
+	return std::uniform_real_distribution<double>(0.0, 1.0)(generator);
+}
+
+json FirestoreClient::MakeRequest(const std::string &method, const std::string &url, FirestoreRetrySafety safety,
+                                  const json &body, const FirestoreErrorContext &ctx, int64_t *response_bytes_out) {
+	FS_LOG_DEBUG("Making " + method + " request to: " + url);
+
+	// Build context for error reporting
+	FirestoreErrorContext error_ctx = ctx;
+	error_ctx.withMethod(method).withUrl(url).withProject(credentials_->project_id);
+
+	// Serialize request body for methods that carry one
+	std::string body_str;
+	if (!body.empty() && (method == "POST" || method == "PATCH")) {
+		body_str = body.dump();
+	}
+
+	for (int64_t retry = 0;; retry++) {
+		auto start_time = std::chrono::high_resolution_clock::now();
+
+		// Ensure the cached token is valid (service-account OAuth2 or Firebase
+		// user ID token). Inside the loop: a long run of retries can outlast it.
+		FirestoreAuthManager::RefreshTokenIfNeeded(*credentials_, db_);
+
+		HttpAttempt attempt = SendRequest(method, url, body_str);
+
+		auto end_time = std::chrono::high_resolution_clock::now();
+		auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+		const bool can_retry = retry < retry_policy_.max_retries;
+
+		if (attempt.failure != FirestoreTransportFailure::NONE) {
+			std::string error_msg = "HTTP request failed: " + attempt.error;
+			if (can_retry && ShouldRetryFirestoreTransportFailure(attempt.failure, safety)) {
+				auto delay_ms = FirestoreRetryDelayMs(retry_policy_, retry, RetryJitter());
+				FS_LOG_WARN(error_msg + "; retry " + std::to_string(retry + 1) + " of " +
+				            std::to_string(retry_policy_.max_retries) + " in " + std::to_string(delay_ms) + "ms " +
+				            error_ctx.ToString());
+				WaitBeforeRetry(delay_ms);
+				continue;
+			}
+			FS_LOG_ERROR(error_msg + " " + error_ctx.ToString());
+			throw FirestoreNetworkError(FirestoreErrorCode::NETWORK_CURL_PERFORM, error_msg, error_ctx);
+		}
+
+		const int http_code = attempt.status;
+		FS_LOG_DEBUG("Request completed in " + std::to_string(duration_ms) +
+		             "ms, status: " + std::to_string(http_code));
+
+		const bool success = http_code >= 200 && http_code < 300;
+
+		// Parse response
+		json response;
+		if (!attempt.body.empty()) {
+			try {
+				response = json::parse(attempt.body);
+			} catch (const json::exception &e) {
+				if (success) {
+					error_ctx.withStatus(http_code).withResponseBody(attempt.body.substr(0, 500));
+					std::string error_msg = "Failed to parse response: " + std::string(e.what());
+					FS_LOG_ERROR(error_msg);
+					throw FirestoreError(FirestoreErrorCode::REQUEST_RESPONSE_PARSE, error_msg, error_ctx);
+				}
+				// An error page from something in front of Firestore (a 502
+				// from a load balancer, say) is HTML, not JSON. The status
+				// still says what happened.
+				response = json();
+			}
+		}
+
+		if (!success) {
+			std::string rpc_status;
+			if (response.is_object() && response.contains("error") && response["error"].is_object() &&
+			    response["error"].contains("status") && response["error"]["status"].is_string()) {
+				rpc_status = response["error"]["status"].get<std::string>();
+			}
+			if (can_retry && ShouldRetryFirestoreResponse(http_code, rpc_status, safety)) {
+				auto delay_ms = FirestoreRetryDelayMs(retry_policy_, retry, RetryJitter(), attempt.retry_after_ms);
+				FS_LOG_WARN("Firestore returned HTTP " + std::to_string(http_code) +
+				            (rpc_status.empty() ? "" : " " + rpc_status) + "; retry " + std::to_string(retry + 1) +
+				            " of " + std::to_string(retry_policy_.max_retries) + " in " + std::to_string(delay_ms) +
+				            "ms " + error_ctx.ToString());
+				WaitBeforeRetry(delay_ms);
+				continue;
+			}
+			if (response.is_null() && !attempt.body.empty()) {
+				error_ctx.withResponseBody(attempt.body.substr(0, 500));
+			}
+		}
+
+		error_ctx.withStatus(http_code);
+
+		if (response_bytes_out != nullptr) {
+			// Uncompressed: gzip is inflated by the transport before this point,
+			// and it is the inflated bytes the JSON DOM is built from.
+			*response_bytes_out = static_cast<int64_t>(attempt.body.size());
+		}
+
+		// Handle errors
+		HandleError(http_code, response, error_ctx);
+
+		return response;
+	}
 }
 
 void FirestoreClient::HandleError(int status_code, const json &response, const FirestoreErrorContext &ctx) {
@@ -417,7 +535,7 @@ FirestoreListResponse FirestoreClient::ListDocuments(const std::string &collecti
 	ctx.withOperation("list").withCollection(collection);
 
 	FirestoreListResponse result;
-	json response = MakeRequest("GET", url, {}, ctx, &result.response_bytes);
+	json response = MakeRequest("GET", url, FirestoreRetrySafety::IDEMPOTENT, {}, ctx, &result.response_bytes);
 
 	if (response.contains("documents")) {
 		for (auto &doc_json : response["documents"]) {
@@ -448,7 +566,7 @@ FirestoreCollectionIdsPage FirestoreClient::ListCollectionIdsPage(const std::str
 		body["pageToken"] = page_token.value();
 	}
 
-	json response = MakeRequest("POST", url, body, ctx);
+	json response = MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx);
 
 	FirestoreCollectionIdsPage result;
 	if (response.contains("collectionIds")) {
@@ -493,7 +611,7 @@ FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, co
 	FirestoreErrorContext ctx;
 	ctx.withOperation("get").withCollection(collection).withDocument(document_id);
 
-	json response = MakeRequest("GET", url, {}, ctx);
+	json response = MakeRequest("GET", url, FirestoreRetrySafety::IDEMPOTENT, {}, ctx);
 	return ParseDocument(std::move(response));
 }
 
@@ -516,7 +634,7 @@ FirestoreDocument FirestoreClient::CreateDocument(const std::string &collection,
 	}
 
 	json body = {{"fields", fields}};
-	json response = MakeRequest("POST", url, body, ctx);
+	json response = MakeRequest("POST", url, FirestoreRetrySafety::NOT_IDEMPOTENT, body, ctx);
 	return ParseDocument(std::move(response));
 }
 
@@ -538,7 +656,7 @@ void FirestoreClient::UpdateDocument(const std::string &collection, const std::s
 	ctx.withOperation("update").withCollection(collection).withDocument(document_id);
 
 	json body = {{"fields", fields}};
-	MakeRequest("PATCH", url, body, ctx);
+	MakeRequest("PATCH", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx);
 
 	FS_LOG_DEBUG("Document updated successfully");
 }
@@ -552,7 +670,7 @@ void FirestoreClient::DeleteDocument(const std::string &collection, const std::s
 	FirestoreErrorContext ctx;
 	ctx.withOperation("delete").withCollection(collection).withDocument(document_id);
 
-	MakeRequest("DELETE", url, {}, ctx);
+	MakeRequest("DELETE", url, FirestoreRetrySafety::IDEMPOTENT, {}, ctx);
 
 	FS_LOG_DEBUG("Document deleted successfully");
 }
@@ -571,8 +689,76 @@ void FirestoreClient::BatchWrite(const std::vector<json> &writes) {
 	FirestoreErrorContext ctx;
 	ctx.withOperation("batch_write");
 
-	json body = {{"writes", writes}};
-	MakeRequest("POST", url, body, ctx);
+	// Idempotent for the writes this extension batches, which set fields to
+	// given values or delete documents: applying one twice changes nothing.
+	std::vector<json> pending = writes;
+	size_t failed = 0;
+	std::string first_failure;
+	for (int64_t retry = 0;; retry++) {
+		json body = {{"writes", pending}};
+		json response = MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx);
+
+		// batchWrite is not atomic: each write succeeds or fails on its own,
+		// and HTTP 200 only means the batch was processed. A failed write was
+		// not applied, so a transient failure is resent by itself.
+		std::vector<json> transient;
+		std::string transient_message;
+		if (response.is_object() && response.contains("status") && response["status"].is_array()) {
+			const auto &statuses = response["status"];
+			for (size_t i = 0; i < pending.size() && i < statuses.size(); i++) {
+				const auto &status = statuses[i];
+				int code = 0;
+				std::string message;
+				if (status.is_object()) {
+					if (status.contains("code") && status["code"].is_number_integer()) {
+						code = status["code"].get<int>();
+					}
+					if (status.contains("message") && status["message"].is_string()) {
+						message = status["message"].get<std::string>();
+					}
+				}
+				if (code == 0) {
+					continue;
+				}
+				if (IsTransientFirestoreRpcCode(code)) {
+					transient.push_back(std::move(pending[i]));
+					transient_message = message;
+				} else {
+					failed++;
+					if (first_failure.empty()) {
+						first_failure = message.empty() ? "code " + std::to_string(code) : message;
+					}
+				}
+			}
+		}
+
+		if (transient.empty()) {
+			break;
+		}
+		if (retry >= retry_policy_.max_retries) {
+			failed += transient.size();
+			if (first_failure.empty()) {
+				first_failure = transient_message;
+			}
+			break;
+		}
+		auto delay_ms = FirestoreRetryDelayMs(retry_policy_, retry, RetryJitter());
+		FS_LOG_WARN(std::to_string(transient.size()) + " of " + std::to_string(pending.size()) +
+		            " batched writes failed transiently (" + transient_message + "); retry " +
+		            std::to_string(retry + 1) + " of " + std::to_string(retry_policy_.max_retries) + " in " +
+		            std::to_string(delay_ms) + "ms");
+		WaitBeforeRetry(delay_ms);
+		pending = std::move(transient);
+	}
+
+	if (failed > 0) {
+		// The other writes in the batch were applied; reporting the batch as a
+		// success would count these as written too.
+		throw FirestoreError(FirestoreErrorCode::WRITE_BATCH_PARTIAL_FAILURE,
+		                     std::to_string(failed) + " of " + std::to_string(writes.size()) +
+		                         " batched writes failed: " + first_failure,
+		                     ctx);
+	}
 
 	FS_LOG_DEBUG("Batch write completed successfully");
 }
@@ -627,7 +813,9 @@ void FirestoreClient::ArrayTransform(const std::string &collection, const std::s
 		return;
 	}
 
-	// For ARRAY_UNION and ARRAY_REMOVE, use field transforms via commit
+	// For ARRAY_UNION and ARRAY_REMOVE, use field transforms via commit.
+	// Both are idempotent -- a second union adds nothing, a second remove
+	// finds nothing -- so the commit may be retried.
 	std::string url = BuildBaseUrl() + ":commit" + credentials_->GetUrlSuffix();
 
 	FirestoreErrorContext ctx;
@@ -639,7 +827,7 @@ void FirestoreClient::ArrayTransform(const std::string &collection, const std::s
 	                   {"fieldTransforms", {{{"fieldPath", field_name}, {transform_name, {{"values", elements}}}}}}}}};
 
 	json body = {{"writes", {write_op}}};
-	MakeRequest("POST", url, body, ctx);
+	MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx);
 
 	FS_LOG_DEBUG("Array transform completed successfully");
 }
@@ -671,7 +859,7 @@ FirestoreListResponse FirestoreClient::CollectionGroupQuery(const std::string &c
 	json body = {{"structuredQuery", structured_query}};
 
 	FirestoreListResponse result;
-	json response = MakeRequest("POST", url, body, ctx, &result.response_bytes);
+	json response = MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx, &result.response_bytes);
 
 	// Response is an array of results, each containing a "document" field
 	if (response.is_array()) {
@@ -743,7 +931,7 @@ bool FirestoreClient::CountDocuments(const std::string &collection, bool is_coll
 	json body = BuildCountAggregationQuery(collection_id, is_collection_group, up_to);
 	FS_LOG_DEBUG("Counting documents in '" + collection + "' with :runAggregationQuery");
 
-	json response = MakeRequest("POST", url, body, ctx);
+	json response = MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx);
 	if (!ParseCountAggregationResponse(response, count_out)) {
 		FS_LOG_DEBUG("Aggregation response carried no count; falling back to scanning");
 		return false;
@@ -780,7 +968,7 @@ FirestoreListResponse FirestoreClient::RunQuery(const std::string &collection, c
 	FS_LOG_DEBUG("StructuredQuery: " + structured_query.dump());
 
 	FirestoreListResponse result;
-	json response = MakeRequest("POST", url, body, ctx, &result.response_bytes);
+	json response = MakeRequest("POST", url, FirestoreRetrySafety::IDEMPOTENT, body, ctx, &result.response_bytes);
 
 	if (response.is_array()) {
 		for (auto &item : response) {
@@ -802,7 +990,7 @@ std::vector<FirestoreIndex> FirestoreClient::FetchCompositeIndexes(const std::st
 	FirestoreErrorContext ctx;
 	ctx.withOperation("fetch_indexes").withCollection(collection_id);
 
-	json response = MakeRequest("GET", url, {}, ctx);
+	json response = MakeRequest("GET", url, FirestoreRetrySafety::IDEMPOTENT, {}, ctx);
 
 	std::vector<FirestoreIndex> indexes;
 
@@ -878,7 +1066,7 @@ bool FirestoreClient::CheckDefaultSingleFieldIndexes() {
 		FirestoreErrorContext ctx;
 		ctx.withOperation("check_default_indexes");
 
-		json response = MakeRequest("GET", url, {}, ctx);
+		json response = MakeRequest("GET", url, FirestoreRetrySafety::IDEMPOTENT, {}, ctx);
 
 		// If the response contains indexConfig with indexes, defaults are enabled
 		if (response.contains("indexConfig") && response["indexConfig"].contains("indexes")) {

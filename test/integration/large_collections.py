@@ -28,6 +28,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 DUCKDB = os.path.join(ROOT, "build", "release", "duckdb")
+EXTENSION = os.path.join(ROOT, "build", "release", "extension", "fire_duck_ext", "fire_duck_ext.duckdb_extension")
 MOCK = os.path.join(ROOT, "bench", "mock_firestore.py")
 PORT = int(os.environ.get("MOCK_PORT", "8123"))
 BASE = f"http://127.0.0.1:{PORT}"
@@ -53,6 +54,8 @@ REQUIRED_MOCK_FEATURES = {
     "concurrency_stats",
     "runtime_delay",
     "cursor_validation",
+    "fault_injection",
+    "create_document",
 }
 
 
@@ -95,20 +98,42 @@ def stats():
     return mock_get("/__stats")
 
 
+def inject_faults(count, kind, op="any", retry_after=None):
+    """Fail the next `count` requests to `op`; count=0 clears it."""
+    query = f"/__inject_faults?count={count}&kind={kind}&op={op}"
+    if retry_after is not None:
+        query += f"&retry_after={retry_after}"
+    mock_post(query)
+
+
+def inject_write_faults(count, code):
+    """Fail the next `count` writes in :batchWrite bodies with rpc code `code`."""
+    mock_post(f"/__inject_write_faults?count={count}&code={code}")
+
+
 # ---------------------------------------------------------------- duckdb driver
 
 
-def run_sql(sql, settings=None):
-    """Run SQL through the real CLI against the mock, returning CSV rows."""
-    script = "LOAD fire_duck_ext;\n"
-    for statement in settings or []:
-        script += statement + ";\n"
-    script += ".mode csv\n.headers off\n" + sql + "\n"
+def run_cli(sql, settings=None, as_argument=False):
+    # By path: a DuckDB 2.0 shell does not have the extension linked in.
+    statements = [f"LOAD '{EXTENSION}'"] + list(settings or [])
+    args = [DUCKDB, "-batch", "-unsigned", "-init", "/dev/null"]
+    script = None
+    if as_argument:
+        # A DuckDB 2.0 shell reading stdin binds a statement a second time
+        # after its first bind fails, which would double every request count
+        # a failing query makes. One passed with -c is bound once.
+        args += ["-csv", "-noheader", "-c", ";\n".join(statements + [sql])]
+    else:
+        script = "".join(statement + ";\n" for statement in statements)
+        script += ".mode csv\n.headers off\n" + sql + "\n"
 
     env = dict(os.environ)
     env["FIRESTORE_EMULATOR_HOST"] = f"127.0.0.1:{PORT}"
-    completed = subprocess.run(
-        [DUCKDB, "-batch", "-init", "/dev/null"],
+    # Set by coding agents, and it switches the CLI to JSON output.
+    env.pop("AI_AGENT", None)
+    return subprocess.run(
+        args,
         input=script,
         capture_output=True,
         text=True,
@@ -116,6 +141,19 @@ def run_sql(sql, settings=None):
         timeout=600,
         cwd=ROOT,
     )
+
+
+def run_sql_failing(sql, settings=None):
+    """Run SQL that is expected to fail, returning its combined output."""
+    completed = run_cli(sql, settings, as_argument=True)
+    if completed.returncode == 0:
+        raise AssertionError(f"expected the query to fail\nSQL: {sql}\nstdout: {completed.stdout}")
+    return completed.stdout + completed.stderr
+
+
+def run_sql(sql, settings=None):
+    """Run SQL through the real CLI against the mock, returning CSV rows."""
+    completed = run_cli(sql, settings)
     if completed.returncode != 0:
         raise AssertionError(
             f"duckdb exited {completed.returncode}\nSQL: {sql}\n"
@@ -1135,6 +1173,167 @@ def _():
     total = int(rows[0])
     if not (0 < total < 2500):
         raise AssertionError(f"expected a proper subset to match the filter, got {total}")
+
+
+# ---- transient failures: retry with backoff ---------------------------------
+#
+# Firestore sheds load with 429 and 503, aborts contended writes with 409
+# ABORTED, and drops the odd connection. Before retrying existed any of these
+# failed the whole query, however far through a large scan it was. The mock
+# injects them on demand; the backoff is shortened so the tests stay quick.
+
+FAST_RETRY = ["SET firestore_retry_initial_backoff_ms=5", "SET firestore_retry_max_backoff_ms=20"]
+
+
+def write_args(extra=""):
+    args = "project_id:='bench-project', api_key:='benchkey'"
+    return args + (", " + extra if extra else "")
+
+
+@test("retry: a scan rides out 503 UNAVAILABLE")
+def _():
+    reset_stats()
+    inject_faults(3, "unavailable", op="list")
+    assert_eq(count_rows("bench_flat_4_2500", settings=FAST_RETRY), 2500, "rows after three 503s")
+    assert_eq(stats()["injected_faults"], 3, "faults served")
+
+
+@test("retry: a dropped connection is retried for a read")
+def _():
+    reset_stats()
+    inject_faults(2, "drop", op="list")
+    assert_eq(count_rows("bench_flat_4_1500", settings=FAST_RETRY), 1500, "rows after two dropped connections")
+    assert_eq(stats()["injected_faults"], 2, "faults served")
+
+
+@test("retry: a load balancer's HTML 502 is retried for a read")
+def _():
+    reset_stats()
+    inject_faults(2, "html502", op="list")
+    assert_eq(count_rows("bench_flat_4_1500", settings=FAST_RETRY), 1500, "rows after two HTML 502 pages")
+    assert_eq(stats()["injected_faults"], 2, "faults served")
+
+
+@test("retry: runQuery, a read sent as POST, is retried on 500 INTERNAL")
+def _():
+    reset_stats()
+    inject_faults(2, "internal", op="runquery")
+    assert_eq(count_rows("~bench_flat_4_1500", settings=FAST_RETRY), 1500, "collection-group rows after two 500s")
+    assert_eq(stats()["injected_faults"], 2, "faults served")
+
+
+@test("retry: a 429's Retry-After is waited out")
+def _():
+    reset_stats()
+    inject_faults(1, "exhausted", op="list", retry_after=1)
+    started = time.time()
+    rows = count_rows("bench_flat_4_100", settings=["SET firestore_retry_initial_backoff_ms=1"])
+    elapsed = time.time() - started
+    assert_eq(rows, 100, "rows after a 429")
+    if elapsed < 1.0:
+        raise AssertionError(f"Retry-After: 1 should hold the retry back a second, the query took {elapsed:.2f}s")
+
+
+@test("retry: retries stop at firestore_max_retries and the error is reported")
+def _():
+    reset_stats()
+    inject_faults(10, "unavailable", op="list")
+    try:
+        output = run_sql_failing(
+            f"SELECT count(*) FROM firestore_scan({scan_args('bench_flat_4_100')});",
+            FAST_RETRY + ["SET firestore_max_retries=2"],
+        )
+    finally:
+        inject_faults(0, "unavailable")
+    if "503" not in output:
+        raise AssertionError(f"the error should carry the final status, got: {output}")
+    assert_eq(stats()["injected_faults"], 3, "one attempt plus two retries")
+
+
+@test("retry: firestore_max_retries=0 disables retrying")
+def _():
+    reset_stats()
+    inject_faults(1, "unavailable", op="list")
+    try:
+        run_sql_failing(
+            f"SELECT count(*) FROM firestore_scan({scan_args('bench_flat_4_100')});",
+            ["SET firestore_max_retries=0"],
+        )
+    finally:
+        inject_faults(0, "unavailable")
+    assert_eq(stats()["injected_faults"], 1, "a single attempt")
+
+
+@test("retry: an error a retry cannot fix is not retried")
+def _():
+    reset_stats()
+    inject_faults(5, "already_exists", op="list")
+    try:
+        run_sql_failing(f"SELECT count(*) FROM firestore_scan({scan_args('bench_flat_4_100')});", FAST_RETRY)
+    finally:
+        inject_faults(0, "unavailable")
+    assert_eq(stats()["injected_faults"], 1, "a single attempt")
+
+
+@test("retry: creating a document is not repeated after a failure that may have applied it")
+def _():
+    # An auto-id create that Firestore applied before failing would, if sent
+    # again, leave a second copy of the document.
+    reset_stats()
+    inject_faults(1, "internal", op="create")
+    try:
+        run_sql_failing(f"CALL firestore_insert('retry_docs', (SELECT 1 AS a), {write_args()});", FAST_RETRY)
+    finally:
+        inject_faults(0, "unavailable")
+    after = stats()
+    assert_eq(after["injected_faults"], 1, "a single attempt")
+    assert_eq(after["requests_by_op"].get("create", 0), 0, "documents created")
+
+
+@test("retry: creating a document is repeated after a refusal that applied nothing")
+def _():
+    reset_stats()
+    inject_faults(2, "unavailable", op="create")
+    rows = run_sql(f"CALL firestore_insert('retry_docs', (SELECT 1 AS a), {write_args()});", FAST_RETRY)
+    assert_eq(rows, ["1"], "rows inserted")
+    after = stats()
+    assert_eq(after["injected_faults"], 2, "faults served")
+    assert_eq(after["requests_by_op"].get("create", 0), 1, "documents created")
+
+
+@test("retry: a batchWrite rides out 409 ABORTED")
+def _():
+    reset_stats()
+    inject_faults(2, "aborted", op="write")
+    rows = run_sql(f"CALL firestore_delete_batch('retry_docs', ['a', 'b', 'c'], {write_args()});", FAST_RETRY)
+    assert_eq(rows, ["3"], "documents deleted")
+    assert_eq(stats()["injected_faults"], 2, "faults served")
+
+
+@test("retry: transiently failed writes in a batch are resent by themselves")
+def _():
+    reset_stats()
+    inject_write_faults(2, 14)  # UNAVAILABLE
+    rows = run_sql(f"CALL firestore_delete_batch('retry_docs', ['a', 'b', 'c', 'd'], {write_args()});", FAST_RETRY)
+    assert_eq(rows, ["4"], "documents deleted")
+    after = stats()
+    assert_eq(after["batch_sizes_in_order"], [4, 2], "the batch, then only its two failed writes")
+    assert_eq(after["writes_received"], 6, "writes sent")
+
+
+@test("retry: a write that fails for good is reported, not counted as written")
+def _():
+    reset_stats()
+    inject_write_faults(1, 7)  # PERMISSION_DENIED
+    try:
+        output = run_sql_failing(
+            f"CALL firestore_delete_batch('retry_docs', ['a', 'b', 'c', 'd'], {write_args()});", FAST_RETRY
+        )
+    finally:
+        inject_write_faults(0, 14)
+    if "1 of 4 batched writes failed" not in output:
+        raise AssertionError(f"expected the failed write to be reported, got: {output}")
+    assert_eq(stats()["batch_sizes_in_order"], [4], "a permanent failure is not resent")
 
 
 # ================================================================ runner

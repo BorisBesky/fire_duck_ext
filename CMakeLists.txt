@@ -31,6 +31,7 @@ set(EXTENSION_SOURCES
     src/firestore_types.cpp
     src/firestore_wire.cpp
     src/firestore_paging.cpp
+    src/firestore_retry.cpp
     src/firestore_schema_accumulator.cpp
     src/firestore_path_utils.cpp
     src/firestore_scanner.cpp
