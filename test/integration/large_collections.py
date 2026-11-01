@@ -1222,6 +1222,28 @@ def _():
     assert_eq(stats()["injected_faults"], 2, "faults served")
 
 
+@test("retry: runQuery's status is read from the array it wraps errors in")
+def _():
+    # 409 alone could be ALREADY_EXISTS, which is not retried; only the
+    # ABORTED inside the array says this one is.
+    reset_stats()
+    inject_faults(1, "aborted", op="runquery")
+    assert_eq(count_rows("~bench_flat_4_300", settings=FAST_RETRY), 300, "collection-group rows after a 409 ABORTED")
+    assert_eq(stats()["injected_faults"], 1, "faults served")
+
+
+@test("retry: runQuery's error message survives the array it is wrapped in")
+def _():
+    reset_stats()
+    inject_faults(1, "already_exists", op="runquery")
+    try:
+        output = run_sql_failing(f"SELECT count(*) FROM firestore_scan({scan_args('~bench_flat_4_300')});", FAST_RETRY)
+    finally:
+        inject_faults(0, "unavailable")
+    if "injected ALREADY_EXISTS" not in output:
+        raise AssertionError(f"expected Firestore's message in the error, got: {output}")
+
+
 @test("retry: a 429's Retry-After is waited out")
 def _():
     reset_stats()

@@ -669,7 +669,12 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         status, rpc = FAULT_RESPONSES[kind]
-        payload = json.dumps({"error": {"code": status, "message": f"injected {rpc}", "status": rpc}}).encode()
+        error = {"error": {"code": status, "message": f"injected {rpc}", "status": rpc}}
+        # Firestore's streaming methods answer with an array of results, and
+        # an error arrives as the array's one element.
+        if op in ("runquery", "aggregation"):
+            error = [error]
+        payload = json.dumps(error).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         if retry_after is not None:

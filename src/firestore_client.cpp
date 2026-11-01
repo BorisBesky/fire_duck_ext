@@ -287,6 +287,20 @@ void FirestoreClient::WaitBeforeRetry(int64_t delay_ms) {
 	}
 }
 
+// The google.rpc.Status of an error response, or null. Most methods answer
+// {"error": {...}}; the streaming ones (runQuery, runAggregationQuery) answer
+// with an array of results, and an error arrives as [{"error": {...}}].
+static const json *FirestoreErrorObject(const json &response) {
+	const json *holder = &response;
+	if (response.is_array() && !response.empty()) {
+		holder = &response[0];
+	}
+	if (holder->is_object() && holder->contains("error") && (*holder)["error"].is_object()) {
+		return &(*holder)["error"];
+	}
+	return nullptr;
+}
+
 // Uniform in [0, 1), for spreading retries out. Per thread, so parallel scan
 // threads neither share a generator nor retry in lockstep.
 static double RetryJitter() {
@@ -363,9 +377,9 @@ json FirestoreClient::MakeRequest(const std::string &method, const std::string &
 
 		if (!success) {
 			std::string rpc_status;
-			if (response.is_object() && response.contains("error") && response["error"].is_object() &&
-			    response["error"].contains("status") && response["error"]["status"].is_string()) {
-				rpc_status = response["error"]["status"].get<std::string>();
+			auto error = FirestoreErrorObject(response);
+			if (error && error->contains("status") && (*error)["status"].is_string()) {
+				rpc_status = (*error)["status"].get<std::string>();
 			}
 			if (can_retry && ShouldRetryFirestoreResponse(http_code, rpc_status, safety)) {
 				auto delay_ms = FirestoreRetryDelayMs(retry_policy_, retry, RetryJitter(), attempt.retry_after_ms);
@@ -402,16 +416,14 @@ void FirestoreClient::HandleError(int status_code, const json &response, const F
 	}
 
 	std::string message = "Unknown error";
-	if (response.contains("error")) {
-		auto &error = response["error"];
-		if (error.contains("message")) {
-			message = error["message"].get<std::string>();
-		}
+	auto error = FirestoreErrorObject(response);
+	if (error && error->contains("message") && (*error)["message"].is_string()) {
+		message = (*error)["message"].get<std::string>();
 	}
 
 	FirestoreErrorContext error_ctx = ctx;
-	if (response.contains("error")) {
-		error_ctx.withResponseBody(response["error"].dump().substr(0, 500));
+	if (error) {
+		error_ctx.withResponseBody(error->dump().substr(0, 500));
 	}
 
 	FS_LOG_ERROR("Firestore API error (HTTP " + std::to_string(status_code) + "): " + message);
