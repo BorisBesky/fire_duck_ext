@@ -84,6 +84,8 @@ docs:
 
     The extension also builds and runs under DuckDB-WASM using API-key or
     Firebase-user auth (service-account auth needs OpenSSL and is native-only).
+    Prefer DuckDB 2.0 there: the DuckDB 1.5 WASM runtime misreports requests
+    Firestore refuses, so a rejected update or delete can look successful.
 
     Builds for DuckDB 2.0 (including Windows ARM64) and DuckDB 1.5.
 

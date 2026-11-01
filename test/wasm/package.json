@@ -7,12 +7,16 @@
   "scripts": {
     "validate:module": "node validate_wasm_module.mjs",
     "validate:functional": "node validate_wasm_functional.mjs",
-    "validate": "node validate_wasm_module.mjs && node validate_wasm_functional.mjs",
-    "sql": "node run_sql.mjs"
+    "validate": "node validate_wasm_module.mjs && node validate_wasm_functional.mjs && node validate_wasm_browser.mjs",
+    "sql": "node run_sql.mjs",
+    "validate:browser": "node validate_wasm_browser.mjs"
   },
-  "comment": "@duckdb/duckdb-wasm must bundle the same DuckDB MINOR as the extension build (currently 1.5.x). Stable releases still bundle 1.4.x, so a 1.33.1-dev* build (DuckDB 1.5.4) is pinned here. Bump to a stable 1.5.x when one ships. Check with: node -e \"...createDuckDB...getVersion()\".",
+  "comment": "@duckdb/duckdb-wasm must bundle the same DuckDB MINOR as the extension build. 1.33.1-dev110.0 bundles DuckDB v2.0.0 (d54cbbe3df), the version MainDistributionPipeline.yml builds; the DuckDB 1.5 leg of wasm-validation.yml installs 1.33.1-dev57.0 (DuckDB 1.5.4) over it. Stable releases still bundle 1.4.x. Check what a version bundles with: node -e \"...getVersion()\" (see README.md).",
   "dependencies": {
-    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
+    "@duckdb/duckdb-wasm": "1.33.1-dev110.0",
     "web-worker": "^1.5.0"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
   }
 }

@@ -893,6 +893,8 @@ Two consequences of rules-governed (API key / Firebase user) access apply on any
 
 The WASM build must match the DuckDB version bundled by the `@duckdb/duckdb-wasm` runtime it is loaded into — the C++ extension ABI is not stable across versions.
 
+Prefer DuckDB 2.0 for WASM. The DuckDB 1.5 browser runtime misreports requests Firestore refuses — as an empty `404` for reads, and as **success** for updates and deletes — so a rejected write can look like it went through. DuckDB 2.0's runtime reports them correctly. CI loads both builds into DuckDB-WASM in headless Chromium and, on 2.0, sends real requests to Firestore over every transport path; see [`test/wasm/README.md`](test/wasm/README.md).
+
 ## Building from Source
 
 ### Prerequisites

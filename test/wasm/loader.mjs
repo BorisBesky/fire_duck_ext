@@ -62,11 +62,18 @@ function startExtensionServer(extBytes) {
 	});
 }
 
+// The single-threaded exception-handling build, which loads wasm_eh extensions.
+// Builds bundling DuckDB 1.5 call it "eh"; those bundling DuckDB 2.0 dropped the
+// MVP variant and call it "base".
 function selectEhBundle() {
 	const DIST = path.dirname(require.resolve("@duckdb/duckdb-wasm"));
 	const findOne = (candidates) => candidates.find((f) => existsSync(path.join(DIST, f)));
-	const mainModule = findOne(["duckdb-eh.wasm"]);
-	const mainWorker = findOne(["duckdb-node-eh.worker.cjs", "duckdb-node-eh.worker.js"]);
+	const mainModule = findOne(["duckdb-eh.wasm", "duckdb-base.wasm"]);
+	const mainWorker = findOne([
+		"duckdb-node-eh.worker.cjs",
+		"duckdb-node-eh.worker.js",
+		"duckdb-node-base.worker.cjs",
+	]);
 	if (!mainModule || !mainWorker) {
 		throw new Error(`Could not locate the DuckDB-WASM 'eh' Node bundle under ${DIST}.`);
 	}

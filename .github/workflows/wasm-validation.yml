@@ -1,8 +1,9 @@
 #
 # Builds the DuckDB-WASM (wasm_eh) build of fire_duck_ext and runs the WASM
-# validation tests in test/wasm/. The main distribution pipeline builds the WASM
-# artifact but runs no tests against it; this workflow closes that gap
-# ("compiling isn't running").
+# validation tests in test/wasm/, for each DuckDB version the extension ships
+# for. The main distribution pipeline builds the WASM artifacts but runs no
+# tests against them; this workflow closes that gap ("compiling isn't
+# running").
 #
 # Because OpenSSL is excluded on the emscripten triplet (see vcpkg.json /
 # CMakeLists.txt), the WASM build needs no vcpkg dependencies, so emsdk alone is
@@ -26,18 +27,34 @@ concurrency:
 
 jobs:
   wasm-validate:
-    name: Build wasm_eh and validate
+    name: Build wasm_eh and validate (DuckDB ${{ matrix.duckdb_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep each leg in step with MainDistributionPipeline.yml. The
+          # Emscripten version is the one extension-ci-tools builds that DuckDB
+          # release with, and @duckdb/duckdb-wasm must bundle the same DuckDB
+          # minor (see test/wasm/README.md).
+          - duckdb_version: v2.0.0
+            emsdk_version: 6.0.9
+            duckdb_wasm: 1.33.1-dev110.0
+            firestore_probes: true
+          # The newest @duckdb/duckdb-wasm bundling DuckDB 1.5 carries 1.5.4.
+          # Its browser runtime reports a failed request to the extension as a
+          # 404 with no body (GET, POST) or as success (PATCH, DELETE), so the
+          # Firestore probes cannot pass there; loading is still checked.
+          - duckdb_version: v1.5.4
+            emsdk_version: 3.1.71
+            duckdb_wasm: 1.33.1-dev57.0
+            firestore_probes: false
     env:
       DUCKDB_PLATFORM: wasm_eh
       WASM_EXTENSIONS: 1
-      # Stays on DuckDB 1.5 while MainDistributionPipeline.yml builds 2.0:
-      # LOAD needs a @duckdb/duckdb-wasm runtime with the same DuckDB minor,
-      # and no published one bundles 2.0 yet (the newest, 1.33.1-dev65.0,
-      # bundles v1.5.6). The 2.0 WASM builds still run in the main pipeline.
-      # Move this (and test/wasm/package.json) to 2.0 once such a runtime ships.
-      DUCKDB_VERSION: v1.5.4
+      DUCKDB_VERSION: ${{ matrix.duckdb_version }}
+      DUCKDB_WASM_VERSION: ${{ matrix.duckdb_wasm }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,10 +64,10 @@ jobs:
       - name: Pin DuckDB to the distribution version
         run: DUCKDB_GIT_VERSION="$DUCKDB_VERSION" make set_duckdb_version
 
-      # Emscripten version must match the one DuckDB v1.5.x is built with upstream.
-      - uses: mymindstorm/setup-emsdk@v13
+      # The action and pin extension-ci-tools builds DuckDB's WASM extensions with.
+      - uses: emscripten-core/setup-emsdk@4528d102f7230f0e7b276855c01ea1159be0e984 # v16
         with:
-          version: 3.1.71
+          version: ${{ matrix.emsdk_version }}
 
       - name: Build wasm_eh extension
         run: make wasm_eh
@@ -64,8 +81,21 @@ jobs:
       - name: Structural validation
         run: node test/wasm/validate_wasm_module.mjs
 
-      # Layer 2: load the extension into DuckDB-WASM and run queries.
-      - name: Functional validation
+      - name: Install the DuckDB-WASM runtime
         run: |
           npm --prefix test/wasm install
-          node test/wasm/validate_wasm_functional.mjs
+          npm --prefix test/wasm install --no-save "@duckdb/duckdb-wasm@$DUCKDB_WASM_VERSION"
+
+      # Layer 2: load the extension into DuckDB-WASM under Node and run queries.
+      - name: Functional validation
+        run: node test/wasm/validate_wasm_functional.mjs
+
+      # Layer 3: load it into DuckDB-WASM in headless Chromium, where its HTTP
+      # layer works, and send real requests to Firestore over each transport
+      # path (Node has no XMLHttpRequest, so Layer 2 cannot).
+      - name: Browser validation
+        env:
+          WASM_SKIP_NETWORK: ${{ matrix.firestore_probes && '0' || '1' }}
+        run: |
+          npx --prefix test/wasm playwright install --with-deps chromium
+          node test/wasm/validate_wasm_browser.mjs
