@@ -636,6 +636,10 @@ unique_ptr<FunctionData> FirestoreScanBind(ClientContext &context, TableFunction
 			FS_LOG_DEBUG("Index cache populated: " + std::to_string(result->index_cache->composite_indexes.size()) +
 			             " composite indexes, default_single_field=" +
 			             (result->index_cache->default_single_field_enabled ? "true" : "false"));
+		} catch (const InterruptException &) {
+			// Raised while waiting to retry a request: the query is being
+			// cancelled, which none of the fallbacks here should absorb.
+			throw;
 		} catch (const std::exception &e) {
 			// Admin API unavailable (e.g. emulator, insufficient permissions).
 			// Assume Firestore's default single-field indexes exist for every field.
@@ -885,6 +889,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 					global_state->docpath_ids.resize(lim);
 				}
 			}
+		} catch (const InterruptException &) {
+			throw;
 		} catch (...) {
 			FS_LOG_ERROR("Failed to list subcollections for document path '" + bind_data.collection +
 			             "': an exception was thrown while fetching document path IDs");
@@ -967,6 +973,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 				             std::to_string(counted) + " documents, fetching none");
 				return std::move(global_state);
 			}
+		} catch (const InterruptException &) {
+			throw;
 		} catch (const std::exception &e) {
 			// Aggregation queries are not available everywhere (older
 			// emulators, restricted credentials). Reading the documents is
@@ -1079,6 +1087,8 @@ unique_ptr<GlobalTableFunctionState> FirestoreScanInitGlobal(ClientContext &cont
 			global_state->last_page_was_full =
 			    (static_cast<int64_t>(response.documents.size()) >= global_state->query_page_size);
 			FS_LOG_DEBUG("InitGlobal: RunQuery returned " + std::to_string(response.documents.size()) + " documents");
+		} catch (const InterruptException &) {
+			throw;
 		} catch (const std::exception &e) {
 			// Fallback: if runQuery fails, disable pushdown and use ListDocuments
 			FS_LOG_WARN("RunQuery with filters failed, falling back to full scan: " + std::string(e.what()));
