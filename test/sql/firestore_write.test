@@ -218,44 +218,185 @@ SELECT * FROM firestore_delete_batch(
 
 # ============================================
 # Collection Group Write Operations (~ prefix)
-# These test that write operations accept the ~ prefix
-# for collection group paths (fails at runtime, but binding succeeds)
+# Full document paths inside the group pass the bind-time path check
+# (these then fail at runtime with fake credentials, not at the check)
 # ============================================
 
 # Single update with ~ collection group prefix
 statement error
 SELECT * FROM firestore_update('~orders', 'users/user1/orders/order1', 'status', 'shipped');
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Single delete with ~ collection group prefix
 statement error
 SELECT * FROM firestore_delete('~orders', 'users/user1/orders/order1');
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Batch update with ~ collection group prefix
 statement error
 SELECT * FROM firestore_update_batch('~orders', ['users/user1/orders/order1', 'users/user2/orders/order1'], 'status', 'cancelled');
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Batch delete with ~ collection group prefix
 statement error
 SELECT * FROM firestore_delete_batch('~orders', ['users/user1/orders/order1', 'users/user2/orders/order1']);
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Array union with ~ collection group prefix
 statement error
 SELECT * FROM firestore_array_union('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Array remove with ~ collection group prefix
 statement error
 SELECT * FROM firestore_array_remove('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
 
 # Array append with ~ collection group prefix
 statement error
 SELECT * FROM firestore_array_append('~orders', 'users/user1/orders/order1', 'tags', ['urgent']);
 ----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
+
+# A leading slash is accepted, and a root-level collection named like the
+# group is part of the group
+statement error
+SELECT * FROM firestore_update('~orders', '/users/user1/orders/order1', 'status', 'shipped');
+----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
+
+statement error
+SELECT * FROM firestore_delete('~orders', 'orders/order1');
+----
+<!REGEX>:.*(not a full document path|not in collection group|empty segment|names no collection|is a path).*
+
+# ============================================
+# Collection Group Writes: refused paths
+# A collection group has no single parent, so each document must be named by
+# its full path inside the group. These fail at bind time, before any request.
+# ============================================
+
+# A bare document id names a collection, not a document
+statement error
+SELECT * FROM firestore_update('~orders', 'order1', 'status', 'shipped');
+----
+firestore_update: 'order1' is not a full document path; writes to collection group '~orders' need each document's full path, such as '<parent path>/orders/<document id>'
+
+statement error
+SELECT * FROM firestore_delete('~orders', 'order1');
+----
+firestore_delete: 'order1' is not a full document path
+
+# A collection path is not a document either
+statement error
+SELECT * FROM firestore_delete('~orders', 'users/user1/orders');
+----
+firestore_delete: 'users/user1/orders' is not a full document path
+
+# A document in another collection is refused rather than written: used
+# verbatim, this would delete users/user1
+statement error
+SELECT * FROM firestore_delete('~orders', 'users/user1');
+----
+firestore_delete: document 'users/user1' is in collection 'users', not in collection group '~orders'
+
+statement error
+SELECT * FROM firestore_update('~orders', 'users/user1/profile/main', 'status', 'shipped');
+----
+firestore_update: document 'users/user1/profile/main' is in collection 'profile', not in collection group '~orders'
+
+# Collection ids are case-sensitive
+statement error
+SELECT * FROM firestore_update('~orders', 'users/user1/Orders/order1', 'status', 'shipped');
+----
+is in collection 'Orders', not in collection group '~orders'
+
+# Empty paths and empty segments
+statement error
+SELECT * FROM firestore_delete('~orders', '');
+----
+firestore_delete: document path is empty
+
+statement error
+SELECT * FROM firestore_update('~orders', 'users//orders/order1', 'status', 'shipped');
+----
+firestore_update: document path 'users//orders/order1' has an empty segment
+
+statement error
+SELECT * FROM firestore_delete('~orders', 'users/user1/orders/order1/');
+----
+has an empty segment
+
+# The group must name one collection id
+statement error
+SELECT * FROM firestore_delete('~', 'users/user1/orders/order1');
+----
+firestore_delete: collection group '~' names no collection
+
+statement error
+SELECT * FROM firestore_update('~users/user1/orders', 'users/user1/orders/order1', 'status', 'shipped');
+----
+firestore_update: collection group '~users/user1/orders' is a path; a collection group is a single collection id, such as '~orders'
+
+# Batches: one bad path fails the whole statement before any batch is sent
+statement error
+SELECT * FROM firestore_update_batch('~orders', ['users/user1/orders/order1', 'order2'], 'status', 'cancelled');
+----
+firestore_update_batch: 'order2' is not a full document path
+
+statement error
+SELECT * FROM firestore_delete_batch('~orders', ['users/user1/orders/order1', 'users/user2']);
+----
+firestore_delete_batch: document 'users/user2' is in collection 'users', not in collection group '~orders'
+
+# The group name is checked even when the list is empty or NULL
+statement error
+SELECT * FROM firestore_update_batch('~', []::VARCHAR[], 'status', 'active');
+----
+firestore_update_batch: collection group '~' names no collection
+
+statement error
+SELECT * FROM firestore_delete_batch('~users/user1/orders', NULL::VARCHAR[]);
+----
+firestore_delete_batch: collection group '~users/user1/orders' is a path
+
+# Array transforms
+statement error
+SELECT * FROM firestore_array_union('~orders', 'order1', 'tags', ['urgent']);
+----
+firestore_array_union: 'order1' is not a full document path
+
+statement error
+SELECT * FROM firestore_array_remove('~orders', 'users/user1', 'tags', ['urgent']);
+----
+firestore_array_remove: document 'users/user1' is in collection 'users', not in collection group '~orders'
+
+statement error
+SELECT * FROM firestore_array_append('~orders', 'users/user1/profile/main', 'tags', ['urgent']);
+----
+firestore_array_append: document 'users/user1/profile/main' is in collection 'profile'
+
+# The check needs no credentials: it fails the same way without a secret
+statement ok
+DROP SECRET type_test;
+
+statement error
+SELECT * FROM firestore_delete('~orders', 'users/user1');
+----
+firestore_delete: document 'users/user1' is in collection 'users'
+
+statement ok
+CREATE SECRET type_test (
+    TYPE firestore,
+    PROJECT_ID 'test-project',
+    API_KEY 'test-key'
+);
 
 # Empty list with ~ prefix returns 0 (no documents to process)
 query I

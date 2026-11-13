@@ -438,6 +438,55 @@ assert_eq "$CG_ALPHA_COUNT" "0" "Collection group array remove removed all 'alph
 # Cleanup collection group array test data
 run_query "SELECT * FROM firestore_delete('users/user1/tags', 'tag1');" > /dev/null
 
+# Test 18f: Collection group writes refuse paths outside the group
+echo "Test 18f: Collection group writes refuse paths outside the group..."
+# 'users/user1' is a valid document path, just not one in any 'orders'
+# collection. Used verbatim, it would have deleted the user.
+CG_WRONG_COLLECTION=$(run_explain "CALL firestore_delete('~orders', 'users/user1');")
+assert_contains "$CG_WRONG_COLLECTION" "is in collection 'users', not in collection group '~orders'" \
+    "Collection group delete refuses a document in another collection"
+USER1_STILL_THERE=$(run_query "SELECT count(*) FROM firestore_scan('users') WHERE __document_id = 'user1';")
+assert_eq "$USER1_STILL_THERE" "1" "users/user1 survives a collection group delete aimed at it"
+
+# A bare id names a collection, not a document
+CG_BARE_ID=$(run_explain "CALL firestore_update('~orders', 'order1', 'status', 'bare_id');")
+assert_contains "$CG_BARE_ID" "'order1' is not a full document path" "Collection group update refuses a bare document id"
+CG_BARE_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'bare_id';")
+assert_eq "$CG_BARE_COUNT" "0" "No order was updated through a bare id"
+
+# One bad path stops a batch before any of it is sent
+CG_BATCH_MIXED=$(run_explain "CALL firestore_update_batch('~orders', ['users/user1/orders/order1', 'users/user2'], 'status', 'mixed_batch');")
+assert_contains "$CG_BATCH_MIXED" "document 'users/user2' is in collection 'users'" \
+    "Collection group batch update refuses a path outside the group"
+CG_MIXED_COUNT=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE status = 'mixed_batch';")
+assert_eq "$CG_MIXED_COUNT" "0" "The valid path in a refused batch was not written either"
+USER2_STATUS=$(run_query "SELECT status FROM firestore_scan('users') WHERE __document_id = 'user2';")
+assert_eq "$USER2_STATUS" "pending" "users/user2 is untouched by the refused batch"
+
+# Test 18g: Insert into a collection group
+echo "Test 18g: Collection group insert..."
+# A collection group has no single parent, so Firestore cannot generate ids in it
+CG_INSERT_AUTO=$(run_explain "CALL firestore_insert('~orders', (SELECT 'Auto' AS product));")
+assert_contains "$CG_INSERT_AUTO" "cannot generate document ids in collection group '~orders'" \
+    "Collection group insert without document_id is refused"
+
+# With full paths, each document is created under its own parent collection --
+# not in a top-level collection literally named '~orders'
+run_query "CALL firestore_insert('~orders', (SELECT 'users/user2/orders/cg_insert' AS path, 'Inserted' AS product, 'cg_inserted' AS status), document_id := 'path');" > /dev/null
+CG_INSERTED=$(run_query "SELECT product FROM firestore_scan('users/user2/orders') WHERE __document_id = 'cg_insert';")
+assert_eq "$CG_INSERTED" "Inserted" "Collection group insert created the document in its own parent collection"
+CG_INSERTED_VIA_GROUP=$(run_query "SELECT count(*) FROM firestore_scan('~orders') WHERE __document_id = 'users/user2/orders/cg_insert';")
+assert_eq "$CG_INSERTED_VIA_GROUP" "1" "The inserted document is visible through the collection group"
+
+CG_INSERT_BAD=$(run_explain "CALL firestore_insert('~orders', (SELECT 'users/user2' AS path, 'Wrong' AS product), document_id := 'path');")
+assert_contains "$CG_INSERT_BAD" "document 'users/user2' is in collection 'users'" \
+    "Collection group insert refuses a path outside the group"
+# Written, the insert would have replaced users/user2 whole, status included
+USER2_STATUS_AFTER_INSERT=$(run_query "SELECT status FROM firestore_scan('users') WHERE __document_id = 'user2';")
+assert_eq "$USER2_STATUS_AFTER_INSERT" "pending" "users/user2 was not overwritten by the refused insert"
+
+run_query "CALL firestore_delete('~orders', 'users/user2/orders/cg_insert');" > /dev/null
+
 # Test 19: GeoPoint type (reading)
 echo "Test 19: GeoPoint type support..."
 curl -s -X POST "http://${FIRESTORE_EMULATOR_HOST}/v1/projects/test-project/databases/(default)/documents/locations?documentId=loc1" \

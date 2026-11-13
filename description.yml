@@ -51,6 +51,12 @@ docs:
     firestore_array_append(). Every function documents itself in
     duckdb_functions() with a description, parameter names, and an example.
 
+    The write functions also take a collection group ('~orders'), naming each
+    document by its full path, as the __document_id from
+    firestore_scan('~orders') gives it. A bare ID, or a path to a document in
+    another collection, is refused rather than written elsewhere; inserting into
+    a collection group needs document_id := with full paths.
+
     WHERE filters, SQL ORDER BY / LIMIT, the column projection, and a bare
     COUNT(*) are pushed down to Firestore where possible. A query then
     transfers only what it uses: matching rows, selected fields, and for a

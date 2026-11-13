@@ -90,7 +90,9 @@ struct ResolvedDocumentPath {
 };
 
 // Resolves a collection + document_id into the correct document path.
-// For collection groups (~ prefix): strips ~, uses document_id as full path.
+// For collection groups (~ prefix): document_id must be the document's full
+// path, inside the group; anything else throws FirestoreError
+// (WRITE_DOC_ID_INVALID). See ResolveFirestoreCollectionGroupDocumentPath.
 // For regular collections: concatenates collection/document_id.
 ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const std::string &document_id);
 

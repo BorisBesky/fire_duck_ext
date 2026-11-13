@@ -98,6 +98,58 @@ SELECT * FROM firestore_insert('users',
 Firestore insert failed
 
 # ============================================
+# Collection groups ('~' prefix)
+# ============================================
+
+# A collection group has no single parent, so Firestore cannot generate ids in
+# one. Before this was refused, the request went to a top-level collection
+# literally named '~orders'.
+statement error
+SELECT * FROM firestore_insert('~orders', (SELECT 'Alice' AS name));
+----
+firestore_insert: cannot generate document ids in collection group '~orders', which has no single parent collection. Pass document_id := a column holding each document's full path, such as '<parent path>/orders/<document id>', or insert into one collection, such as '<parent path>/orders'
+
+# The group must name one collection id
+statement error
+SELECT * FROM firestore_insert('~', (SELECT 'orders/o1' AS id, 1 AS amount), document_id := 'id');
+----
+firestore_insert: collection group '~' names no collection
+
+statement error
+SELECT * FROM firestore_insert('~users/u1/orders', (SELECT 'users/u1/orders/o1' AS id, 1 AS amount), document_id := 'id');
+----
+firestore_insert: collection group '~users/u1/orders' is a path
+
+# Each explicit id must be a full document path inside the group. The ids come
+# from the subquery, so this is checked per row as the rows arrive.
+statement error
+SELECT * FROM firestore_insert('~orders', (SELECT 'order1' AS id, 1 AS amount), document_id := 'id');
+----
+firestore_insert: 'order1' is not a full document path
+
+statement error
+SELECT * FROM firestore_insert('~orders', (SELECT 'users/user1' AS id, 1 AS amount), document_id := 'id');
+----
+firestore_insert: document 'users/user1' is in collection 'users', not in collection group '~orders'
+
+# A bad row anywhere stops the insert
+statement error
+SELECT * FROM firestore_insert('~orders',
+    (SELECT * FROM (VALUES ('users/user1/orders/o1', 1), ('users/user1/profile/main', 2)) AS t(id, amount)),
+    document_id := 'id');
+----
+firestore_insert: document 'users/user1/profile/main' is in collection 'profile'
+
+# Full paths in the group take the same batch path as any explicit id: with
+# fake credentials it falls back to one create per document and returns 0
+query I
+SELECT * FROM firestore_insert('~orders',
+    (SELECT 'users/user1/orders/order1' AS id, 1 AS amount),
+    document_id := 'id');
+----
+0
+
+# ============================================
 # Cleanup
 # ============================================
 

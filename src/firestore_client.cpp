@@ -64,10 +64,18 @@ static bool ParseUrl(const std::string &url, std::string &scheme_host, std::stri
 
 ResolvedDocumentPath ResolveDocumentPath(const std::string &collection, const std::string &document_id) {
 	ResolvedDocumentPath result;
-	if (!collection.empty() && collection[0] == '~') {
-		// Collection group: doc_id is already a full document path
+	if (IsFirestoreCollectionGroup(collection)) {
+		// Collection group: doc_id must already be the document's full path,
+		// and that document must sit in the group. Used verbatim, a bare id
+		// would address a collection, and a path into another collection would
+		// write there.
 		result.is_collection_group = true;
-		result.document_path = document_id;
+		auto error = ResolveFirestoreCollectionGroupDocumentPath(collection, document_id, result.document_path);
+		if (!error.empty()) {
+			FirestoreErrorContext ctx;
+			ctx.withCollection(collection).withDocument(document_id);
+			throw FirestoreError(FirestoreErrorCode::WRITE_DOC_ID_INVALID, error, ctx);
+		}
 	} else {
 		result.is_collection_group = false;
 		std::string clean_collection = collection;
@@ -630,6 +638,18 @@ FirestoreDocument FirestoreClient::GetDocument(const std::string &collection, co
 FirestoreDocument FirestoreClient::CreateDocument(const std::string &collection, const json &fields,
                                                   const std::optional<std::string> &document_id) {
 	FS_LOG_DEBUG("Creating document in collection: " + collection);
+
+	if (IsFirestoreCollectionGroup(collection)) {
+		// A collection group has no single parent to create a document under;
+		// sent as is, '~orders' would create a top-level collection of that name.
+		FirestoreErrorContext ctx;
+		ctx.withOperation("create").withCollection(collection);
+		throw FirestoreError(FirestoreErrorCode::WRITE_INSERT_FAILED,
+		                     "cannot create a document in collection group '" + collection +
+		                         "'; name the collection to create it in, such as '<parent path>/" +
+		                         collection.substr(1) + "'",
+		                     ctx);
+	}
 
 	std::string url = BuildUrl(collection);
 
