@@ -16,6 +16,13 @@ fi
 
 EXT_PATH="build/release/extension/fire_duck_ext/fire_duck_ext.duckdb_extension"
 
+# Every query authenticates with the emulator's owner token, which the emulator
+# treats as admin. An API key sends no Authorization header at all, and the
+# emulator then refuses metadata operations -- including the phantom-document
+# listing every default (show_missing:=true) scan sends -- and batch writes.
+# The "API-key auth" section near the end covers that mode on purpose.
+EMULATOR_AUTH="PROJECT_ID 'test-project', ID_TOKEN 'owner'"
+
 # Strip ANSI escapes and whitespace so assertions see stable values.
 clean_query_output() {
     sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' | tr -d '[:space:]"'
@@ -25,7 +32,7 @@ clean_query_output() {
 run_query() {
     $DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+CREATE SECRET __q (TYPE firestore, ${EMULATOR_AUTH});
 $1
 " 2>&1 | tail -1 | clean_query_output
 }
@@ -60,7 +67,7 @@ assert_ge() {
 run_explain() {
     $DUCKDB -unsigned -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET __q (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+CREATE SECRET __q (TYPE firestore, ${EMULATOR_AUTH});
 $1
 " 2>&1
 }
@@ -1097,7 +1104,7 @@ echo "Test 51: firestore_connect sets session database..."
 # The emulator uses (default) database, so connecting to it should work
 CONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET conn_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CREATE SECRET conn_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT 'connected';
 " 2>&1 | tail -1 | clean_query_output)
@@ -1107,7 +1114,7 @@ assert_eq "$CONNECT_RESULT" "connected" "firestore_connect succeeds for (default
 echo "Test 52: firestore_disconnect clears session database..."
 DISCONNECT_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET disc_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CREATE SECRET disc_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '(default)');
 CALL firestore_connect('(default)');
 CALL firestore_disconnect();
 SELECT 'disconnected';
@@ -1118,7 +1125,7 @@ assert_eq "$DISCONNECT_RESULT" "disconnected" "firestore_disconnect succeeds"
 echo "Test 53: firestore_connect with wildcard secret..."
 WILDCARD_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET wild_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CREATE SECRET wild_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '*');
 CALL firestore_connect('any-database');
 SELECT 'wildcard_works';
 " 2>&1 | tail -1 | clean_query_output)
@@ -1128,7 +1135,7 @@ assert_eq "$WILDCARD_RESULT" "wildcard_works" "firestore_connect works with wild
 echo "Test 53b: firestore_connect with DATABASES list secret..."
 DATABASES_LIST_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET list_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CREATE SECRET list_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('(default)');
 SELECT 'list_default_ok';
 " 2>&1 | tail -1 | clean_query_output)
@@ -1136,7 +1143,7 @@ assert_eq "$DATABASES_LIST_RESULT" "list_default_ok" "firestore_connect works wi
 
 DATABASES_LIST_OTHER=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET list_test2 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CREATE SECRET list_test2 (TYPE firestore, ${EMULATOR_AUTH}, DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('other-db');
 SELECT 'list_other_ok';
 " 2>&1 | tail -1 | clean_query_output)
@@ -1144,7 +1151,7 @@ assert_eq "$DATABASES_LIST_OTHER" "list_other_ok" "firestore_connect works with 
 
 DATABASES_LIST_NOMATCH=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET list_test3 (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASES ['(default)', 'other-db']);
+CREATE SECRET list_test3 (TYPE firestore, ${EMULATOR_AUTH}, DATABASES ['(default)', 'other-db']);
 CALL firestore_connect('unknown-db');
 SELECT 'should_not_reach';
 " 2>&1 | grep -i "No Firestore credentials found" | head -1)
@@ -1159,7 +1166,7 @@ fi
 echo "Test 54: firestore_connect fails for non-matching database..."
 NOMATCH_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET specific_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE 'specific-db');
+CREATE SECRET specific_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE 'specific-db');
 CALL firestore_connect('different-db');
 SELECT 'should_not_reach';
 " 2>&1 | grep -i "No Firestore credentials found" | head -1)
@@ -1179,7 +1186,7 @@ curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databa
 
 CONNECTED_QUERY=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET cq_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '(default)');
+CREATE SECRET cq_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '(default)');
 CALL firestore_connect('(default)');
 SELECT value FROM firestore_scan('connect_test') WHERE __document_id = 'ct1';
 " 2>&1 | tail -1 | clean_query_output)
@@ -1195,7 +1202,7 @@ echo "Test 56: Per-query database parameter overrides firestore_connect..."
 # but we can verify the parameter is accepted
 OVERRIDE_CHECK=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET ov_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CREATE SECRET ov_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '*');
 CALL firestore_connect('connected-db');
 -- This should use '(default)' database, not 'connected-db'
 SELECT count(*) FROM firestore_scan('users', database := '(default)');
@@ -1212,7 +1219,7 @@ fi
 echo "Test 57: Multiple connect/disconnect cycles..."
 CYCLE_RESULT=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET cycle_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CREATE SECRET cycle_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '*');
 CALL firestore_connect('db1');
 CALL firestore_disconnect();
 CALL firestore_connect('db2');
@@ -1226,7 +1233,7 @@ assert_eq "$CYCLE_RESULT" "cycles_ok" "Multiple connect/disconnect cycles work"
 echo "Test 58: Connect to (default) resets to default behavior..."
 DEFAULT_RESET=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET reset_test (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key', DATABASE '*');
+CREATE SECRET reset_test (TYPE firestore, ${EMULATOR_AUTH}, DATABASE '*');
 CALL firestore_connect('custom-db');
 CALL firestore_connect('(default)');
 SELECT 'reset_ok';
@@ -1375,16 +1382,22 @@ curl -s -X POST "http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databa
   -H "Content-Type: application/json" \
   -d '{"fields": {"value": {"stringValue": "real_data"}}}' > /dev/null
 
-# Test 67: show_missing=true is accepted (default behavior)
-echo "Test 67: show_missing=true is accepted..."
+# Test 67: show_missing=true (the default) includes the phantom parent
+echo "Test 67: show_missing=true includes phantom documents..."
+# np_phantom holds real1 and ghost1, which exists only to parent a subcollection.
+# Listing ghost1 is a metadata operation, answered here because the suite
+# authenticates as the emulator's owner.
 SM_TRUE=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom', show_missing=true);")
-# Emulator doesn't support showMissing, so this should still return at least the real doc
-assert_ge "$SM_TRUE" "1" "show_missing=true returns at least 1 document"
+assert_eq "$SM_TRUE" "2" "show_missing=true returns the real and the phantom document"
+SM_DEFAULT=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom');")
+assert_eq "$SM_DEFAULT" "2" "show_missing defaults to true"
+SM_GHOST=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom') WHERE __document_id = 'ghost1';")
+assert_eq "$SM_GHOST" "1" "The phantom document is listed by its id"
 
-# Test 68: show_missing=false is accepted
-echo "Test 68: show_missing=false is accepted..."
+# Test 68: show_missing=false leaves the phantom out
+echo "Test 68: show_missing=false excludes phantom documents..."
 SM_FALSE=$(run_query "SELECT count(*) FROM firestore_scan('np_phantom', show_missing=false);")
-assert_ge "$SM_FALSE" "1" "show_missing=false returns at least 1 document"
+assert_eq "$SM_FALSE" "1" "show_missing=false returns only the real document"
 
 # Test 69: show_missing=false returns real documents correctly
 echo "Test 69: show_missing=false returns correct data..."
@@ -1400,11 +1413,13 @@ assert_eq "$DB_OVERRIDE" "5" "database='(default)' per-query override returns al
 
 # Test 71: database parameter with explicit project_id and api_key
 echo "Test 71: per-query project_id and api_key override..."
-# Use the same project/key as the secret; verifies the parameter path doesn't error
+# The override replaces the secret's credentials with an API key, which cannot
+# list phantom documents, so this scan passes show_missing=false -- as any
+# API-key scan must (see the API-key auth section below).
 PQ_OVERRIDE=$($DUCKDB -unsigned -csv -noheader -c "
 LOAD '${EXT_PATH}';
-CREATE SECRET __pq (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
-SELECT count(*) FROM firestore_scan('np_test', project_id='test-project', api_key='fake-key');
+CREATE SECRET __pq (TYPE firestore, ${EMULATOR_AUTH});
+SELECT count(*) FROM firestore_scan('np_test', project_id='test-project', api_key='fake-key', show_missing=false);
 " 2>&1 | tail -1 | clean_query_output)
 assert_eq "$PQ_OVERRIDE" "5" "Per-query project_id + api_key override returns 5 rows"
 
@@ -1444,6 +1459,88 @@ CALL firestore_delete('np_test', 'np4');
 CALL firestore_delete('np_test', 'np5');
 CALL firestore_delete('np_phantom/ghost1/children', 'child1');
 CALL firestore_delete('np_phantom', 'real1');
+" > /dev/null
+
+# =====================================================
+# API-key auth
+# An API key is rules-governed access, so the emulator refuses what it keeps
+# for admins: listing phantom documents and batchWrite. These tests pin down
+# what an API-key user gets, and run the one-request-per-document fallbacks
+# that the owner token above never reaches.
+# =====================================================
+echo ""
+echo "=== API-key auth Tests ==="
+
+# Same as run_query / run_explain, authenticated with an API key only
+run_query_api_key() {
+    $DUCKDB -unsigned -csv -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET __k (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+$1
+" 2>&1 | tail -1 | clean_query_output
+}
+run_explain_api_key() {
+    $DUCKDB -unsigned -noheader -c "
+LOAD '${EXT_PATH}';
+CREATE SECRET __k (TYPE firestore, PROJECT_ID 'test-project', API_KEY 'fake-key');
+$1
+" 2>&1
+}
+
+AK_DOCS="http://$FIRESTORE_EMULATOR_HOST/v1/projects/test-project/databases/(default)/documents"
+for doc in a b; do
+    curl -s -X POST "$AK_DOCS/ak_docs?documentId=$doc" -H "Content-Type: application/json" \
+      -d '{"fields": {"status": {"stringValue": "new"}}}' > /dev/null
+done
+# ghost exists only to parent a subcollection
+curl -s -X POST "$AK_DOCS/ak_docs/ghost/kids?documentId=k1" -H "Content-Type: application/json" \
+  -d '{"fields": {"v": {"stringValue": "kid"}}}' > /dev/null
+
+# Test 75: a default scan lists phantom documents, which needs admin
+echo "Test 75: API-key default scan is refused..."
+AK_DEFAULT=$(run_explain_api_key "SELECT count(*) FROM firestore_scan('ak_docs');" || true)
+assert_contains "$AK_DEFAULT" "Metadata operations require admin authentication" \
+    "API-key scan with show_missing=true (the default) is refused: phantom listing needs admin"
+
+# Test 76: show_missing=false is what API-key users pass
+echo "Test 76: API-key scan with show_missing=false..."
+AK_SCAN=$(run_query_api_key "SELECT count(*) FROM firestore_scan('ak_docs', show_missing=false);")
+assert_eq "$AK_SCAN" "2" "API-key scan with show_missing=false returns the real documents"
+ADMIN_SCAN=$(run_query "SELECT count(*) FROM firestore_scan('ak_docs');")
+assert_eq "$ADMIN_SCAN" "3" "The owner token sees the phantom document too"
+
+# Test 77: batch update falls back to one request per document
+echo "Test 77: API-key batch update falls back to per-document writes..."
+AK_BATCH=$(run_query_api_key "SELECT * FROM firestore_update_batch('ak_docs', ['a', 'b'], 'status', 'batched');")
+assert_eq "$AK_BATCH" "2" "API-key batch update reports both documents"
+AK_BATCHED=$(run_query "SELECT count(*) FROM firestore_scan('ak_docs', show_missing=false) WHERE status = 'batched';")
+assert_eq "$AK_BATCHED" "2" "Both documents were updated through the fallback"
+
+# Test 78: insert with explicit ids falls back to one create per document,
+# each in its own parent collection -- through a collection group too
+echo "Test 78: API-key insert falls back to per-document creates..."
+AK_INSERT=$(run_query_api_key "SELECT * FROM firestore_insert('~ak_items',
+    (SELECT * FROM (VALUES ('ak_docs/a/ak_items/i1', 'x'), ('ak_docs/b/ak_items/i2', 'y')) AS t(path, v)),
+    document_id := 'path');")
+assert_eq "$AK_INSERT" "2" "API-key collection group insert reports both documents"
+AK_ITEM=$(run_query "SELECT v FROM firestore_scan('ak_docs/a/ak_items', show_missing=false) WHERE __document_id = 'i1';")
+assert_eq "$AK_ITEM" "x" "The fallback created i1 under ak_docs/a/ak_items"
+AK_GROUP=$(run_query "SELECT count(*) FROM firestore_scan('~ak_items');")
+assert_eq "$AK_GROUP" "2" "Both inserted documents are in the collection group"
+AK_LITERAL=$(curl -s "$AK_DOCS/~ak_items" | grep -c '"name"' || true)
+assert_eq "$AK_LITERAL" "0" "No top-level collection literally named '~ak_items' was created"
+
+# Test 79: batch delete falls back too
+echo "Test 79: API-key batch delete falls back to per-document deletes..."
+AK_DELETE=$(run_query_api_key "SELECT * FROM firestore_delete_batch('~ak_items', ['ak_docs/a/ak_items/i1', 'ak_docs/b/ak_items/i2']);")
+assert_eq "$AK_DELETE" "2" "API-key batch delete reports both documents"
+AK_GROUP_AFTER=$(run_query "SELECT count(*) FROM firestore_scan('~ak_items');")
+assert_eq "$AK_GROUP_AFTER" "0" "Both documents were deleted through the fallback"
+
+run_query "
+CALL firestore_delete('ak_docs', 'a');
+CALL firestore_delete('ak_docs', 'b');
+CALL firestore_delete('ak_docs/ghost/kids', 'k1');
 " > /dev/null
 
 echo ""

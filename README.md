@@ -897,7 +897,9 @@ SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing:=fal
 
 When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.
 
-> **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
+> **Note:** The Firestore Emulator answers `showMissing` only for admin requests, like Firestore itself. With an API
+> key it refuses the default scan with `403 Metadata operations require admin authentication`; authenticate with the
+> emulator's owner token (`ID_TOKEN 'owner'`) or pass `show_missing:=false` — see [Firebase Emulator](#firebase-emulator).
 
 > **Important — `show_missing:=true` requires privileged (service-account) access.** Listing
 > phantom/missing documents (`showMissing=true`, the default) is an Admin-oriented operation.
@@ -989,6 +991,12 @@ npm install -g firebase-tools
 firebase emulators:exec --only firestore --project test-project \
     "./test/scripts/run_integration_tests.sh"
 ```
+
+The suite authenticates as the emulator's owner (`ID_TOKEN 'owner'`), which the
+emulator treats as admin, so default scans can list phantom documents and batch
+writes go through `batchWrite`. A closing section repeats the key cases with a
+plain API key: the refused default scan, `show_missing:=false`, and the
+one-request-per-document fallbacks for batch writes and inserts.
 
 ### Large-collection tests
 
