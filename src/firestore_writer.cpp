@@ -3,6 +3,7 @@
 #include "firestore_secrets.hpp"
 #include "firestore_logger.hpp"
 #include "firestore_function_docs.hpp"
+#include "firestore_path_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -11,6 +12,50 @@
 #include "duckdb/main/database.hpp"
 
 namespace duckdb {
+
+// ============================================================================
+// Collection-group targets ('~orders')
+// ============================================================================
+// A collection group has no single parent, so each document a write names must
+// be its full path ('users/u1/orders/o1') and must sit in the group. Checked at
+// bind time wherever the paths are known then, so a bad one fails the
+// statement before anything is written -- for a batch, before its first group
+// of 500 is sent. ResolveDocumentPath checks again when the request is built.
+
+static void CheckCollectionGroupName(const char *function_name, const std::string &collection) {
+	if (!IsFirestoreCollectionGroup(collection)) {
+		return;
+	}
+	auto error = FirestoreCollectionGroupNameError(collection);
+	if (!error.empty()) {
+		throw BinderException(std::string(function_name) + ": " + error);
+	}
+}
+
+static void CheckCollectionGroupDocumentPath(const char *function_name, const std::string &collection,
+                                             const std::string &document_path) {
+	if (!IsFirestoreCollectionGroup(collection)) {
+		return;
+	}
+	std::string resolved;
+	auto error = ResolveFirestoreCollectionGroupDocumentPath(collection, document_path, resolved);
+	if (!error.empty()) {
+		throw BinderException(std::string(function_name) + ": " + error);
+	}
+}
+
+// Create one document at its resolved path, for the inserts that cannot use
+// batchWrite. CreateDocument takes the parent collection and the final id
+// separately, so the path is split at its last '/'. For a collection group the
+// parent comes from the document's own path: the '~' name is not a collection
+// a document can be created in.
+static void CreateDocumentAt(FirestoreClient &client, const std::string &document_path, const json &fields) {
+	size_t last_slash = document_path.rfind('/');
+	if (last_slash == std::string::npos) {
+		throw InvalidInputException("firestore_insert: '" + document_path + "' is not a document path");
+	}
+	client.CreateDocument(document_path.substr(0, last_slash), fields, document_path.substr(last_slash + 1));
+}
 
 // ============================================================================
 // INSERT function implementation (table-in-out)
@@ -35,6 +80,9 @@ struct FirestoreInsertGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<FirestoreClient> client;
 	idx_t rows_inserted;
 	std::vector<json> batch_writes;
+	// Document path (relative to /documents/) of each entry in batch_writes,
+	// for the fallback that creates them one at a time.
+	std::vector<std::string> batch_document_paths;
 	bool use_individual_ops;
 	bool count_emitted;
 
@@ -70,6 +118,18 @@ static unique_ptr<FunctionData> FirestoreInsertBind(ClientContext &context, Tabl
 		} else if (kv.first == "document_id") {
 			result->document_id_param = kv.second.GetValue<string>();
 		}
+	}
+
+	// A collection group has no single parent collection, so Firestore cannot
+	// generate ids in one: each row has to name its document's full path.
+	CheckCollectionGroupName("firestore_insert", result->collection);
+	if (IsFirestoreCollectionGroup(result->collection) && !result->document_id_param.has_value()) {
+		const std::string group_id = result->collection.substr(1);
+		throw BinderException(
+		    "firestore_insert: cannot generate document ids in collection group '" + result->collection +
+		    "', which has no single parent collection. Pass document_id := a column holding each "
+		    "document's full path, such as '<parent path>/" +
+		    group_id + "/<document id>', or insert into one collection, such as '<parent path>/" + group_id + "'");
 	}
 
 	// Resolve credentials
@@ -127,7 +187,7 @@ static unique_ptr<LocalTableFunctionState> FirestoreInsertInitLocal(ExecutionCon
 }
 
 // Flush accumulated batch writes to Firestore
-static void FlushInsertBatchWrites(FirestoreInsertBindData &bind_data, FirestoreInsertGlobalState &global_state) {
+static void FlushInsertBatchWrites(FirestoreInsertGlobalState &global_state) {
 	if (global_state.batch_writes.empty()) {
 		return;
 	}
@@ -140,13 +200,10 @@ static void FlushInsertBatchWrites(FirestoreInsertBindData &bind_data, Firestore
 		FS_LOG_WARN("BatchWrite permission denied for insert, falling back to individual CreateDocument calls");
 		global_state.use_individual_ops = true;
 
-		for (auto &write_op : global_state.batch_writes) {
+		for (size_t i = 0; i < global_state.batch_writes.size(); i++) {
 			try {
-				std::string doc_path = write_op["update"]["name"].get<std::string>();
-				std::string doc_id = doc_path.substr(doc_path.rfind('/') + 1);
-				json fields = write_op["update"]["fields"];
-
-				global_state.client->CreateDocument(bind_data.collection, fields, doc_id);
+				const json &fields = global_state.batch_writes[i]["update"]["fields"];
+				CreateDocumentAt(*global_state.client, global_state.batch_document_paths[i], fields);
 				global_state.rows_inserted++;
 			} catch (const std::exception &e) {
 				FS_LOG_WARN("Individual insert failed during fallback: " + std::string(e.what()));
@@ -154,6 +211,7 @@ static void FlushInsertBatchWrites(FirestoreInsertBindData &bind_data, Firestore
 		}
 	}
 	global_state.batch_writes.clear();
+	global_state.batch_document_paths.clear();
 }
 
 // Table in-out function: receives input DataChunks and inserts rows into Firestore
@@ -197,10 +255,26 @@ static OperatorResultType FirestoreInsertInOutFunction(ExecutionContext &context
 				throw InvalidInputException("Firestore insert failed at row " +
 				                            std::to_string(global_state.rows_inserted) + ": " + std::string(e.what()));
 			}
-		} else if (global_state.use_individual_ops) {
+			continue;
+		}
+
+		// Explicit ids. Into a collection group, the id column holds each
+		// document's full path; one that is not a document in the group stops
+		// the insert rather than being written somewhere else.
+		std::string document_path;
+		if (IsFirestoreCollectionGroup(bind_data.collection)) {
+			auto error = ResolveFirestoreCollectionGroupDocumentPath(bind_data.collection, doc_id_value, document_path);
+			if (!error.empty()) {
+				throw InvalidInputException("firestore_insert: " + error);
+			}
+		} else {
+			document_path = ResolveDocumentPath(bind_data.collection, doc_id_value).document_path;
+		}
+
+		if (global_state.use_individual_ops) {
 			// Fallback mode: individual CreateDocument calls with explicit ID
 			try {
-				global_state.client->CreateDocument(bind_data.collection, fields, doc_id_value);
+				CreateDocumentAt(*global_state.client, document_path, fields);
 				global_state.rows_inserted++;
 			} catch (const std::exception &e) {
 				throw InvalidInputException("Firestore insert failed for document '" + doc_id_value +
@@ -208,15 +282,15 @@ static OperatorResultType FirestoreInsertInOutFunction(ExecutionContext &context
 			}
 		} else {
 			// Batch mode: accumulate write operations
-			auto resolved = ResolveDocumentPath(bind_data.collection, doc_id_value);
 			std::string doc_path = "projects/" + bind_data.credentials->project_id + "/databases/" +
-			                       bind_data.credentials->database_id + "/documents/" + resolved.document_path;
+			                       bind_data.credentials->database_id + "/documents/" + document_path;
 
 			json write_op = {{"update", {{"name", doc_path}, {"fields", fields}}}};
 			global_state.batch_writes.push_back(write_op);
+			global_state.batch_document_paths.push_back(document_path);
 
 			if (global_state.batch_writes.size() >= BATCH_SIZE) {
-				FlushInsertBatchWrites(bind_data, global_state);
+				FlushInsertBatchWrites(global_state);
 			}
 		}
 	}
@@ -238,7 +312,7 @@ static OperatorFinalizeResultType FirestoreInsertFinal(ExecutionContext &context
 
 	// Flush any remaining batch writes
 	if (!bind_data.use_auto_ids && !global_state.batch_writes.empty()) {
-		FlushInsertBatchWrites(bind_data, global_state);
+		FlushInsertBatchWrites(global_state);
 	}
 
 	// Emit the final count
@@ -283,6 +357,7 @@ static unique_ptr<FunctionData> FirestoreUpdateBind(ClientContext &context, Tabl
 
 	// Get document ID (second arg)
 	result->document_id = input.inputs[1].GetValue<string>();
+	CheckCollectionGroupDocumentPath("firestore_update", result->collection, result->document_id);
 
 	// Parse remaining args as field_name/value pairs
 	// Must have even number of remaining args
@@ -407,6 +482,7 @@ static unique_ptr<FunctionData> FirestoreDeleteBind(ClientContext &context, Tabl
 
 	// Get document ID (second arg)
 	result->document_id = input.inputs[1].GetValue<string>();
+	CheckCollectionGroupDocumentPath("firestore_delete", result->collection, result->document_id);
 
 	// Process named parameters for credentials
 	std::optional<std::string> project_id;
@@ -511,11 +587,15 @@ static unique_ptr<FunctionData> FirestoreUpdateBatchBind(ClientContext &context,
 		                      "Usage: firestore_update_batch('collection', ['id1','id2'], 'field1', value1, ...)");
 	}
 
+	CheckCollectionGroupName("firestore_update_batch", result->collection);
+
 	// Handle NULL list (e.g., from empty filter result)
 	if (!ids_value.IsNull()) {
 		auto &id_list = ListValue::GetChildren(ids_value);
 		for (auto &id_val : id_list) {
 			result->document_ids.push_back(id_val.GetValue<string>());
+			// Every path is checked before any batch is sent.
+			CheckCollectionGroupDocumentPath("firestore_update_batch", result->collection, result->document_ids.back());
 		}
 	}
 
@@ -692,11 +772,15 @@ static unique_ptr<FunctionData> FirestoreDeleteBatchBind(ClientContext &context,
 		                      "Usage: firestore_delete_batch('collection', ['id1','id2'])");
 	}
 
+	CheckCollectionGroupName("firestore_delete_batch", result->collection);
+
 	// Handle NULL list (e.g., from empty filter result)
 	if (!ids_value.IsNull()) {
 		auto &id_list = ListValue::GetChildren(ids_value);
 		for (auto &id_val : id_list) {
 			result->document_ids.push_back(id_val.GetValue<string>());
+			// Every path is checked before any batch is sent.
+			CheckCollectionGroupDocumentPath("firestore_delete_batch", result->collection, result->document_ids.back());
 		}
 	}
 
@@ -834,6 +918,18 @@ struct FirestoreArrayTransformGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+static const char *ArrayTransformFunctionName(FirestoreClient::ArrayTransformType transform_type) {
+	switch (transform_type) {
+	case FirestoreClient::ArrayTransformType::ARRAY_UNION:
+		return "firestore_array_union";
+	case FirestoreClient::ArrayTransformType::ARRAY_REMOVE:
+		return "firestore_array_remove";
+	case FirestoreClient::ArrayTransformType::ARRAY_APPEND:
+		return "firestore_array_append";
+	}
+	return "firestore_array_transform";
+}
+
 static unique_ptr<FunctionData> FirestoreArrayTransformBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types,
                                                             vector<FirestoreName> &names,
@@ -846,6 +942,8 @@ static unique_ptr<FunctionData> FirestoreArrayTransformBind(ClientContext &conte
 
 	// Get document ID (second arg)
 	result->document_id = input.inputs[1].GetValue<string>();
+	CheckCollectionGroupDocumentPath(ArrayTransformFunctionName(transform_type), result->collection,
+	                                 result->document_id);
 
 	// Get field name (third arg)
 	result->field_name = input.inputs[2].GetValue<string>();
@@ -1014,7 +1112,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    {{"collection", "subquery"},
 	     "Insert one Firestore document per row of a subquery, with one field per column. document_id := names the "
 	     "column that supplies document IDs, which is then left out of the fields; without it Firestore generates "
-	     "the IDs. Returns the number of documents inserted.",
+	     "the IDs. A collection group ('~orders') needs document_id := naming a column of full document paths. "
+	     "Returns the number of documents inserted.",
 	     "CALL firestore_insert('users', (SELECT 'alice' AS id, 'Alice' AS name, 30 AS age), document_id := 'id');",
 	     {"firestore", "write"}});
 
@@ -1036,7 +1135,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, update_func,
 	    {{"collection", "document_id"},
 	     "Set fields on one Firestore document from the trailing field-name/value pairs, leaving its other fields "
-	     "as they are. Returns a one-row count.",
+	     "as they are. For a collection group ('~orders'), document_id is the document's full path, as __document_id "
+	     "from firestore_scan('~orders') gives it. Returns a one-row count.",
 	     "CALL firestore_update('users', 'user123', 'status', 'verified', 'age', 31);",
 	     {"firestore", "write"}});
 
@@ -1053,11 +1153,13 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	                                             {"database", LogicalType::VARCHAR},
 	                                         });
 
-	RegisterDocumentedTableFunction(loader, delete_func,
-	                                {{"collection", "document_id"},
-	                                 "Delete one Firestore document by ID. Returns a one-row count.",
-	                                 "CALL firestore_delete('users', 'user123');",
-	                                 {"firestore", "write"}});
+	RegisterDocumentedTableFunction(
+	    loader, delete_func,
+	    {{"collection", "document_id"},
+	     "Delete one Firestore document by ID. For a collection group ('~orders'), the ID is the document's full "
+	     "path, as __document_id from firestore_scan('~orders') gives it. Returns a one-row count.",
+	     "CALL firestore_delete('users', 'user123');",
+	     {"firestore", "write"}});
 
 	// Register firestore_update_batch table function
 	// Usage: CALL firestore_update_batch('collection', ['id1','id2'], 'field1', value1, ...)
@@ -1077,8 +1179,9 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, update_batch_func,
 	    {{"collection", "document_ids"},
 	     "Set the same field-name/value pairs on every Firestore document in a list of IDs, sent through "
-	     "batchWrite in groups of up to 500. Batches are not atomic: each write succeeds or fails on its own. "
-	     "Returns a one-row count.",
+	     "batchWrite in groups of up to 500. Batches are not atomic: each write succeeds or fails on its own. For a "
+	     "collection group ('~orders'), each ID is a full document path, checked before anything is sent. Returns a "
+	     "one-row count.",
 	     "CALL firestore_update_batch('users', ['user1', 'user2'], 'status', 'reviewed');",
 	     {"firestore", "write"}});
 
@@ -1099,7 +1202,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, delete_batch_func,
 	    {{"collection", "document_ids"},
 	     "Delete every Firestore document in a list of IDs, sent through batchWrite in groups of up to 500. "
-	     "Batches are not atomic: each delete succeeds or fails on its own. Returns a one-row count.",
+	     "Batches are not atomic: each delete succeeds or fails on its own. For a collection group ('~orders'), each "
+	     "ID is a full document path, checked before anything is sent. Returns a one-row count.",
 	     "CALL firestore_delete_batch('users', ['user1', 'user2']);",
 	     {"firestore", "write"}});
 
@@ -1122,7 +1226,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, array_union_func,
 	    {{"collection", "document_id", "field", "values"},
 	     "Add values to an array field of one Firestore document, skipping any the array already holds "
-	     "(Firestore's arrayUnion transform). Returns a one-row count.",
+	     "(Firestore's arrayUnion transform). For a collection group ('~orders'), document_id is the document's "
+	     "full path. Returns a one-row count.",
 	     "CALL firestore_array_union('users', 'user123', 'tags', ['vip', 'active']);",
 	     {"firestore", "write"}});
 
@@ -1145,7 +1250,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, array_remove_func,
 	    {{"collection", "document_id", "field", "values"},
 	     "Remove every occurrence of the given values from an array field of one Firestore document (Firestore's "
-	     "arrayRemove transform). Returns a one-row count.",
+	     "arrayRemove transform). For a collection group ('~orders'), document_id is the document's full path. "
+	     "Returns a one-row count.",
 	     "CALL firestore_array_remove('users', 'user123', 'tags', ['inactive']);",
 	     {"firestore", "write"}});
 
@@ -1168,7 +1274,8 @@ void RegisterFirestoreWriteFunctions(ExtensionLoader &loader) {
 	    loader, array_append_func,
 	    {{"collection", "document_id", "field", "values"},
 	     "Append values to an array field of one Firestore document, keeping duplicates. The array is read and "
-	     "written back whole, so a concurrent write to the same field can be lost. Returns a one-row count.",
+	     "written back whole, so a concurrent write to the same field can be lost. For a collection group "
+	     "('~orders'), document_id is the document's full path. Returns a one-row count.",
 	     "CALL firestore_array_append('users', 'user123', 'events', ['login']);",
 	     {"firestore", "write"}});
 }

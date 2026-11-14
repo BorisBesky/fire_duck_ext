@@ -3,7 +3,7 @@
 // Minimal self-registering test harness.
 //
 // The DuckDB-free modules (firestore_wire, firestore_paging,
-// firestore_schema_accumulator) are compiled straight into this binary, so
+// firestore_schema_accumulator, firestore_path_utils) are compiled straight into this binary, so
 // their branches can be driven directly and measured with gcov. Anything
 // needing a live DuckDB lives in test/sql instead.
 

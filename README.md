@@ -247,7 +247,7 @@ CREATE SECRET emulator (
 | Function | Description |
 |----------|-------------|
 | `firestore_scan('collection')` | Read all documents from a collection |
-| `firestore_scan('~collection')` | Collection group query (all subcollections) |
+| `firestore_scan('~collection')` | Collection group query (all subcollections); the write functions accept `~collection` with full document paths — see [Writing through a collection group](#writing-through-a-collection-group) |
 | `firestore_scan('collection/doc_id')` | List direct subcollection IDs under a document path |
 | `firestore_insert('collection', (SELECT ...), document_id := 'col')` | Insert documents from a subquery |
 | `firestore_update('collection', 'doc_id', 'field1', value1, ...)` | Update fields on a single document |
@@ -644,6 +644,41 @@ whole collection group rather than stopping at the first page.
 
 Composite-index detection for multi-field `ORDER BY` on a collection group requires service-account auth — see [Admin-only features](#admin-only-features-index-metadata).
 
+### Writing through a collection group
+
+The write functions accept a `~collection` target too. A collection group has no
+single parent, so each document is named by its **full path** instead of a bare
+ID — exactly the `__document_id` that `firestore_scan('~orders')` returns:
+
+```sql
+-- Update one order wherever it lives
+CALL firestore_update('~orders', 'users/user1/orders/order2', 'status', 'approved');
+
+-- Update every pending order across all users
+SET VARIABLE ids = (SELECT list(__document_id) FROM firestore_scan('~orders') WHERE status = 'pending');
+CALL firestore_update_batch('~orders', getvariable('ids'), 'status', 'processed');
+
+-- Insert needs document_id := with full paths; each document is created in its own parent collection
+CALL firestore_insert('~orders', (SELECT 'users/user2/orders/o9' AS path, 'Lamp' AS product), document_id := 'path');
+```
+
+Each path must be a document inside the group, and anything else is refused with an
+error rather than written somewhere unintended:
+
+| Refused | Why |
+|---------|-----|
+| `firestore_update('~orders', 'order2', …)` | A bare ID (an odd number of segments) names a collection, not a document |
+| `firestore_delete('~orders', 'users/user1')` | The document is in `users`, not in an `orders` collection |
+| `firestore_update('~orders', 'users//orders/o1', …)` | Empty path segment (one leading `/` is accepted) |
+| `firestore_delete('~', …)`, `firestore_delete('~users/u1/orders', …)` | The group must be a single collection ID |
+| `firestore_insert('~orders', (SELECT …))` without `document_id :=` | Firestore cannot generate IDs without a parent collection; insert into `users/u1/orders` instead |
+
+`firestore_update`, `firestore_delete`, the batch functions, and the array transforms
+check their paths when the statement is bound, so a batch with one bad path writes
+nothing. `firestore_insert` reads its paths from the subquery, so it checks each row
+as it arrives and stops at the first bad one; any groups of 500 rows sent before
+that row stay written.
+
 ## Collection ID Listings
 
 When `firestore_scan()` is given a document path instead of a collection path, it lists that document's direct subcollection IDs instead of reading documents. This is useful for discovering unknown nested collection names.
@@ -862,7 +897,9 @@ SELECT * FROM firestore_scan('artifacts/default-app-id/users', show_missing:=fal
 
 When a collection contains only phantom documents (no fields at all), the result includes just the `__document_id` column, letting you discover document IDs for navigating into subcollections.
 
-> **Note:** The Firestore Emulator does not support `showMissing`. The extension detects the emulator automatically and skips the parameter.
+> **Note:** The Firestore Emulator answers `showMissing` only for admin requests, like Firestore itself. With an API
+> key it refuses the default scan with `403 Metadata operations require admin authentication`; authenticate with the
+> emulator's owner token (`ID_TOKEN 'owner'`) or pass `show_missing:=false` — see [Firebase Emulator](#firebase-emulator).
 
 > **Important — `show_missing:=true` requires privileged (service-account) access.** Listing
 > phantom/missing documents (`showMissing=true`, the default) is an Admin-oriented operation.
@@ -954,6 +991,12 @@ npm install -g firebase-tools
 firebase emulators:exec --only firestore --project test-project \
     "./test/scripts/run_integration_tests.sh"
 ```
+
+The suite authenticates as the emulator's owner (`ID_TOKEN 'owner'`), which the
+emulator treats as admin, so default scans can list phantom documents and batch
+writes go through `batchWrite`. A closing section repeats the key cases with a
+plain API key: the refused default scan, `show_missing:=false`, and the
+one-request-per-document fallbacks for batch writes and inserts.
 
 ### Large-collection tests
 

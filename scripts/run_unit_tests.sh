@@ -43,6 +43,7 @@ COVERED_SOURCES=(
 	src/firestore_paging.cpp
 	src/firestore_retry.cpp
 	src/firestore_schema_accumulator.cpp
+	src/firestore_path_utils.cpp
 )
 
 TEST_SOURCES=(
@@ -52,6 +53,7 @@ TEST_SOURCES=(
 	test/unit/test_firestore_paging.cpp
 	test/unit/test_firestore_retry.cpp
 	test/unit/test_firestore_schema_accumulator.cpp
+	test/unit/test_firestore_path_utils.cpp
 )
 
 rm -rf "$BUILD_DIR"
