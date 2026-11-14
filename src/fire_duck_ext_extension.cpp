@@ -20,7 +20,7 @@ namespace duckdb {
 static void InitializeLogging() {
 	const char *log_level = std::getenv("FIRESTORE_LOG_LEVEL");
 	if (log_level) {
-		FirestoreLogger::Instance().SetLogLevel(ParseLogLevel(log_level));
+		FirestoreLogger::Instance().SetLogLevel(ParseFirestoreLogLevel(log_level));
 	}
 }
 

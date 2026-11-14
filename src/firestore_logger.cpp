@@ -12,7 +12,7 @@ namespace duckdb {
 // Log Level Utilities
 // ============================================================================
 
-const char *LogLevelToString(FirestoreLogLevel level) {
+const char *FirestoreLogLevelToString(FirestoreLogLevel level) {
 	switch (level) {
 	case FirestoreLogLevel::DEBUG:
 		return "DEBUG";
@@ -29,7 +29,7 @@ const char *LogLevelToString(FirestoreLogLevel level) {
 	}
 }
 
-FirestoreLogLevel ParseLogLevel(const std::string &str) {
+FirestoreLogLevel ParseFirestoreLogLevel(const std::string &str) {
 	std::string upper = str;
 	std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
 
@@ -70,7 +70,7 @@ std::string FirestoreLogEntry::Format() const {
 	ss << "." << std::setfill('0') << std::setw(3) << ms.count();
 
 	// Log level
-	ss << " [" << LogLevelToString(level) << "]";
+	ss << " [" << FirestoreLogLevelToString(level) << "]";
 
 	// Source location (if available)
 	if (file && function) {
@@ -88,28 +88,28 @@ std::string FirestoreLogEntry::Format() const {
 }
 
 // ============================================================================
-// StderrLogSink Implementation
+// FirestoreStderrLogSink Implementation
 // ============================================================================
 
-void StderrLogSink::Log(const FirestoreLogEntry &entry) {
+void FirestoreStderrLogSink::Log(const FirestoreLogEntry &entry) {
 	std::cerr << "[FireDuckExt] " << entry.Format() << std::endl;
 }
 
 // ============================================================================
-// FileLogSink Implementation
+// FirestoreFileLogSink Implementation
 // ============================================================================
 
-FileLogSink::FileLogSink(const std::string &filepath) {
+FirestoreFileLogSink::FirestoreFileLogSink(const std::string &filepath) {
 	file_.open(filepath, std::ios::out | std::ios::app);
 }
 
-FileLogSink::~FileLogSink() {
+FirestoreFileLogSink::~FirestoreFileLogSink() {
 	if (file_.is_open()) {
 		file_.close();
 	}
 }
 
-void FileLogSink::Log(const FirestoreLogEntry &entry) {
+void FirestoreFileLogSink::Log(const FirestoreLogEntry &entry) {
 	if (!file_.is_open())
 		return;
 
@@ -127,16 +127,16 @@ FirestoreLogger &FirestoreLogger::Instance() {
 	return instance;
 }
 
-FirestoreLogger::FirestoreLogger() : level_(FirestoreLogLevel::NONE), sink_(std::make_shared<NullLogSink>()) {
+FirestoreLogger::FirestoreLogger() : level_(FirestoreLogLevel::NONE), sink_(std::make_shared<FirestoreNullLogSink>()) {
 }
 
 void FirestoreLogger::SetLogLevel(FirestoreLogLevel level) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	level_ = level;
 
-	// If enabling logging and still using NullLogSink, switch to stderr
-	if (level != FirestoreLogLevel::NONE && std::dynamic_pointer_cast<NullLogSink>(sink_)) {
-		sink_ = std::make_shared<StderrLogSink>();
+	// If enabling logging and still using FirestoreNullLogSink, switch to stderr
+	if (level != FirestoreLogLevel::NONE && std::dynamic_pointer_cast<FirestoreNullLogSink>(sink_)) {
+		sink_ = std::make_shared<FirestoreStderrLogSink>();
 	}
 }
 
@@ -147,7 +147,7 @@ FirestoreLogLevel FirestoreLogger::GetLogLevel() const {
 
 void FirestoreLogger::SetSink(std::shared_ptr<FirestoreLogSink> sink) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	sink_ = sink ? sink : std::make_shared<NullLogSink>();
+	sink_ = sink ? sink : std::make_shared<FirestoreNullLogSink>();
 }
 
 std::shared_ptr<FirestoreLogSink> FirestoreLogger::GetSink() const {
@@ -158,7 +158,7 @@ std::shared_ptr<FirestoreLogSink> FirestoreLogger::GetSink() const {
 void FirestoreLogger::ResetToDefault() {
 	std::lock_guard<std::mutex> lock(mutex_);
 	level_ = FirestoreLogLevel::NONE;
-	sink_ = std::make_shared<NullLogSink>();
+	sink_ = std::make_shared<FirestoreNullLogSink>();
 }
 
 void FirestoreLogger::Log(FirestoreLogLevel level, const std::string &message, const char *file, int line,
