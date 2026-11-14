@@ -7,6 +7,11 @@
 #include <mutex>
 #include <fstream>
 
+// Everything here lives in namespace duckdb, alongside DuckDB's own logging
+// (duckdb/logging/), so every name carries the Firestore prefix. DuckDB main
+// (after 2.0) added duckdb::FileLogSink and duckdb::CallbackLogSink; this file
+// used to define both, and the extension stopped linking against it.
+
 namespace duckdb {
 
 // ============================================================================
@@ -22,10 +27,10 @@ enum class FirestoreLogLevel {
 };
 
 // Convert log level to string
-const char *LogLevelToString(FirestoreLogLevel level);
+const char *FirestoreLogLevelToString(FirestoreLogLevel level);
 
 // Parse log level from string (case insensitive)
-FirestoreLogLevel ParseLogLevel(const std::string &str);
+FirestoreLogLevel ParseFirestoreLogLevel(const std::string &str);
 
 // ============================================================================
 // Log Entry
@@ -54,23 +59,23 @@ public:
 };
 
 // Default sink that does nothing (for production)
-class NullLogSink : public FirestoreLogSink {
+class FirestoreNullLogSink : public FirestoreLogSink {
 public:
 	void Log(const FirestoreLogEntry &entry) override {
 	}
 };
 
 // Sink that writes to stderr
-class StderrLogSink : public FirestoreLogSink {
+class FirestoreStderrLogSink : public FirestoreLogSink {
 public:
 	void Log(const FirestoreLogEntry &entry) override;
 };
 
 // Sink that writes to a file
-class FileLogSink : public FirestoreLogSink {
+class FirestoreFileLogSink : public FirestoreLogSink {
 public:
-	explicit FileLogSink(const std::string &filepath);
-	~FileLogSink();
+	explicit FirestoreFileLogSink(const std::string &filepath);
+	~FirestoreFileLogSink();
 	void Log(const FirestoreLogEntry &entry) override;
 	bool IsOpen() const {
 		return file_.is_open();
@@ -82,10 +87,10 @@ private:
 };
 
 // Sink that calls a user-provided callback
-class CallbackLogSink : public FirestoreLogSink {
+class FirestoreCallbackLogSink : public FirestoreLogSink {
 public:
 	using Callback = std::function<void(const FirestoreLogEntry &)>;
-	explicit CallbackLogSink(Callback cb) : callback_(std::move(cb)) {
+	explicit FirestoreCallbackLogSink(Callback cb) : callback_(std::move(cb)) {
 	}
 	void Log(const FirestoreLogEntry &entry) override {
 		if (callback_)
@@ -111,7 +116,7 @@ public:
 
 	void SetSink(std::shared_ptr<FirestoreLogSink> sink);
 	std::shared_ptr<FirestoreLogSink> GetSink() const;
-	void ResetToDefault(); // Resets to NullLogSink
+	void ResetToDefault(); // Resets to FirestoreNullLogSink
 
 	// Check if a level would be logged
 	bool ShouldLog(FirestoreLogLevel level) const {
